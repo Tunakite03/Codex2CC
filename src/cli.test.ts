@@ -1,0 +1,48 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { BridgeError } from "./bridge.js";
+import { DEFAULT_PORT, parseCli, standalonePolicy } from "./cli.js";
+
+test("parseCli gives --mcp precedence, then --list-models, then --serve", () => {
+  assert.deepEqual(parseCli(["--mcp", "--serve", "--list-models"]), { kind: "mcp" });
+  assert.deepEqual(parseCli(["--list-models", "--serve"]), { kind: "list-models" });
+});
+
+test("parseCli reads serve options and defaults the port", () => {
+  assert.deepEqual(parseCli(["--serve"]), { kind: "serve", model: undefined, port: DEFAULT_PORT, noAuth: false });
+  assert.deepEqual(parseCli(["--serve", "--port", "4000", "--model", "gpt-6-sol", "--no-auth"]), {
+    kind: "serve",
+    model: "gpt-6-sol",
+    port: 4000,
+    noAuth: true,
+  });
+});
+
+test("parseCli passes arguments after -- to Claude Code untouched", () => {
+  assert.deepEqual(parseCli(["--model", "gpt-6-sol", "--", "--resume", "abc"]), {
+    kind: "claude",
+    model: "gpt-6-sol",
+    claudeArgs: ["--resume", "abc"],
+  });
+});
+
+test("parseCli translates shorthand flags into Claude Code arguments without duplicating them", () => {
+  const command = parseCli(["-y", "--permission-mode", "plan", "-p", "fix it", "-c"]);
+  assert.deepEqual(command, {
+    kind: "claude",
+    model: undefined,
+    claudeArgs: ["--permission-mode", "plan", "--dangerously-skip-permissions", "-p", "fix it", "--continue"],
+  });
+  const deduplicated = parseCli(["-y", "-c", "--", "--dangerously-skip-permissions", "--continue"]);
+  assert.deepEqual(deduplicated, { kind: "claude", model: undefined, claudeArgs: ["--dangerously-skip-permissions", "--continue"] });
+});
+
+test("standalonePolicy opens only on --no-auth, generates a token by default, and rejects weak tokens", () => {
+  assert.deepEqual(standalonePolicy(true, undefined), { mode: "open" });
+  const generated = standalonePolicy(false, undefined);
+  assert.equal(generated.mode, "token");
+  assert.ok(generated.mode === "token" && generated.token.length >= 32);
+  assert.notDeepEqual(standalonePolicy(false, "  "), standalonePolicy(false, "  "), "blank token generates fresh secrets");
+  assert.deepEqual(standalonePolicy(false, "  configured-token-123  "), { mode: "token", token: "configured-token-123" });
+  assert.throws(() => standalonePolicy(false, "short"), (error: unknown) => error instanceof BridgeError && error.code === "weak_gateway_token");
+});

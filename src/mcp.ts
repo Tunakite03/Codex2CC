@@ -1,10 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { createServer } from "node:http";
 import { createInterface } from "node:readline";
 import { z } from "zod";
 import { ChatGPTSession } from "./auth.js";
-import { AnthropicStream, readSse, toOpenAIRequest } from "./bridge.js";
-import { checkClient, checkHost, requestPathname } from "./guard.js";
+import { createGatewayServer, listenOnLoopback } from "./gateway.js";
 import {
   DEFAULT_PERMISSION_MODE,
   PERMISSION_MODES,
@@ -18,7 +16,6 @@ import {
 } from "./mcp-policy.js";
 import { killAllProcesses, runProcess } from "./runner.js";
 
-const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const FALLBACK_MODEL = "gpt-6-sol";
 const TIMEOUT_TAIL_CHARS = 2_000;
 
@@ -53,106 +50,23 @@ async function executeAgentTask(
 ): Promise<string> {
   const { model } = task;
   const secret = randomBytes(32).toString("base64url");
-  const server = createServer(async (request, response) => {
-    const clientGone = new AbortController();
-    response.on("close", () => clientGone.abort());
-    const hostCheck = checkHost(request.headers);
-    if (!hostCheck.ok) {
-      response.writeHead(hostCheck.status).end();
-      return;
-    }
-    const pathname = requestPathname(request.url);
-    if (pathname === undefined) {
-      response.writeHead(400).end();
-      return;
-    }
-    if (request.method === "HEAD" && pathname === "/api/hello") {
-      response.writeHead(200).end();
-      return;
-    }
-    const clientCheck = checkClient(request.headers, { mode: "token", token: secret });
-    if (!clientCheck.ok) {
-      response.writeHead(clientCheck.status, { "Content-Type": "application/json" }).end(
-        JSON.stringify({ type: "error", error: { type: clientCheck.type, message: clientCheck.message } }),
-      );
-      return;
-    }
-    if (request.method === "GET" && pathname === "/v1/models") {
-      const models = [
-        { id: model, type: "model", display_name: model },
-        { id: "claude-3-7-sonnet-20250219", type: "model", display_name: `Claude 3.7 Sonnet (via ${model})` },
-      ];
-      response.writeHead(200, { "Content-Type": "application/json" }).end(
-        JSON.stringify({ data: models, has_more: false, first_id: model, last_id: model }),
-      );
-      return;
-    }
-    if (request.method !== "POST" || pathname !== "/v1/messages") {
-      response.writeHead(404).end();
-      return;
-    }
-
-    try {
-      let raw = "";
-      for await (const chunk of request) raw += chunk;
-      const inbound = JSON.parse(raw);
-      const outgoing = toOpenAIRequest(inbound, model);
-
-      const upstream = await fetch(CHATGPT_RESPONSES_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${await session.accessToken()}`,
-          "ChatGPT-Account-Id": session.accountId(),
-        },
-        body: JSON.stringify(outgoing),
-        signal: AbortSignal.any([AbortSignal.timeout(600_000), clientGone.signal]),
-      });
-
-      if (!upstream.ok) {
-        const err = await upstream.text().catch(() => "");
-        response.writeHead(upstream.status, { "Content-Type": "application/json" }).end(
-          JSON.stringify({ type: "error", error: { type: "api_error", message: `ChatGPT upstream failed: ${err.slice(0, 200)}` } }),
-        );
-        return;
-      }
-
-      response.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      });
-
-      const toolNames = (inbound.tools ?? []).map((t: { name: string }) => t.name);
-      const encoder = new AnthropicStream(response, model, toolNames);
-      await readSse(upstream.body!, (event) => encoder.accept(event));
-      encoder.assertCompleted();
-      response.end();
-    } catch (err) {
-      if (response.headersSent) {
-        response.destroy();
-      } else {
-        response.writeHead(500, { "Content-Type": "application/json" }).end(
-          JSON.stringify({ type: "error", error: { type: "api_error", message: String(err) } }),
-        );
-      }
-    }
+  const server = createGatewayServer({
+    session,
+    defaultModel: model,
+    availableModels: [{ slug: model, displayName: model }],
+    policy: { mode: "token", token: secret },
   });
-
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-
-  const address = server.address();
-  if (!address || typeof address === "string") {
+  let port: number;
+  try {
+    port = await listenOnLoopback(server, 0);
+  } catch (error) {
     server.close();
-    throw new Error("Failed to bind local ephemeral gateway.");
+    throw error;
   }
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+    ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
     ANTHROPIC_AUTH_TOKEN: secret,
     ANTHROPIC_API_KEY: secret,
     ANTHROPIC_MODEL: "claude-3-7-sonnet-20250219",
