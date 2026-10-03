@@ -1,57 +1,104 @@
 import { randomBytes } from "node:crypto";
+import { parseArgs } from "node:util";
 import { BridgeError } from "./bridge.js";
 import { MIN_TOKEN_LENGTH, type GuardPolicy } from "./guard.js";
 
 export const DEFAULT_PORT = 3456;
 
 export type CliCommand =
+  | { readonly kind: "help" }
   | { readonly kind: "mcp" }
   | { readonly kind: "list-models" }
   | { readonly kind: "serve"; readonly model: string | undefined; readonly port: number; readonly noAuth: boolean }
   | { readonly kind: "claude"; readonly model: string | undefined; readonly claudeArgs: readonly string[] };
 
-function valueAfter(options: readonly string[], flag: string): string | undefined {
-  const index = options.indexOf(flag);
-  return index >= 0 ? options[index + 1] || undefined : undefined;
+export const USAGE = `Usage: codex2cc [options] [-- <claude arguments>]
+
+Run Claude Code on your ChatGPT (Codex) login, or serve a local Anthropic-compatible gateway.
+
+Modes (default: launch Claude Code):
+  --serve                   Run a standalone gateway
+  --mcp                     Run as an MCP server over stdio
+  --list-models             Print the models available to your ChatGPT account
+  -h, --help                Show this help
+
+Options:
+  --model <slug>            Model to use (default: first model of your account)
+  --port <n>                Standalone gateway port, 0-65535 (default: ${DEFAULT_PORT})
+  --no-auth                 Standalone gateway without a token (not recommended)
+  -p, --print <prompt>      Run Claude Code non-interactively
+  -c, --continue            Continue the previous Claude Code session
+  --permission-mode <mode>  Claude Code permission mode
+  -y, --dangerously-skip-permissions, --skip-permissions
+                            Pass --dangerously-skip-permissions to Claude Code
+
+Arguments after "--" are passed to Claude Code unchanged.
+Environment: CODEX2CC_TOKEN (standalone gateway token), CODEX2CC_ALLOWED_ROOTS and other
+CODEX2CC_* variables for the MCP server, CODEX2CC_MODEL_OPUS/SONNET/HAIKU (model tiers).
+`;
+
+const OPTIONS = {
+  help: { type: "boolean", short: "h" },
+  mcp: { type: "boolean" },
+  "list-models": { type: "boolean" },
+  serve: { type: "boolean" },
+  "no-auth": { type: "boolean" },
+  model: { type: "string" },
+  port: { type: "string" },
+  "permission-mode": { type: "string" },
+  print: { type: "string", short: "p" },
+  continue: { type: "boolean", short: "c" },
+  "dangerously-skip-permissions": { type: "boolean", short: "y" },
+  "skip-permissions": { type: "boolean" },
+} as const;
+
+function parseGatewayOptions(options: readonly string[]) {
+  try {
+    return parseArgs({ args: [...options], options: OPTIONS, strict: true, allowPositionals: false }).values;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && typeof error.code === "string" && error.code.startsWith("ERR_PARSE_ARGS_")) {
+      throw new BridgeError(400, "invalid_arguments", `${error.message.replace(/\.?$/, ".")} Pass Claude Code arguments after "--". Run codex2cc --help for usage.`);
+    }
+    throw error;
+  }
+}
+
+function parsePort(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return DEFAULT_PORT;
+  if (!/^\d+$/.test(raw) || Number(raw) > 65_535) {
+    throw new BridgeError(400, "invalid_port", `--port must be an integer between 0 and 65535, got "${raw}".`);
+  }
+  return Number(raw);
 }
 
 /**
- * Parses codex2cc arguments. Everything before `--` configures the gateway; everything
- * after it is passed to Claude Code unchanged. Mode precedence: --mcp, --list-models, --serve.
+ * Parses codex2cc arguments. Everything before `--` configures the gateway and is validated
+ * strictly; everything after it is passed to Claude Code unchanged. Mode precedence:
+ * --help, --mcp, --list-models, --serve.
  */
 export function parseCli(argv: readonly string[]): CliCommand {
   const separator = argv.indexOf("--");
-  const options = separator < 0 ? argv : argv.slice(0, separator);
+  const values = parseGatewayOptions(separator < 0 ? argv : argv.slice(0, separator));
   const claudeArgs = separator < 0 ? [] : argv.slice(separator + 1);
-  const model = valueAfter(options, "--model");
+  const model = values.model || undefined;
 
-  if (options.includes("--mcp")) return { kind: "mcp" };
-  if (options.includes("--list-models")) return { kind: "list-models" };
-  if (options.includes("--serve")) {
-    const rawPort = valueAfter(options, "--port");
-    return {
-      kind: "serve",
-      model,
-      port: rawPort ? parseInt(rawPort, 10) : DEFAULT_PORT,
-      noAuth: options.includes("--no-auth"),
-    };
-  }
+  if (values.help) return { kind: "help" };
+  if (values.mcp) return { kind: "mcp" };
+  if (values["list-models"]) return { kind: "list-models" };
+  if (values.serve) return { kind: "serve", model, port: parsePort(values.port), noAuth: values["no-auth"] === true };
 
   const forwarded = [...claudeArgs];
-  const skipPermissions = options.includes("--dangerously-skip-permissions") || options.includes("-y") || options.includes("--skip-permissions");
-  const permissionMode = valueAfter(options, "--permission-mode");
-  const printPrompt = valueAfter(options, "-p");
-  const continueSession = options.includes("--continue") || options.includes("-c");
+  const skipPermissions = values["dangerously-skip-permissions"] === true || values["skip-permissions"] === true;
   if (skipPermissions && !forwarded.includes("--dangerously-skip-permissions")) {
     forwarded.unshift("--dangerously-skip-permissions");
   }
-  if (permissionMode && !forwarded.includes("--permission-mode")) {
-    forwarded.unshift("--permission-mode", permissionMode);
+  if (values["permission-mode"] && !forwarded.includes("--permission-mode")) {
+    forwarded.unshift("--permission-mode", values["permission-mode"]);
   }
-  if (printPrompt && !forwarded.includes("-p")) {
-    forwarded.push("-p", printPrompt);
+  if (values.print && !forwarded.includes("-p")) {
+    forwarded.push("-p", values.print);
   }
-  if (continueSession && !forwarded.includes("--continue") && !forwarded.includes("-c")) {
+  if (values.continue === true && !forwarded.includes("--continue") && !forwarded.includes("-c")) {
     forwarded.push("--continue");
   }
   return { kind: "claude", model, claudeArgs: forwarded };

@@ -14,7 +14,8 @@
     "start": "npm run build && node dist/main.js",
     "serve": "npm run build && node dist/main.js --serve",
     "mcp": "npm run build && node dist/main.js --mcp",
-    "test": "npm run build && node --test dist/*.test.js"
+    "test": "npm run build && node --test dist/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "zod": "^4.1.0"

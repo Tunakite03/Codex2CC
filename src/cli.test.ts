@@ -3,7 +3,8 @@ import test from "node:test";
 import { BridgeError } from "./bridge.js";
 import { DEFAULT_PORT, parseCli, standalonePolicy } from "./cli.js";
 
-test("parseCli gives --mcp precedence, then --list-models, then --serve", () => {
+test("parseCli gives --help precedence, then --mcp, then --list-models, then --serve", () => {
+  assert.deepEqual(parseCli(["--mcp", "-h"]), { kind: "help" });
   assert.deepEqual(parseCli(["--mcp", "--serve", "--list-models"]), { kind: "mcp" });
   assert.deepEqual(parseCli(["--list-models", "--serve"]), { kind: "list-models" });
 });
@@ -49,4 +50,22 @@ test("standalonePolicy opens only on --no-auth, generates a token by default, an
   assert.notDeepEqual(standalonePolicy(false, "  "), standalonePolicy(false, "  "), "blank token generates fresh secrets");
   assert.deepEqual(standalonePolicy(false, "  configured-token-123  "), { mode: "token", token: "configured-token-123" });
   assert.throws(() => standalonePolicy(false, "short"), (error: unknown) => error instanceof BridgeError && error.code === "weak_gateway_token");
+});
+
+test("parseCli rejects unknown options, stray arguments and bad ports instead of ignoring them", () => {
+  const invalid = (argv: string[], code: string): void => {
+    assert.throws(() => parseCli(argv), (error: unknown) => error instanceof BridgeError && error.status === 400 && error.code === code, argv.join(" "));
+  };
+  invalid(["--bogus"], "invalid_arguments");
+  invalid(["stray"], "invalid_arguments");
+  invalid(["--model"], "invalid_arguments");
+  invalid(["--serve", "--port", "abc"], "invalid_port");
+  invalid(["--serve", "--port", "70000"], "invalid_port");
+  invalid(["--serve", "--port", "-1"], "invalid_arguments");
+  assert.deepEqual(parseCli(["--serve", "--port", "0"]), { kind: "serve", model: undefined, port: 0, noAuth: false });
+  assert.deepEqual(parseCli(["--serve", "--port", ""]), { kind: "serve", model: undefined, port: DEFAULT_PORT, noAuth: false });
+});
+
+test("arguments after -- are not validated as codex2cc options", () => {
+  assert.deepEqual(parseCli(["--", "--bogus", "stray"]), { kind: "claude", model: undefined, claudeArgs: ["--bogus", "stray"] });
 });

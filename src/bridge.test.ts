@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createServer } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import {
   AnthropicStream,
+  BridgeError,
   estimateInputTokens,
   MessageAccumulator,
   MessageRequest,
+  readSse,
   toAnthropicUsage,
   toOpenAIRequest,
   unsupportedBlockTypes,
@@ -339,4 +341,194 @@ test("AnthropicStream reports usage from the completed event and the estimate at
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+type SseEvent = { event: string; data: Record<string, unknown> };
+
+function captureStream(estimatedInputTokens = 0): { stream: AnthropicStream; events: () => SseEvent[] } {
+  const writes: string[] = [];
+  const response = { write: (chunk: string): boolean => { writes.push(chunk); return true; } } as unknown as ServerResponse;
+  return {
+    stream: new AnthropicStream(response, "gpt-model", estimatedInputTokens),
+    events: () => writes.map((chunk) => {
+      const match = /^event: (.+)\ndata: (.+)\n\n$/s.exec(chunk);
+      assert.ok(match, `unexpected SSE frame: ${chunk}`);
+      return { event: match[1]!, data: JSON.parse(match[2]!) as Record<string, unknown> };
+    }),
+  };
+}
+
+function sseStream(...chunks: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  });
+}
+
+async function collectEvents(...chunks: string[]): Promise<Array<{ type: string }>> {
+  const received: Array<{ type: string }> = [];
+  await readSse(sseStream(...chunks), (event) => received.push(event));
+  return received;
+}
+
+async function rejectsWithBridgeCode(promise: Promise<unknown>, code: string): Promise<void> {
+  await assert.rejects(promise, (error: unknown) => error instanceof BridgeError && error.status === 502 && error.code === code);
+}
+
+test("readSse reassembles frames split across chunks and accepts CRLF line endings", async () => {
+  const events = await collectEvents('data: {"type":"a"}\r\n\r\nda', 'ta: {"type":"b"}\n', '\ndata: {"type":"c"}\n\n');
+  assert.deepEqual(events.map((event) => event.type), ["a", "b", "c"]);
+});
+
+test("readSse ignores comments, event names and the [DONE] sentinel, and joins multi-line data", async () => {
+  const events = await collectEvents(
+    ': keep-alive\n\n',
+    'event: response.created\ndata: {"type":"created"}\n\n',
+    'data: {"type":\ndata: "multi"}\n\n',
+    'data: [DONE]\n\n',
+  );
+  assert.deepEqual(events.map((event) => event.type), ["created", "multi"]);
+});
+
+test("readSse reports malformed JSON, events without a type, and a truncated final frame", async () => {
+  await rejectsWithBridgeCode(collectEvents("data: {not json}\n\n"), "invalid_upstream_json");
+  await rejectsWithBridgeCode(collectEvents('data: {"no":"type"}\n\n'), "invalid_upstream_event");
+  await rejectsWithBridgeCode(collectEvents('data: {"type":"a"}\n\ndata: {"type":"cut'), "truncated_upstream_event");
+});
+
+test("tool_choice maps to the Responses API values", () => {
+  const convert = (toolChoice: object | undefined) => toOpenAIRequest(MessageRequest.parse({
+    model: "m",
+    messages: [{ role: "user", content: "hi" }],
+    ...(toolChoice ? { tool_choice: toolChoice } : {}),
+  }), "gpt-model").tool_choice;
+  assert.equal(convert(undefined), undefined);
+  assert.equal(convert({ type: "none" }), "none");
+  assert.equal(convert({ type: "any" }), "required");
+  assert.equal(convert({ type: "auto" }), "auto");
+  assert.deepEqual(convert({ type: "tool", name: "Read" }), { type: "function", name: "Read" });
+});
+
+test("images: user and tool_result images are forwarded, assistant images are rejected", () => {
+  const png = { type: "image", source: { type: "base64", media_type: "image/png", data: "QUJD" } };
+  const converted = toOpenAIRequest(MessageRequest.parse({
+    model: "m",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "look" }, png] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: [{ type: "text", text: "shot" }, png] }] },
+    ],
+  }), "gpt-model");
+  assert.deepEqual(converted.input[0], {
+    role: "user",
+    content: [{ type: "input_text", text: "look" }, { type: "input_image", image_url: "data:image/png;base64,QUJD" }],
+  });
+  assert.deepEqual(converted.input[1], {
+    type: "function_call_output",
+    call_id: "c1",
+    output: [{ type: "input_text", text: "shot" }, { type: "input_image", image_url: "data:image/png;base64,QUJD" }],
+  });
+  assert.throws(
+    () => toOpenAIRequest(MessageRequest.parse({ model: "m", messages: [{ role: "assistant", content: [png] }] }), "gpt-model"),
+    (error: unknown) => error instanceof BridgeError && error.code === "unsupported_image",
+  );
+});
+
+test("tool errors, array system prompts and misplaced tool blocks are handled explicitly", () => {
+  const converted = toOpenAIRequest(MessageRequest.parse({
+    model: "m",
+    system: [{ type: "text", text: "Rule one." }, { type: "text", text: "Rule two." }],
+    messages: [
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "boom", is_error: true }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "c2", is_error: true }] },
+    ],
+  }), "gpt-model");
+  assert.equal(converted.instructions, "Rule one.\n\nRule two.");
+  assert.deepEqual(converted.input, [
+    { type: "function_call_output", call_id: "c1", output: "Tool error: boom" },
+    { type: "function_call_output", call_id: "c2", output: "Tool error." },
+  ]);
+  const invalidRole = (message: object): unknown => toOpenAIRequest(MessageRequest.parse({ model: "m", messages: [message] }), "gpt-model");
+  assert.throws(() => invalidRole({ role: "assistant", content: [{ type: "tool_result", tool_use_id: "c", content: "x" }] }),
+    (error: unknown) => error instanceof BridgeError && error.code === "invalid_tool_role");
+  assert.throws(() => invalidRole({ role: "user", content: [{ type: "tool_use", id: "c", name: "Read", input: {} }] }),
+    (error: unknown) => error instanceof BridgeError && error.code === "invalid_tool_role");
+});
+
+test("AnthropicStream keeps interleaved parallel tool calls on separate content blocks", () => {
+  const { stream, events } = captureStream();
+  stream.accept({ type: "response.created", response: { id: "resp_1" } });
+  stream.accept({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", name: "Read", call_id: "call_a" } });
+  stream.accept({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", name: "Grep", call_id: "call_b" } });
+  stream.accept({ type: "response.function_call_arguments.delta", output_index: 1, delta: '{"p":' });
+  stream.accept({ type: "response.function_call_arguments.delta", output_index: 0, delta: '{"path":"a"}' });
+  stream.accept({ type: "response.function_call_arguments.delta", output_index: 1, delta: '"x"}' });
+  stream.accept({ type: "response.function_call_arguments.done", output_index: 0, arguments: '{"path":"a"}' });
+  stream.accept({ type: "response.output_item.done", output_index: 0, item: { type: "function_call", name: "Read", call_id: "call_a" } });
+  stream.accept({ type: "response.output_item.done", output_index: 1, item: { type: "function_call", name: "Grep", call_id: "call_b" } });
+  stream.accept({ type: "response.completed", response: { id: "resp_1" } });
+  stream.assertCompleted();
+
+  const all = events();
+  const starts = all.filter((e) => e.event === "content_block_start").map((e) => ({ index: e.data.index, block: e.data.content_block }));
+  assert.deepEqual(starts, [
+    { index: 0, block: { type: "tool_use", id: "call_a", name: "Read", input: {} } },
+    { index: 1, block: { type: "tool_use", id: "call_b", name: "Grep", input: {} } },
+  ]);
+  const jsonFor = (index: number): string => all
+    .filter((e) => e.event === "content_block_delta" && e.data.index === index)
+    .map((e) => (e.data.delta as { partial_json: string }).partial_json).join("");
+  assert.equal(jsonFor(0), '{"path":"a"}', "done event must not duplicate already streamed arguments");
+  assert.equal(jsonFor(1), '{"p":"x"}');
+  assert.deepEqual(all.filter((e) => e.event === "content_block_stop").map((e) => e.data.index), [0, 1]);
+  assert.equal((all.find((e) => e.event === "message_delta")!.data.delta as { stop_reason: string }).stop_reason, "tool_use");
+  assert.equal(all.at(-1)!.event, "message_stop");
+});
+
+test("AnthropicStream closes a text block before starting a tool call and backfills arguments from the done event", () => {
+  const { stream, events } = captureStream();
+  stream.accept({ type: "response.created", response: { id: "resp_1" } });
+  stream.accept({ type: "response.output_text.delta", delta: "Let me look." });
+  stream.accept({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", name: "Read", call_id: "call_a" } });
+  stream.accept({ type: "response.function_call_arguments.done", output_index: 1, arguments: '{"path":"a"}' });
+  stream.accept({ type: "response.output_item.done", output_index: 1, item: { type: "function_call", name: "Read", call_id: "call_a" } });
+  stream.accept({ type: "response.completed", response: { id: "resp_1" } });
+  const sequence = events().map((e) => `${e.event}${e.data.index === undefined ? "" : `#${e.data.index}`}`);
+  assert.deepEqual(sequence, [
+    "message_start", "content_block_start#0", "content_block_delta#0", "content_block_stop#0",
+    "content_block_start#1", "content_block_delta#1", "content_block_stop#1", "message_delta", "message_stop",
+  ]);
+});
+
+test("AnthropicStream emits an empty text block when the response has no content, and throws on upstream failure", () => {
+  const empty = captureStream();
+  empty.stream.accept({ type: "response.created", response: { id: "resp_1" } });
+  empty.stream.accept({ type: "response.completed", response: { id: "resp_1" } });
+  assert.deepEqual(empty.events().map((e) => e.event), ["message_start", "content_block_start", "content_block_stop", "message_delta", "message_stop"]);
+
+  const failing = captureStream();
+  assert.throws(
+    () => failing.stream.accept({ type: "response.failed", response: { error: { code: "rate_limit_exceeded", message: "slow down" } } }),
+    (error: unknown) => error instanceof BridgeError && error.code === "rate_limit_exceeded" && error.message === "slow down",
+  );
+  assert.throws(() => failing.stream.assertCompleted(), (error: unknown) => error instanceof BridgeError && error.code === "upstream_truncated");
+});
+
+test("MessageAccumulator returns every parallel tool call and tolerates malformed arguments", () => {
+  const accumulator = new MessageAccumulator("gpt-model");
+  accumulator.accept({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", name: "Read", call_id: "call_a" } });
+  accumulator.accept({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", name: "Grep", call_id: "call_b" } });
+  accumulator.accept({ type: "response.function_call_arguments.delta", output_index: 1, delta: "{broken" });
+  accumulator.accept({ type: "response.function_call_arguments.delta", output_index: 0, delta: '{"path":"a"}' });
+  accumulator.accept({ type: "response.output_item.done", output_index: 0, item: { type: "function_call", name: "Read", call_id: "call_a" } });
+  accumulator.accept({ type: "response.output_item.done", output_index: 1, item: { type: "function_call", name: "Grep", call_id: "call_b" } });
+  accumulator.accept({ type: "response.completed", response: { id: "resp_1" } });
+  const message = accumulator.buildMessage() as { content: unknown[]; stop_reason: string };
+  assert.deepEqual(message.content, [
+    { type: "tool_use", id: "call_a", name: "Read", input: { path: "a" } },
+    { type: "tool_use", id: "call_b", name: "Grep", input: {} },
+  ]);
+  assert.equal(message.stop_reason, "tool_use");
 });
