@@ -12,6 +12,7 @@ import {
   readSse,
   toOpenAIRequest,
 } from "./bridge.js";
+import { checkClient, checkHost, MIN_TOKEN_LENGTH, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
 
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
@@ -57,8 +58,10 @@ function parseRequest(raw: string): MessageRequest {
   }
 }
 
-function clientAuthorized(request: IncomingMessage, secret?: string): boolean {
-  return true;
+function sendGuardFailure(response: ServerResponse, failure: Extract<GuardResult, { ok: false }>): void {
+  response.writeHead(failure.status, { "Content-Type": "application/json" }).end(
+    JSON.stringify({ type: "error", error: { type: failure.type, message: failure.message } }),
+  );
 }
 
 async function openInference(session: ChatGPTSession, body: object): Promise<Response> {
@@ -136,20 +139,28 @@ function createGatewayServer(
   session: ChatGPTSession,
   defaultModel: string,
   availableModels: Array<{ slug: string; displayName: string }>,
-  secret?: string,
+  policy: GuardPolicy,
 ) {
   const modelSlugs = new Set(availableModels.map((m) => m.slug));
 
   return createServer((request, response) => {
-    const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+    const hostCheck = checkHost(request.headers);
+    if (!hostCheck.ok) {
+      sendGuardFailure(response, hostCheck);
+      return;
+    }
+    const path = requestPathname(request.url);
+    if (path === undefined) {
+      response.writeHead(400).end();
+      return;
+    }
     if (request.method === "HEAD" && path === "/api/hello") {
       response.writeHead(200).end();
       return;
     }
-    if (!clientAuthorized(request, secret)) {
-      response.writeHead(401, { "Content-Type": "application/json" }).end(
-        JSON.stringify({ type: "error", error: { type: "authentication_error", message: "Invalid local gateway credential." } }),
-      );
+    const clientCheck = checkClient(request.headers, policy);
+    if (!clientCheck.ok) {
+      sendGuardFailure(response, clientCheck);
       return;
     }
     if (request.method === "GET" && path === "/v1/models") {
@@ -188,9 +199,10 @@ async function serveStandalone(
   session: ChatGPTSession,
   defaultModel: string,
   availableModels: Array<{ slug: string; displayName: string }>,
-  requestedPort: number = 3456,
+  requestedPort: number,
+  policy: GuardPolicy,
 ): Promise<void> {
-  const server = createGatewayServer(session, defaultModel, availableModels);
+  const server = createGatewayServer(session, defaultModel, availableModels, policy);
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(requestedPort, "127.0.0.1", resolve);
@@ -200,6 +212,11 @@ async function serveStandalone(
   process.stdout.write(`   Base URL: http://127.0.0.1:${requestedPort}\n`);
   process.stdout.write(`   Active Codex Model: ${defaultModel}\n`);
   process.stdout.write(`   Available Models: ${availableModels.map((m) => m.slug).join(", ")}\n`);
+  if (policy.mode === "token") {
+    process.stdout.write(`   API key (send as "Authorization: Bearer" or "x-api-key"): ${policy.token}\n`);
+  } else {
+    process.stdout.write(`   WARNING: authentication disabled (--no-auth). Any local process can spend your ChatGPT quota.\n`);
+  }
   process.stdout.write(`   Compatible Clients: Cherry Studio, Chatbox, Cline, Roo Code, LibreChat, TypingMind\n`);
   process.stdout.write(`   Press Ctrl+C to stop.\n\n`);
 
@@ -218,7 +235,7 @@ async function serveClaudeCli(
   args: string[],
 ): Promise<number> {
   const secret = randomBytes(32).toString("base64url");
-  const server = createGatewayServer(session, selectedModel, availableModels, secret);
+  const server = createGatewayServer(session, selectedModel, availableModels, { mode: "token", token: secret });
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -260,6 +277,16 @@ async function serveClaudeCli(
   }
 }
 
+function standalonePolicy(noAuth: boolean, configuredToken: string | undefined): GuardPolicy {
+  if (noAuth) return { mode: "open" };
+  const token = configuredToken?.trim();
+  if (token === undefined || token.length === 0) return { mode: "token", token: randomBytes(32).toString("base64url") };
+  if (token.length < MIN_TOKEN_LENGTH) {
+    throw new BridgeError(400, "weak_gateway_token", `CODEX2CC_TOKEN must be at least ${MIN_TOKEN_LENGTH} characters.`);
+  }
+  return { mode: "token", token };
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const separator = argv.indexOf("--");
@@ -269,6 +296,7 @@ async function main(): Promise<void> {
   const isListModels = options.includes("--list-models");
   const isServe = options.includes("--serve");
   const isMcp = options.includes("--mcp");
+  const isNoAuth = options.includes("--no-auth");
   const isSkipPermissions = options.includes("--dangerously-skip-permissions") || options.includes("-y") || options.includes("--skip-permissions");
   const modelIndex = options.indexOf("--model");
   const portIndex = options.indexOf("--port");
@@ -297,7 +325,7 @@ async function main(): Promise<void> {
 
   if (isServe) {
     const port = portIndex >= 0 && options[portIndex + 1] ? parseInt(options[portIndex + 1]!, 10) : 3456;
-    await serveStandalone(session, selectedModel, models, port);
+    await serveStandalone(session, selectedModel, models, port, standalonePolicy(isNoAuth, process.env.CODEX2CC_TOKEN));
     return;
   }
 
