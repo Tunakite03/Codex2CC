@@ -1,0 +1,30 @@
+{
+  "name": "codex2cc",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "codex2cc": "./dist/main.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "npm run build && node dist/main.js",
+    "serve": "npm run build && node dist/main.js --serve",
+    "mcp": "npm run build && node dist/main.js --mcp",
+    "test": "npm run build && node --test dist/*.test.js"
+  },
+  "dependencies": {
+    "jose": "^6.1.0",
+    "just-secrets": "^0.0.2",
+    "proper-lockfile": "^4.1.2",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "^5.9.0"
+  }
+}
