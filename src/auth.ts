@@ -1,18 +1,32 @@
 import { randomUUID } from "node:crypto";
-import { open, readFile, rename, chmod } from "node:fs/promises";
+import { chmod, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { BridgeError } from "./bridge.js";
-import { CredentialStore, TokenResponse, type TokenResponse as Tokens } from "./credentials.js";
 
-const AUTH_ORIGIN = "https://auth.openai.com";
-const CHATGPT_BACKEND_ORIGIN = "https://chatgpt.com/backend-api";
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const CODEX_AUTH_PATH = join(homedir(), ".codex", "auth.json");
-const CODEX_MODELS_CACHE_PATH = join(homedir(), ".codex", "models_cache.json");
-const SETTINGS_DIRECTORY = join(homedir(), ".config", "codex2cc");
-const credentialStore = new CredentialStore(SETTINGS_DIRECTORY);
+const CODEX_CLIENT_VERSION = "0.159.0";
+const REFRESH_MARGIN_MS = 60_000;
+const FRESH_TOKEN_WINDOW_MS = 30_000;
+const LOST_RACE_POLLS = 5;
+const LOST_RACE_POLL_INTERVAL_MS = 150;
+
+export type SessionOptions = {
+  readonly authPath: string;
+  readonly modelsCachePath: string;
+  readonly authOrigin: string;
+  readonly backendOrigin: string;
+};
+
+export function defaultSessionOptions(): SessionOptions {
+  return {
+    authPath: join(homedir(), ".codex", "auth.json"),
+    modelsCachePath: join(homedir(), ".codex", "models_cache.json"),
+    authOrigin: "https://auth.openai.com",
+    backendOrigin: "https://chatgpt.com/backend-api",
+  };
+}
 
 const CodexAuthFile = z.object({
   auth_mode: z.string(),
@@ -25,6 +39,12 @@ const CodexAuthFile = z.object({
   last_refresh: z.string().optional(),
 });
 
+const RefreshResponse = z.object({
+  access_token: z.string().min(1),
+  refresh_token: z.string().min(1).optional(),
+  id_token: z.string().min(1).optional(),
+});
+
 const ModelsApiResponse = z.object({
   models: z.array(z.object({
     slug: z.string().min(1),
@@ -32,8 +52,15 @@ const ModelsApiResponse = z.object({
   })),
 });
 
-function warn(operation: string, attempt: number, status: number | string): void {
-  process.stderr.write(`${JSON.stringify({ level: "warn", operation, attempt, status })}\n`);
+type Tokens = { access_token: string; refresh_token: string; id_token: string; account_id?: string | undefined };
+type AuthDocument = { readonly document: Record<string, unknown>; readonly tokens: Tokens };
+
+function isErrnoException(error: unknown, code: string): boolean {
+  return error instanceof Error && "code" in error && error.code === code;
+}
+
+function warn(operation: string, detail: Record<string, unknown>): void {
+  process.stderr.write(`${JSON.stringify({ level: "warn", operation, ...detail })}\n`);
 }
 
 async function fetchRetry(url: string, init: RequestInit, operation: string): Promise<Response> {
@@ -43,12 +70,12 @@ async function fetchRetry(url: string, init: RequestInit, operation: string): Pr
       response = await fetch(url, { ...init, signal: AbortSignal.timeout(20_000) });
     } catch (error) {
       if (!(error instanceof TypeError) || attempt === 3) throw new BridgeError(502, "network_error", `${operation} failed because OpenAI was unreachable.`);
-      warn(operation, attempt, "network_error");
+      warn(operation, { attempt, status: "network_error" });
       await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
       continue;
     }
     if ((response.status === 429 || response.status >= 500) && attempt < 3) {
-      warn(operation, attempt, response.status);
+      warn(operation, { attempt, status: response.status });
       await response.body?.cancel();
       await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
       continue;
@@ -56,6 +83,18 @@ async function fetchRetry(url: string, init: RequestInit, operation: string): Pr
     return response;
   }
   throw new BridgeError(502, "retry_exhausted", `${operation} failed after bounded retries.`);
+}
+
+/** One attempt, no retry: refresh tokens are single-use, so resending a possibly-consumed token only makes things worse. */
+async function fetchOnce(url: string, init: RequestInit, operation: string): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(20_000) });
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof DOMException) {
+      throw new BridgeError(502, "network_error", `${operation} failed because OpenAI was unreachable. If requests are then rejected, run 'codex login'.`);
+    }
+    throw error;
+  }
 }
 
 function parseJwtPayload(token: string): Record<string, unknown> | null {
@@ -88,153 +127,205 @@ function extractTokenExp(accessToken: string): number {
   return Date.now() + 3600_000;
 }
 
+async function readAuthFile(path: string): Promise<AuthDocument> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (error) {
+    if (isErrnoException(error, "ENOENT")) {
+      throw new BridgeError(401, "auth_required", `No Codex login found at ${path}. Run 'codex login' in your terminal to sign in with ChatGPT first.`);
+    }
+    throw error;
+  }
+  try {
+    const json: unknown = JSON.parse(raw);
+    const document = z.record(z.string(), z.unknown()).parse(json);
+    const parsed = CodexAuthFile.parse(json);
+    if (parsed.auth_mode !== "chatgpt") {
+      throw new BridgeError(401, "auth_required", `${path} uses auth_mode "${parsed.auth_mode}". Run 'codex login' and sign in with ChatGPT.`);
+    }
+    return { document, tokens: parsed.tokens };
+  } catch (error) {
+    if (error instanceof SyntaxError || error instanceof z.ZodError) {
+      throw new BridgeError(500, "invalid_codex_auth", `${path} is not a valid Codex auth file.`);
+    }
+    throw error;
+  }
+}
+
+async function writeFileAtomic(path: string, content: string): Promise<void> {
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    const handle = await open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(content);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporary, path);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+  await chmod(path, 0o600);
+}
+
+/**
+ * A ChatGPT session backed by the Codex CLI login in ~/.codex/auth.json. Refresh tokens are
+ * single-use and Codex CLI (or another Codex2CC process) may rotate them, so the file is the source
+ * of truth for tokens this process has never seen: it is re-read before and after a refresh to adopt
+ * them, but a refresh token this process already held is never adopted again, so a failed write-back
+ * cannot resurrect a consumed token.
+ */
 export class ChatGPTSession {
   private pendingRefresh: Promise<string> | undefined;
+  private readonly seenRefreshTokens = new Set<string>();
+  private lastRefreshAt: number | undefined;
 
   private constructor(
-    private tokens: { access_token: string; refresh_token: string; id_token: string; account_id?: string | undefined },
-    private accountIdValue: string,
+    private readonly options: SessionOptions,
+    private tokens: Tokens,
+    private readonly accountIdValue: string,
     private expiresAt: number,
-    private readonly isCodexAuth: boolean,
-  ) {}
+  ) {
+    this.seenRefreshTokens.add(tokens.refresh_token);
+  }
 
   accountId(): string {
     return this.accountIdValue;
   }
 
-  static async open(): Promise<ChatGPTSession> {
-    // 1. Prioritize ~/.codex/auth.json from official Codex CLI login
-    try {
-      const raw = await readFile(CODEX_AUTH_PATH, "utf8");
-      const parsed = CodexAuthFile.parse(JSON.parse(raw));
-      if (parsed.auth_mode === "chatgpt") {
-        const accountId = extractAccountId(parsed.tokens.access_token, parsed.tokens.account_id);
-        if (!accountId) {
-          throw new BridgeError(500, "missing_account_id", "ChatGPT Account ID could not be resolved from ~/.codex/auth.json.");
-        }
-        const expiresAt = extractTokenExp(parsed.tokens.access_token);
-        const session = new ChatGPTSession(parsed.tokens, accountId, expiresAt, true);
-        return session;
-      }
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
-        process.stderr.write(`${JSON.stringify({ level: "warn", operation: "read_codex_auth", error: error instanceof Error ? error.message : String(error) })}\n`);
-      }
+  static async open(options: SessionOptions = defaultSessionOptions()): Promise<ChatGPTSession> {
+    const { tokens } = await readAuthFile(options.authPath);
+    const accountId = extractAccountId(tokens.access_token, tokens.account_id);
+    if (!accountId) {
+      throw new BridgeError(500, "missing_account_id", `ChatGPT Account ID could not be resolved from ${options.authPath}.`);
     }
-
-    // 2. Check saved credentials in CredentialStore
-    const saved = await credentialStore.load();
-    if (saved) {
-      const accountId = extractAccountId(saved.tokens.access_token);
-      if (accountId) {
-        return new ChatGPTSession(saved.tokens, accountId, saved.expiresAt, false);
-      }
-    }
-
-    throw new BridgeError(
-      401,
-      "auth_required",
-      "No active ChatGPT Plus session found. Please run 'codex login' in your terminal to sign in to ChatGPT Plus via Codex CLI first.",
-    );
+    return new ChatGPTSession(options, tokens, accountId, extractTokenExp(tokens.access_token));
   }
 
   async accessToken(): Promise<string> {
-    if (Date.now() < this.expiresAt - 60_000) return this.tokens.access_token;
-    if (this.pendingRefresh) return this.pendingRefresh;
-    const pending = this.refreshAccessToken();
-    this.pendingRefresh = pending;
-    try { return await pending; }
-    finally { if (this.pendingRefresh === pending) this.pendingRefresh = undefined; }
+    if (Date.now() < this.expiresAt - REFRESH_MARGIN_MS) return this.tokens.access_token;
+    return this.refreshDeduplicated();
   }
 
-  private async refreshAccessToken(): Promise<string> {
-    if (this.isCodexAuth) {
-      const body = new URLSearchParams({
-        grant_type: "refresh_token",
-        client_id: CODEX_CLIENT_ID,
-        refresh_token: this.tokens.refresh_token,
-      });
-      const response = await fetchRetry(
-        `${AUTH_ORIGIN}/api/accounts/oauth/token`,
-        { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body },
-        "Codex token refresh",
-      );
-      if (!response.ok) {
-        throw new BridgeError(
-          response.status === 401 || response.status === 400 ? 401 : 502,
-          "refresh_failed",
-          `ChatGPT token refresh returned HTTP ${response.status}. Please run 'codex login' in terminal to refresh.`,
-        );
-      }
-      const data = await response.json();
-      const updatedTokens = {
-        access_token: data.access_token,
-        refresh_token: data.refresh_token ?? this.tokens.refresh_token,
-        id_token: data.id_token ?? this.tokens.id_token,
-        account_id: this.accountIdValue,
-      };
-      this.tokens = updatedTokens;
-      this.expiresAt = extractTokenExp(updatedTokens.access_token);
+  /**
+   * Called when upstream rejected `rejected` with 401. Returns a different valid token when one
+   * is already available, otherwise refreshes. A token refreshed moments ago is not refreshed
+   * again: that would burn a rotation per request when 401 has another cause.
+   */
+  async refreshAfterRejection(rejected: string): Promise<string> {
+    if (this.tokens.access_token !== rejected) return this.tokens.access_token;
+    if (this.lastRefreshAt !== undefined && Date.now() - this.lastRefreshAt < FRESH_TOKEN_WINDOW_MS) {
+      throw new BridgeError(401, "token_rejected", "ChatGPT rejected a token that was refreshed moments ago. Run 'codex login' to sign in again.");
+    }
+    return this.refreshDeduplicated();
+  }
 
-      // Persist refreshed tokens back to ~/.codex/auth.json
-      try {
-        const raw = await readFile(CODEX_AUTH_PATH, "utf8");
-        const current = JSON.parse(raw);
-        current.tokens = { ...current.tokens, ...updatedTokens };
-        current.last_refresh = new Date().toISOString();
-        const temporary = `${CODEX_AUTH_PATH}.${randomUUID()}.tmp`;
-        const handle = await open(temporary, "wx", 0o600);
-        try {
-          await handle.writeFile(JSON.stringify(current, null, 2));
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
-        await rename(temporary, CODEX_AUTH_PATH);
-        await chmod(CODEX_AUTH_PATH, 0o600);
-      } catch (err) {
-        process.stderr.write(`Failed to update ~/.codex/auth.json: ${err instanceof Error ? err.message : String(err)}\n`);
-      }
+  private refreshDeduplicated(): Promise<string> {
+    if (this.pendingRefresh) return this.pendingRefresh;
+    const pending: Promise<string> = this.refresh().finally(() => {
+      if (this.pendingRefresh === pending) this.pendingRefresh = undefined;
+    });
+    this.pendingRefresh = pending;
+    return pending;
+  }
 
-      return updatedTokens.access_token;
+  private adopt(tokens: Tokens): void {
+    this.seenRefreshTokens.add(tokens.refresh_token);
+    this.tokens = { ...tokens, account_id: this.accountIdValue };
+    this.expiresAt = extractTokenExp(tokens.access_token);
+  }
+
+  /** Adopts tokens another process rotated on disk. Returns true when a usable token was adopted. */
+  private async adoptRotatedTokens(): Promise<boolean> {
+    const onDisk = (await readAuthFile(this.options.authPath)).tokens;
+    if (this.seenRefreshTokens.has(onDisk.refresh_token)) return false;
+    const diskAccountId = extractAccountId(onDisk.access_token, onDisk.account_id);
+    if (diskAccountId !== undefined && diskAccountId !== this.accountIdValue) {
+      throw new BridgeError(401, "account_changed", "The Codex login now belongs to a different ChatGPT account. Restart codex2cc to use it.");
+    }
+    this.adopt(onDisk);
+    return Date.now() < this.expiresAt - REFRESH_MARGIN_MS;
+  }
+
+  private async refresh(): Promise<string> {
+    try {
+      if (await this.adoptRotatedTokens()) return this.tokens.access_token;
+    } catch (error) {
+      if (error instanceof BridgeError && error.code === "account_changed") throw error;
+      // An unreadable file must not fail a session whose in-memory refresh token is still usable.
+      warn("adopt_rotated_tokens", { message: error instanceof Error ? error.message : String(error) });
     }
 
-    // Refresh via CredentialStore
-    return credentialStore.withLock(async () => {
-      const latest = await credentialStore.load();
-      if (!latest) throw new BridgeError(500, "missing_saved_credentials", "ChatGPT credentials disappeared before token refresh.");
-      if (latest.tokens.refresh_token !== this.tokens.refresh_token) {
-        this.tokens = latest.tokens;
-        this.expiresAt = latest.expiresAt;
-        if (Date.now() < this.expiresAt - 60_000) return this.tokens.access_token;
-      }
-      const body = new URLSearchParams({
-        grant_type: "refresh_token",
-        client_id: latest.clientId,
-        refresh_token: this.tokens.refresh_token,
-      });
-      const response = await fetchRetry(
-        `${AUTH_ORIGIN}/api/accounts/oauth/token`,
-        { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body },
-        "OAuth token refresh",
-      );
-      if (!response.ok) {
-        throw new BridgeError(401, "reauth_required", `ChatGPT token refresh returned HTTP ${response.status}.`);
-      }
-      const replacement = TokenResponse.parse(await response.json());
-      this.tokens = replacement;
-      this.expiresAt = Date.now() + replacement.expires_in * 1000;
-      await credentialStore.save({ clientId: latest.clientId, subject: latest.subject, tokens: replacement, expiresAt: this.expiresAt });
-      return replacement.access_token;
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: CODEX_CLIENT_ID,
+      refresh_token: this.tokens.refresh_token,
     });
+    const response = await fetchOnce(
+      `${this.options.authOrigin}/api/accounts/oauth/token`,
+      { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body },
+      "Codex token refresh",
+    );
+    if (!response.ok) {
+      await response.body?.cancel();
+      if (await this.adoptAfterLostRace()) return this.tokens.access_token;
+      throw new BridgeError(
+        response.status === 401 || response.status === 400 ? 401 : 502,
+        "refresh_failed",
+        `ChatGPT token refresh returned HTTP ${response.status}. Please run 'codex login' in terminal to refresh.`,
+      );
+    }
+    const data = RefreshResponse.parse(await response.json());
+    const updated: Tokens = {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token ?? this.tokens.refresh_token,
+      id_token: data.id_token ?? this.tokens.id_token,
+    };
+    this.adopt(updated);
+    this.lastRefreshAt = Date.now();
+    await this.persist(updated);
+    return updated.access_token;
+  }
+
+  /** A rejected refresh usually means a concurrent process used the single-use token first; give it time to save. */
+  private async adoptAfterLostRace(): Promise<boolean> {
+    for (let poll = 0; poll < LOST_RACE_POLLS; poll++) {
+      if (poll > 0) await new Promise((resolve) => setTimeout(resolve, LOST_RACE_POLL_INTERVAL_MS));
+      try {
+        if (await this.adoptRotatedTokens()) return true;
+      } catch (error) {
+        if (error instanceof BridgeError && error.code === "account_changed") throw error;
+        warn("adopt_rotated_tokens", { message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return false;
+  }
+
+  private async persist(updated: Tokens): Promise<void> {
+    try {
+      // Write through a symlinked auth.json instead of replacing the link.
+      const target = await realpath(this.options.authPath);
+      const { document, tokens: onDisk } = await readAuthFile(target);
+      if (!this.seenRefreshTokens.has(onDisk.refresh_token)) {
+        warn("persist_codex_auth", { path: target, message: "auth.json was rotated by another process during the refresh; leaving it untouched." });
+        return;
+      }
+      const existing = typeof document.tokens === "object" && document.tokens !== null ? document.tokens : {};
+      const tokens = { ...existing, access_token: updated.access_token, refresh_token: updated.refresh_token, id_token: updated.id_token };
+      await writeFileAtomic(target, JSON.stringify({ ...document, tokens, last_refresh: new Date().toISOString() }, null, 2));
+    } catch (error) {
+      // The in-memory session stays valid, but the rotated refresh token is not saved: Codex CLI may need 'codex login'.
+      warn("persist_codex_auth", { path: this.options.authPath, message: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   async listModels(): Promise<Array<{ slug: string; displayName: string }>> {
-    // 1. Try remote ChatGPT backend models catalog
     try {
-      const url = `${CHATGPT_BACKEND_ORIGIN}/codex/models?client_version=0.159.0`;
       const response = await fetchRetry(
-        url,
+        `${this.options.backendOrigin}/codex/models?client_version=${CODEX_CLIENT_VERSION}`,
         {
           method: "GET",
           headers: {
@@ -247,31 +338,24 @@ export class ChatGPTSession {
       if (response.ok) {
         const parsed = ModelsApiResponse.safeParse(await response.json());
         if (parsed.success && parsed.data.models.length > 0) {
-          return parsed.data.models.map((m) => ({
-            slug: m.slug,
-            displayName: m.display_name ?? m.slug,
-          }));
+          return parsed.data.models.map((m) => ({ slug: m.slug, displayName: m.display_name ?? m.slug }));
         }
       }
     } catch (error) {
-      process.stderr.write(`${JSON.stringify({ level: "warn", operation: "remote_model_discovery", message: error instanceof Error ? error.message : String(error) })}\n`);
+      warn("remote_model_discovery", { message: error instanceof Error ? error.message : String(error) });
     }
 
-    // 2. Try local ~/.codex/models_cache.json
     try {
-      const raw = await readFile(CODEX_MODELS_CACHE_PATH, "utf8");
-      const cache = JSON.parse(raw);
-      if (Array.isArray(cache.models)) {
-        return cache.models.map((m: { slug: string; display_name?: string }) => ({
-          slug: m.slug,
-          displayName: m.display_name ?? m.slug,
-        }));
+      const parsed = ModelsApiResponse.safeParse(JSON.parse(await readFile(this.options.modelsCachePath, "utf8")));
+      if (parsed.success && parsed.data.models.length > 0) {
+        return parsed.data.models.map((m) => ({ slug: m.slug, displayName: m.display_name ?? m.slug }));
       }
-    } catch {
-      // Fallback
+    } catch (error) {
+      if (!isErrnoException(error, "ENOENT")) {
+        warn("local_model_cache", { path: this.options.modelsCachePath, message: error instanceof Error ? error.message : String(error) });
+      }
     }
 
-    // 3. Sensible defaults
     return [
       { slug: "gpt-6-sol", displayName: "GPT-6 Sol" },
       { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol" },

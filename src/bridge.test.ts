@@ -3,7 +3,6 @@ import test from "node:test";
 import { createServer } from "node:http";
 import {
   AnthropicStream,
-  completedMessage,
   estimateInputTokens,
   MessageAccumulator,
   MessageRequest,
@@ -86,31 +85,10 @@ test("maps system and developer history to supported developer messages", () => 
   ]);
 });
 
-test("maps a completed OpenAI function call to Anthropic tool_use", () => {
-  const message = completedMessage({
-    type: "response.completed",
-    response: {
-      id: "resp_1",
-      usage: { input_tokens: 10, output_tokens: 5 },
-      output: [{ type: "function_call", name: "Read", call_id: "call_1", arguments: '{"path":"main.ts"}' }],
-    },
-  }, "gpt-model", ["Read"]);
-  assert.deepEqual(message, {
-    id: "resp_1",
-    type: "message",
-    role: "assistant",
-    model: "gpt-model",
-    content: [{ type: "tool_use", id: "call_1", name: "Read", input: { path: "main.ts" } }],
-    stop_reason: "tool_use",
-    stop_sequence: null,
-    usage: { input_tokens: 10, output_tokens: 5 },
-  });
-});
-
 test("streams a complete Anthropic tool call with validated JSON arguments", async () => {
   const server = createServer((_request, response) => {
     response.writeHead(200, { "Content-Type": "text/event-stream" });
-    const stream = new AnthropicStream(response, "gpt-model", ["Read"]);
+    const stream = new AnthropicStream(response, "gpt-model");
     stream.accept({ type: "response.created", response: { id: "resp_1" } });
     stream.accept({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", name: "Read", call_id: "call_1" } });
     stream.accept({ type: "response.function_call_arguments.delta", output_index: 0, delta: '{"path":"main.ts"}' });
@@ -136,7 +114,7 @@ test("streams a complete Anthropic tool call with validated JSON arguments", asy
 });
 
 test("MessageAccumulator collects text and tool calls for non-streaming requests", () => {
-  const accumulator = new MessageAccumulator("gpt-model", ["Read"]);
+  const accumulator = new MessageAccumulator("gpt-model");
   accumulator.accept({ type: "response.created", response: { id: "resp_acc_1" } });
   accumulator.accept({ type: "response.output_text.delta", delta: "Here is the result." });
   accumulator.accept({ type: "response.output_text.done" });
@@ -230,16 +208,13 @@ test("maps assistant text to output_text rather than input_text", () => {
   });
 });
 
-test("maps completed refusal event to Anthropic assistant text block", () => {
-  const message = completedMessage({
-    type: "response.completed",
-    response: {
-      id: "resp_refusal_1",
-      usage: { input_tokens: 10, output_tokens: 5 },
-      output: [{ type: "message", content: [{ type: "refusal", refusal: "Cannot fulfill request" }] }],
-    },
-  }, "gpt-model", []);
-  assert.deepEqual(message, {
+test("MessageAccumulator turns a refusal into an assistant text block", () => {
+  const accumulator = new MessageAccumulator("gpt-model");
+  accumulator.accept({ type: "response.created", response: { id: "resp_refusal_1" } });
+  accumulator.accept({ type: "response.refusal.delta", delta: "Cannot fulfill request" });
+  accumulator.accept({ type: "response.refusal.done" });
+  accumulator.accept({ type: "response.completed", response: { id: "resp_refusal_1", usage: { input_tokens: 10, output_tokens: 5 } } });
+  assert.deepEqual(accumulator.buildMessage(), {
     id: "resp_refusal_1",
     type: "message",
     role: "assistant",
@@ -249,6 +224,16 @@ test("maps completed refusal event to Anthropic assistant text block", () => {
     stop_sequence: null,
     usage: { input_tokens: 10, output_tokens: 5 },
   });
+});
+
+test("tool names are forwarded verbatim, including names that look like internal placeholders", () => {
+  const accumulator = new MessageAccumulator("gpt-model");
+  accumulator.accept({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", name: "tool_1", call_id: "call_1" } });
+  accumulator.accept({ type: "response.function_call_arguments.delta", delta: "{}" });
+  accumulator.accept({ type: "response.output_item.done", item: { type: "function_call", name: "tool_1", call_id: "call_1" } });
+  accumulator.accept({ type: "response.completed", response: { id: "resp_1" } });
+  const message = accumulator.buildMessage() as { content: unknown[] };
+  assert.deepEqual(message.content, [{ type: "tool_use", id: "call_1", name: "tool_1", input: {} }]);
 });
 
 test("toAnthropicUsage reports cached tokens separately from fresh input", () => {
@@ -338,7 +323,7 @@ test("estimateInputTokens approximates four characters per token plus a fixed co
 test("AnthropicStream reports usage from the completed event and the estimate at message_start", async () => {
   const server = createServer((_request, response) => {
     response.writeHead(200, { "Content-Type": "text/event-stream" });
-    const stream = new AnthropicStream(response, "gpt-model", [], 42);
+    const stream = new AnthropicStream(response, "gpt-model", 42);
     stream.accept({ type: "response.created", response: { id: "resp_1" } });
     stream.accept({ type: "response.output_text.delta", delta: "ok" });
     stream.accept({ type: "response.completed", response: { id: "resp_1", usage: { input_tokens: 100, output_tokens: 7, input_tokens_details: { cached_tokens: 40 } } } });

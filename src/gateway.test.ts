@@ -52,7 +52,7 @@ type Gateway = { base: string; port: number; close: () => Promise<void> };
 
 async function startGateway(upstreamUrl: string, overrides: Partial<GatewayOptions> = {}): Promise<Gateway> {
   const server = createGatewayServer({
-    session: { accessToken: async () => "upstream-token", accountId: () => "acct_1" },
+    session: { accessToken: async () => "upstream-token", refreshAfterRejection: async () => "refreshed-token", accountId: () => "acct_1" },
     defaultModel: "gpt-6-sol",
     availableModels: [{ slug: "gpt-6-sol", displayName: "GPT-6 Sol" }, { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol" }],
     policy: { mode: "token", token: TOKEN },
@@ -211,6 +211,42 @@ test("gateway gives up after bounded retries and reports rate limiting", async (
     assert.equal(response.status, 429);
     assert.equal(((await response.json()) as { error: { type: string } }).error.type, "rate_limit_error");
     assert.equal(upstream.requests.length, 3);
+  });
+});
+
+test("gateway refreshes the session once when upstream answers 401 and retries with the new token", async () => {
+  await withGateway((_request, response, attempt) => {
+    if (attempt === 1) {
+      response.writeHead(401).end("expired");
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/event-stream" }).end(HELLO_STREAM);
+  }, async (gateway, upstream) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstream.requests.map((sent) => sent.headers.authorization), ["Bearer upstream-token", "Bearer refreshed-token"]);
+  });
+});
+
+test("gateway reports 401 as an authentication error after a single refresh attempt", async () => {
+  await withGateway((_request, response) => {
+    response.writeHead(401).end("revoked");
+  }, async (gateway, upstream) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
+    assert.equal(response.status, 401);
+    assert.equal(((await response.json()) as { error: { type: string } }).error.type, "authentication_error");
+    assert.equal(upstream.requests.length, 2);
+  });
+});
+
+test("gateway passes an upstream 403 through as a permission error", async () => {
+  await withGateway((_request, response) => {
+    response.writeHead(403).end("blocked");
+  }, async (gateway, upstream) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
+    assert.equal(response.status, 403);
+    assert.equal(((await response.json()) as { error: { type: string } }).error.type, "permission_error");
+    assert.equal(upstream.requests.length, 1);
   });
 });
 

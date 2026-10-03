@@ -296,43 +296,9 @@ export type OpenAIEvent = {
   text?: string;
 };
 
-export function completedMessage(event: OpenAIEvent, model: string, toolNames: string[]): object {
-  if (event.type !== "response.completed" || !event.response?.id) {
-    throw new BridgeError(502, "missing_completed_response", "OpenAI did not return a completed response body.");
-  }
-  const content: Array<{ type: "text"; text: string } | { type: "tool_use"; id: string; name: string; input: z.infer<typeof JsonValue> }> = [];
-  for (const item of event.response.output ?? []) {
-    if (item.type === "message") {
-      for (const part of item.content ?? []) {
-        if (part.type === "output_text" && typeof part.text === "string") {
-          content.push({ type: "text", text: part.text });
-        } else if (part.type === "refusal") {
-          const refusalText = (part as { refusal?: string; text?: string }).refusal ?? (part as { refusal?: string; text?: string }).text;
-          if (typeof refusalText === "string") content.push({ type: "text", text: refusalText });
-        }
-      }
-    } else if (item.type === "function_call") {
-      const match = item.name ? /^tool_(\d+)$/.exec(item.name) : null;
-      let name = item.name;
-      if (match) {
-        const toolIdx = Number(match[1]);
-        const mapped = toolNames[toolIdx];
-        if (mapped) name = mapped;
-      }
-      if (!name || !item.call_id || !item.arguments) throw new BridgeError(502, "invalid_tool_call", "OpenAI completed an invalid tool call.");
-      content.push({ type: "tool_use", id: item.call_id, name, input: JsonValue.parse(JSON.parse(item.arguments)) });
-    }
-  }
-  return {
-    id: event.response.id,
-    type: "message",
-    role: "assistant",
-    model,
-    content,
-    stop_reason: content.some((part) => part.type === "tool_use") ? "tool_use" : "end_turn",
-    stop_sequence: null,
-    usage: toAnthropicUsage(event.response.usage),
-  };
+/** Responses events normally carry output_index; without one the oldest open call is meant. */
+function resolveOutputIndex(event: OpenAIEvent, open: ReadonlyMap<number, unknown>): number {
+  return event.output_index ?? open.keys().next().value ?? 0;
 }
 
 function writeEvent(response: ServerResponse, event: string, data: object): void {
@@ -352,7 +318,6 @@ export class AnthropicStream {
   constructor(
     private readonly response: ServerResponse,
     private readonly model: string,
-    private readonly toolNames: string[],
     private readonly estimatedInputTokens: number = 0,
   ) {}
 
@@ -404,13 +369,7 @@ export class AnthropicStream {
       this.closeText();
       const outputIndex = event.output_index ?? this.functionBlocks.size;
       const callId = event.item.call_id ?? `call_${randomUUID()}`;
-      let name = event.item.name ?? "tool";
-      const match = /^tool_(\d+)$/.exec(name);
-      if (match) {
-        const toolIdx = Number(match[1]);
-        const mapped = this.toolNames[toolIdx];
-        if (mapped) name = mapped;
-      }
+      const name = event.item.name ?? "tool";
       const index = this.nextBlock++;
       this.usedTool = true;
       this.functionBlocks.set(outputIndex, index);
@@ -421,8 +380,7 @@ export class AnthropicStream {
         content_block: { type: "tool_use", id: callId, name, input: {} },
       });
     } else if (event.type === "response.function_call_arguments.delta") {
-      const fallbackIdx = this.functionBlocks.size > 0 ? (this.functionBlocks.keys().next().value ?? 0) : 0;
-      const outputIndex = event.output_index ?? fallbackIdx;
+      const outputIndex = resolveOutputIndex(event, this.functionBlocks);
       const index = this.functionBlocks.get(outputIndex);
       if (index !== undefined && typeof event.delta === "string") {
         this.functionArguments.set(outputIndex, (this.functionArguments.get(outputIndex) ?? "") + event.delta);
@@ -433,8 +391,7 @@ export class AnthropicStream {
         });
       }
     } else if (event.type === "response.function_call_arguments.done") {
-      const fallbackIdx = this.functionBlocks.size > 0 ? (this.functionBlocks.keys().next().value ?? 0) : 0;
-      const outputIndex = event.output_index ?? fallbackIdx;
+      const outputIndex = resolveOutputIndex(event, this.functionBlocks);
       const index = this.functionBlocks.get(outputIndex);
       if (index !== undefined && typeof event.arguments === "string" && (this.functionArguments.get(outputIndex) ?? "") === "") {
         this.functionArguments.set(outputIndex, event.arguments);
@@ -445,8 +402,7 @@ export class AnthropicStream {
         });
       }
     } else if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
-      const fallbackIdx = this.functionBlocks.size > 0 ? (this.functionBlocks.keys().next().value ?? 0) : 0;
-      const outputIndex = event.output_index ?? fallbackIdx;
+      const outputIndex = resolveOutputIndex(event, this.functionBlocks);
       const index = this.functionBlocks.get(outputIndex);
       if (index !== undefined) {
         writeEvent(this.response, "content_block_stop", { type: "content_block_stop", index });
@@ -492,7 +448,7 @@ export class MessageAccumulator {
   > = [];
   private usage: AnthropicUsage = { input_tokens: 0, output_tokens: 0 };
 
-  constructor(private readonly model: string, private readonly toolNames: string[]) {}
+  constructor(private readonly model: string) {}
 
   accept(event: OpenAIEvent): void {
     if (event.type === "response.created" && event.response?.id) {
@@ -506,28 +462,20 @@ export class MessageAccumulator {
       }
     } else if (event.type === "response.output_item.added" && event.item?.type === "function_call") {
       const outputIndex = event.output_index ?? this.toolCalls.size;
-      let name = event.item.name ?? "tool";
-      const match = /^tool_(\d+)$/.exec(name);
-      if (match) {
-        const toolIdx = Number(match[1]);
-        const mapped = this.toolNames[toolIdx];
-        if (mapped) name = mapped;
-      }
+      const name = event.item.name ?? "tool";
       this.toolCalls.set(outputIndex, {
         id: event.item.call_id ?? `call_${randomUUID()}`,
         name,
         args: "",
       });
     } else if (event.type === "response.function_call_arguments.delta") {
-      const fallbackIdx = this.toolCalls.size > 0 ? (this.toolCalls.keys().next().value ?? 0) : 0;
-      const outputIndex = event.output_index ?? fallbackIdx;
+      const outputIndex = resolveOutputIndex(event, this.toolCalls);
       const existing = this.toolCalls.get(outputIndex);
       if (existing && typeof event.delta === "string") {
         existing.args += event.delta;
       }
     } else if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
-      const fallbackIdx = this.toolCalls.size > 0 ? (this.toolCalls.keys().next().value ?? 0) : 0;
-      const outputIndex = event.output_index ?? fallbackIdx;
+      const outputIndex = resolveOutputIndex(event, this.toolCalls);
       const existing = this.toolCalls.get(outputIndex);
       if (existing) {
         let input: unknown = {};

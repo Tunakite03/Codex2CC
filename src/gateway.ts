@@ -24,6 +24,8 @@ export type ModelInfo = { slug: string; displayName: string };
 /** The part of a ChatGPT session the gateway needs to call the upstream API. */
 export type UpstreamSession = {
   accessToken(): Promise<string>;
+  /** Returns a token other than `rejected`, refreshing the session when upstream answered 401. */
+  refreshAfterRejection(rejected: string): Promise<string>;
   accountId(): string;
 };
 
@@ -44,6 +46,8 @@ type ResolvedGatewayOptions = GatewayOptions & {
 
 function errorType(status: number): string {
   if (status === 400) return "invalid_request_error";
+  if (status === 401) return "authentication_error";
+  if (status === 403) return "permission_error";
   if (status === 429) return "rate_limit_error";
   return "api_error";
 }
@@ -90,17 +94,30 @@ function parseRequest(raw: string): MessageRequest {
 }
 
 async function openInference(options: ResolvedGatewayOptions, body: object, clientGone: AbortSignal): Promise<Response> {
-  for (let attempt = 1; attempt <= UPSTREAM_ATTEMPTS; attempt++) {
+  let token = await options.session.accessToken();
+  let refreshedAfterRejection = false;
+  let attempt = 0;
+  for (;;) {
+    attempt++;
     const response = await fetch(options.upstreamUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${await options.session.accessToken()}`,
+        Authorization: `Bearer ${token}`,
         "ChatGPT-Account-Id": options.session.accountId(),
       },
       body: JSON.stringify(body),
       signal: AbortSignal.any([AbortSignal.timeout(UPSTREAM_TIMEOUT_MS), clientGone]),
     });
+    if (response.status === 401 && !refreshedAfterRejection) {
+      // The token may have expired early or been rotated by another process: refresh once, outside the retry budget.
+      refreshedAfterRejection = true;
+      attempt--;
+      await response.body?.cancel();
+      process.stderr.write(`${JSON.stringify({ level: "warn", operation: "inference", status: 401, action: "refresh_token" })}\n`);
+      token = await options.session.refreshAfterRejection(token);
+      continue;
+    }
     if ((response.status === 429 || response.status === 503) && attempt < UPSTREAM_ATTEMPTS) {
       process.stderr.write(`${JSON.stringify({ level: "warn", operation: "inference", attempt, status: response.status })}\n`);
       await response.body?.cancel();
@@ -109,8 +126,9 @@ async function openInference(options: ResolvedGatewayOptions, body: object, clie
     }
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
+      const passthrough = response.status === 401 || response.status === 403 || response.status === 429;
       throw new BridgeError(
-        response.status === 429 ? 429 : 502,
+        passthrough ? response.status : 502,
         "inference_failed",
         `ChatGPT inference returned HTTP ${response.status}: ${errText.slice(0, 200)}`,
       );
@@ -118,7 +136,6 @@ async function openInference(options: ResolvedGatewayOptions, body: object, clie
     if (!response.body) throw new BridgeError(502, "missing_stream", "ChatGPT inference returned no stream.");
     return response;
   }
-  throw new BridgeError(502, "retry_exhausted", "ChatGPT inference failed after bounded retries.");
 }
 
 export function resolveModelSlug(
@@ -153,15 +170,14 @@ async function handleMessage(
   const activeModel = resolveModelSlug(inbound.model, options.defaultModel, options.modelSlugs);
   const outgoing = toOpenAIRequest(inbound, activeModel);
   const upstream = await openInference(options, outgoing, clientGone);
-  const toolNames = (inbound.tools ?? []).map((tool) => tool.name);
   if (inbound.stream) {
     response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-    const encoder = new AnthropicStream(response, activeModel, toolNames, estimateInputTokens(inbound));
+    const encoder = new AnthropicStream(response, activeModel, estimateInputTokens(inbound));
     await readSse(upstream.body!, (event) => encoder.accept(event));
     encoder.assertCompleted();
     response.end();
   } else {
-    const accumulator = new MessageAccumulator(activeModel, toolNames);
+    const accumulator = new MessageAccumulator(activeModel);
     await readSse(upstream.body!, (event) => accumulator.accept(event));
     response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(accumulator.buildMessage()));
   }
