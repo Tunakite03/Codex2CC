@@ -6,18 +6,27 @@ const JsonValue = z.json();
 const TextBlock = z.object({ type: z.literal("text"), text: z.string() }).passthrough();
 const ImageBlock = z.object({
   type: z.literal("image"),
-  source: z.object({ type: z.literal("base64"), media_type: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]), data: z.string() }),
+  source: z.discriminatedUnion("type", [
+    z.object({ type: z.literal("base64"), media_type: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]), data: z.string() }),
+    z.object({ type: z.literal("url"), url: z.string().min(1) }),
+  ]),
 }).passthrough();
 const ToolUseBlock = z.object({ type: z.literal("tool_use"), id: z.string().min(1), name: z.string().min(1), input: JsonValue }).passthrough();
+const KNOWN_BLOCK_TYPES: readonly string[] = ["text", "image", "tool_use", "tool_result", "thinking", "redacted_thinking"];
+// Block types Claude Code may send that the Responses API cannot take (document, server_tool_use, ...).
+// They pass validation and are replaced by a visible note instead of failing the whole request.
+const UnknownBlock = z.object({ type: z.string().refine((type) => !KNOWN_BLOCK_TYPES.includes(type)) }).passthrough();
 const ToolResultBlock = z.object({
   type: z.literal("tool_result"), tool_use_id: z.string().min(1),
-  content: z.union([z.string(), z.array(z.union([TextBlock, ImageBlock]))]).optional(),
+  content: z.union([z.string(), z.array(z.union([TextBlock, ImageBlock, UnknownBlock]))]).optional(),
   is_error: z.boolean().optional(),
 }).passthrough();
 const ThinkingBlock = z.object({ type: z.enum(["thinking", "redacted_thinking"]), thinking: z.string().optional() }).passthrough();
 const Block = z.discriminatedUnion("type", [TextBlock, ImageBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock]);
-const Message = z.object({ role: z.enum(["user", "assistant", "system", "developer"]), content: z.union([z.string(), z.array(Block)]) }).passthrough();
-const Tool = z.object({ name: z.string().min(1), description: z.string().default(""), input_schema: JsonValue }).passthrough();
+type KnownBlock = z.infer<typeof Block>;
+const Message = z.object({ role: z.enum(["user", "assistant", "system", "developer"]), content: z.union([z.string(), z.array(z.union([Block, UnknownBlock]))]) }).passthrough();
+// Server-side tools (for example web_search) have no input_schema and cannot be offered as function tools.
+const Tool = z.object({ name: z.string().min(1), description: z.string().default(""), input_schema: JsonValue.optional() }).passthrough();
 const ToolChoice = z.discriminatedUnion("type", [
   z.object({ type: z.literal("auto") }).passthrough(),
   z.object({ type: z.literal("any") }).passthrough(),
@@ -63,13 +72,34 @@ export type OpenAIRequest = {
 };
 
 function imageContent(block: z.infer<typeof ImageBlock>): InputImage {
-  return { type: "input_image", image_url: `data:${block.source.media_type};base64,${block.source.data}` };
+  const { source } = block;
+  return { type: "input_image", image_url: source.type === "url" ? source.url : `data:${source.media_type};base64,${source.data}` };
+}
+
+function isKnownBlock(block: { type: string }): block is KnownBlock {
+  return KNOWN_BLOCK_TYPES.includes(block.type);
+}
+
+function isTextBlock(block: { type: string }): block is z.infer<typeof TextBlock> {
+  return block.type === "text";
+}
+
+function isImageBlock(block: { type: string }): block is z.infer<typeof ImageBlock> {
+  return block.type === "image";
+}
+
+function unsupportedText(type: string): string {
+  return `[Unsupported content block "${type}" omitted by Codex2CC]`;
 }
 
 function toolOutput(content: z.infer<typeof ToolResultBlock>["content"], isError: boolean): string | Array<InputText | InputImage> {
   if (content === undefined) return isError ? "Tool error." : "";
   if (typeof content === "string") return isError ? `Tool error: ${content}` : content;
-  const parts = content.map((block) => block.type === "text" ? { type: "input_text" as const, text: block.text } : imageContent(block));
+  const parts = content.map((block): InputText | InputImage => {
+    if (isTextBlock(block)) return { type: "input_text", text: block.text };
+    if (isImageBlock(block)) return imageContent(block);
+    return { type: "input_text", text: unsupportedText(block.type) };
+  });
   return isError ? [{ type: "input_text", text: "Tool error:" }, ...parts] : parts;
 }
 
@@ -93,6 +123,10 @@ export function toOpenAIRequest(request: MessageRequest, model: string): OpenAIR
         pending = [];
       };
       for (const block of message.content) {
+        if (!isKnownBlock(block)) {
+          pending.push({ type: "output_text", text: unsupportedText(block.type) });
+          continue;
+        }
         if (block.type === "text") {
           pending.push({ type: "output_text", text: block.text });
         } else if (block.type === "image") {
@@ -117,6 +151,10 @@ export function toOpenAIRequest(request: MessageRequest, model: string): OpenAIR
         pending = [];
       };
       for (const block of message.content) {
+        if (!isKnownBlock(block)) {
+          pending.push({ type: "input_text", text: unsupportedText(block.type) });
+          continue;
+        }
         if (block.type === "text") {
           pending.push({ type: "input_text", text: block.text });
         } else if (block.type === "image") {
@@ -142,14 +180,10 @@ export function toOpenAIRequest(request: MessageRequest, model: string): OpenAIR
     : request.system?.map((block) => block.text).join("\n\n");
   const result: OpenAIRequest = { model, input, store: false, stream: true };
   if (instructions) result.instructions = instructions;
-  if (tools.length > 0) {
-    result.tools = tools.map((tool) => ({
-      type: "function",
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.input_schema,
-    }));
-  }
+  const functionTools = tools.flatMap((tool): FunctionTool[] => tool.input_schema === undefined
+    ? []
+    : [{ type: "function", name: tool.name, description: tool.description, parameters: tool.input_schema }]);
+  if (functionTools.length > 0) result.tools = functionTools;
   if (request.tool_choice?.type === "none") result.tool_choice = "none";
   else if (request.tool_choice?.type === "any") result.tool_choice = "required";
   else if (request.tool_choice?.type === "auto") result.tool_choice = "auto";
@@ -157,11 +191,90 @@ export function toOpenAIRequest(request: MessageRequest, model: string): OpenAIR
   return result;
 }
 
+/** Content block types in the request that the Responses API cannot represent. */
+export function unsupportedBlockTypes(request: MessageRequest): string[] {
+  const found = new Set<string>();
+  for (const message of request.messages) {
+    if (typeof message.content === "string") continue;
+    for (const block of message.content) {
+      if (!isKnownBlock(block)) {
+        found.add(block.type);
+      } else if (block.type === "tool_result" && Array.isArray(block.content)) {
+        for (const inner of block.content) {
+          if (!isTextBlock(inner) && !isImageBlock(inner)) found.add(inner.type);
+        }
+      }
+    }
+  }
+  return [...found];
+}
+
+/** Names of tools that cannot be offered upstream because they have no input_schema. */
+export function unsupportedToolNames(request: MessageRequest): string[] {
+  return (request.tools ?? []).filter((tool) => tool.input_schema === undefined).map((tool) => tool.name);
+}
+
+const CHARS_PER_TOKEN = 4;
+const IMAGE_TOKEN_ESTIMATE = 1_500;
+
+function blockWeight(block: { type: string }): { chars: number; images: number } {
+  if (isTextBlock(block)) return { chars: block.text.length, images: 0 };
+  if (isImageBlock(block)) return { chars: 0, images: 1 };
+  if (!isKnownBlock(block)) return { chars: JSON.stringify(block).length, images: 0 };
+  if (block.type === "tool_use") return { chars: block.name.length + JSON.stringify(block.input).length, images: 0 };
+  if (block.type === "tool_result") {
+    if (block.content === undefined) return { chars: 0, images: 0 };
+    if (typeof block.content === "string") return { chars: block.content.length, images: 0 };
+    return block.content.reduce((total, inner) => {
+      const weight = blockWeight(inner);
+      return { chars: total.chars + weight.chars, images: total.images + weight.images };
+    }, { chars: 0, images: 0 });
+  }
+  if (block.type === "thinking") return { chars: (block.thinking ?? "").length, images: 0 };
+  return { chars: 0, images: 0 };
+}
+
+/**
+ * Heuristic input size (about 4 characters per token, a fixed cost per image). The Responses API has
+ * no token-counting endpoint, so this only has to be good enough for Claude Code's context accounting.
+ */
+export function estimateInputTokens(request: MessageRequest): number {
+  let chars = typeof request.system === "string" ? request.system.length : (request.system ?? []).reduce((sum, block) => sum + block.text.length, 0);
+  let images = 0;
+  for (const tool of request.tools ?? []) {
+    chars += tool.name.length + tool.description.length + JSON.stringify(tool.input_schema ?? {}).length;
+  }
+  for (const message of request.messages) {
+    if (typeof message.content === "string") {
+      chars += message.content.length;
+      continue;
+    }
+    for (const block of message.content) {
+      const weight = blockWeight(block);
+      chars += weight.chars;
+      images += weight.images;
+    }
+  }
+  return Math.ceil(chars / CHARS_PER_TOKEN) + images * IMAGE_TOKEN_ESTIMATE;
+}
+
+export type OpenAIUsage = { input_tokens?: number; output_tokens?: number; input_tokens_details?: { cached_tokens?: number } };
+export type AnthropicUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number };
+
+/** OpenAI counts cached tokens inside input_tokens; Anthropic reports them separately. */
+export function toAnthropicUsage(usage: OpenAIUsage | undefined): AnthropicUsage {
+  const total = usage?.input_tokens ?? 0;
+  const cached = Math.min(usage?.input_tokens_details?.cached_tokens ?? 0, total);
+  const result: AnthropicUsage = { input_tokens: total - cached, output_tokens: usage?.output_tokens ?? 0 };
+  if (cached > 0) result.cache_read_input_tokens = cached;
+  return result;
+}
+
 export type OpenAIEvent = {
   type: string;
   response?: {
     id?: string;
-    usage?: { input_tokens?: number; output_tokens?: number };
+    usage?: OpenAIUsage;
     error?: { code?: string; message?: string };
     output?: Array<{
       type?: string;
@@ -218,10 +331,7 @@ export function completedMessage(event: OpenAIEvent, model: string, toolNames: s
     content,
     stop_reason: content.some((part) => part.type === "tool_use") ? "tool_use" : "end_turn",
     stop_sequence: null,
-    usage: {
-      input_tokens: event.response.usage?.input_tokens ?? 0,
-      output_tokens: event.response.usage?.output_tokens ?? 0,
-    },
+    usage: toAnthropicUsage(event.response.usage),
   };
 }
 
@@ -239,7 +349,12 @@ export class AnthropicStream {
   private readonly functionArguments = new Map<number, string>();
   private usedTool = false;
 
-  constructor(private readonly response: ServerResponse, private readonly model: string, private readonly toolNames: string[]) {}
+  constructor(
+    private readonly response: ServerResponse,
+    private readonly model: string,
+    private readonly toolNames: string[],
+    private readonly estimatedInputTokens: number = 0,
+  ) {}
 
   private start(id: string): void {
     if (this.started) return;
@@ -254,7 +369,7 @@ export class AnthropicStream {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
+        usage: { input_tokens: this.estimatedInputTokens, output_tokens: 0 },
       },
     });
   }
@@ -350,11 +465,10 @@ export class AnthropicStream {
         writeEvent(this.response, "content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
         writeEvent(this.response, "content_block_stop", { type: "content_block_stop", index });
       }
-      const outputTokens = event.response?.usage?.output_tokens ?? 0;
       writeEvent(this.response, "message_delta", {
         type: "message_delta",
         delta: { stop_reason: this.usedTool ? "tool_use" : "end_turn", stop_sequence: null },
-        usage: { output_tokens: outputTokens },
+        usage: toAnthropicUsage(event.response?.usage),
       });
       writeEvent(this.response, "message_stop", { type: "message_stop" });
       this.stopped = true;
@@ -376,8 +490,7 @@ export class MessageAccumulator {
     | { type: "text"; text: string }
     | { type: "tool_use"; id: string; name: string; input: unknown }
   > = [];
-  private inputTokens = 0;
-  private outputTokens = 0;
+  private usage: AnthropicUsage = { input_tokens: 0, output_tokens: 0 };
 
   constructor(private readonly model: string, private readonly toolNames: string[]) {}
 
@@ -433,8 +546,7 @@ export class MessageAccumulator {
         this.content.push({ type: "text", text: this.textBuffer });
         this.textBuffer = "";
       }
-      this.inputTokens = event.response?.usage?.input_tokens ?? 0;
-      this.outputTokens = event.response?.usage?.output_tokens ?? 0;
+      this.usage = toAnthropicUsage(event.response?.usage);
     }
   }
 
@@ -448,10 +560,7 @@ export class MessageAccumulator {
       content: this.content,
       stop_reason: stopReason,
       stop_sequence: null,
-      usage: {
-        input_tokens: this.inputTokens,
-        output_tokens: this.outputTokens,
-      },
+      usage: this.usage,
     };
   }
 }

@@ -4,9 +4,13 @@ import { createServer } from "node:http";
 import {
   AnthropicStream,
   completedMessage,
+  estimateInputTokens,
   MessageAccumulator,
   MessageRequest,
+  toAnthropicUsage,
   toOpenAIRequest,
+  unsupportedBlockTypes,
+  unsupportedToolNames,
 } from "./bridge.js";
 
 test("converts Claude Code tool history and definitions to standard Responses input", () => {
@@ -245,4 +249,109 @@ test("maps completed refusal event to Anthropic assistant text block", () => {
     stop_sequence: null,
     usage: { input_tokens: 10, output_tokens: 5 },
   });
+});
+
+test("toAnthropicUsage reports cached tokens separately from fresh input", () => {
+  assert.deepEqual(toAnthropicUsage(undefined), { input_tokens: 0, output_tokens: 0 });
+  assert.deepEqual(toAnthropicUsage({ input_tokens: 100, output_tokens: 7 }), { input_tokens: 100, output_tokens: 7 });
+  assert.deepEqual(
+    toAnthropicUsage({ input_tokens: 100, output_tokens: 7, input_tokens_details: { cached_tokens: 40 } }),
+    { input_tokens: 60, output_tokens: 7, cache_read_input_tokens: 40 },
+  );
+  assert.deepEqual(
+    toAnthropicUsage({ input_tokens: 10, output_tokens: 1, input_tokens_details: { cached_tokens: 99 } }),
+    { input_tokens: 0, output_tokens: 1, cache_read_input_tokens: 10 },
+  );
+});
+
+test("unknown content blocks are replaced by a visible note instead of failing validation", () => {
+  const request = MessageRequest.parse({
+    model: "claude-sonnet",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "see doc" }, { type: "document", source: { type: "base64", data: "AAAA" } }] },
+      { role: "assistant", content: [{ type: "server_tool_use", id: "s1", name: "web_search", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: [{ type: "tool_reference", tool_name: "X" }] }] },
+    ],
+  });
+  assert.deepEqual(unsupportedBlockTypes(request).sort(), ["document", "server_tool_use", "tool_reference"]);
+  const input = toOpenAIRequest(request, "gpt-model").input;
+  assert.deepEqual(input[0], {
+    role: "user",
+    content: [
+      { type: "input_text", text: "see doc" },
+      { type: "input_text", text: '[Unsupported content block "document" omitted by Codex2CC]' },
+    ],
+  });
+  assert.deepEqual(input[1], {
+    role: "assistant",
+    content: [{ type: "output_text", text: '[Unsupported content block "server_tool_use" omitted by Codex2CC]' }],
+  });
+  assert.deepEqual(input[2], {
+    type: "function_call_output",
+    call_id: "call_1",
+    output: [{ type: "input_text", text: '[Unsupported content block "tool_reference" omitted by Codex2CC]' }],
+  });
+});
+
+test("a known block type with an invalid shape is still rejected", () => {
+  assert.throws(() => MessageRequest.parse({
+    model: "claude-sonnet",
+    messages: [{ role: "assistant", content: [{ type: "tool_use", name: "Read", input: {} }] }],
+  }));
+  assert.throws(() => MessageRequest.parse({
+    model: "claude-sonnet",
+    messages: [{ role: "user", content: [{ type: "text" }] }],
+  }));
+});
+
+test("url image sources pass through and tools without input_schema are dropped", () => {
+  const request = MessageRequest.parse({
+    model: "claude-sonnet",
+    tools: [
+      { name: "Read", description: "Read a file", input_schema: { type: "object" } },
+      { type: "web_search_20250305", name: "web_search", max_uses: 3 },
+    ],
+    messages: [{ role: "user", content: [{ type: "image", source: { type: "url", url: "https://example.com/a.png" } }] }],
+  });
+  const converted = toOpenAIRequest(request, "gpt-model");
+  assert.deepEqual(converted.input[0], { role: "user", content: [{ type: "input_image", image_url: "https://example.com/a.png" }] });
+  assert.deepEqual(converted.tools?.map((tool) => tool.name), ["Read"]);
+  assert.deepEqual(unsupportedToolNames(request), ["web_search"]);
+});
+
+test("estimateInputTokens approximates four characters per token plus a fixed cost per image", () => {
+  const text = MessageRequest.parse({ model: "m", system: "abcd", messages: [{ role: "user", content: "abcdefgh" }] });
+  assert.equal(estimateInputTokens(text), 3);
+  const withImage = MessageRequest.parse({
+    model: "m",
+    messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "x".repeat(50_000) } }] }],
+  });
+  assert.equal(estimateInputTokens(withImage), 1_500);
+  const withTool = MessageRequest.parse({
+    model: "m",
+    tools: [{ name: "Read", description: "abcd", input_schema: { type: "object" } }],
+    messages: [{ role: "assistant", content: [{ type: "tool_use", id: "c", name: "Read", input: { a: 1 } }] }],
+  });
+  assert.equal(estimateInputTokens(withTool), Math.ceil((4 + 4 + 17 + 4 + 7) / 4));
+});
+
+test("AnthropicStream reports usage from the completed event and the estimate at message_start", async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    const stream = new AnthropicStream(response, "gpt-model", [], 42);
+    stream.accept({ type: "response.created", response: { id: "resp_1" } });
+    stream.accept({ type: "response.output_text.delta", delta: "ok" });
+    stream.accept({ type: "response.completed", response: { id: "resp_1", usage: { input_tokens: 100, output_tokens: 7, input_tokens_details: { cached_tokens: 40 } } } });
+    response.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  try {
+    const events = await (await fetch(`http://127.0.0.1:${address.port}`)).text();
+    assert.match(events, /event: message_start\ndata: .*"usage":\{"input_tokens":42,"output_tokens":0\}/);
+    assert.match(events, /event: message_delta\ndata: .*"usage":\{"input_tokens":60,"output_tokens":7,"cache_read_input_tokens":40\}/);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

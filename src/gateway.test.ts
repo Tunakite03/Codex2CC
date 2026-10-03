@@ -263,6 +263,41 @@ test("gateway aborts the upstream request when the client disconnects", async ()
   });
 });
 
+test("gateway estimates token counts locally and requires credentials for it", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
+    const body = { model: "claude-sonnet-4", system: "abcd", messages: [{ role: "user", content: "abcdefgh" }] };
+    const unauthenticated = await fetch(`${gateway.base}/v1/messages/count_tokens`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    assert.equal(unauthenticated.status, 401);
+    const counted = await fetch(`${gateway.base}/v1/messages/count_tokens`, {
+      method: "POST", headers: { "Content-Type": "application/json", ...AUTH }, body: JSON.stringify(body),
+    });
+    assert.equal(counted.status, 200);
+    assert.deepEqual(await counted.json(), { input_tokens: 3 });
+    assert.equal(upstream.requests.length, 0);
+  });
+});
+
+test("gateway reports real input and cached tokens in the stream and keeps going past unsupported blocks", async () => {
+  const withUsage = sse(
+    { type: "response.created", response: { id: "resp_1" } },
+    { type: "response.output_text.delta", delta: "ok" },
+    { type: "response.completed", response: { id: "resp_1", usage: { input_tokens: 100, output_tokens: 7, input_tokens_details: { cached_tokens: 40 } } } },
+  );
+  await withGateway(replyWithStream(withUsage), async (gateway, upstream) => {
+    const response = await post(gateway, {
+      ...CHAT_REQUEST,
+      stream: true,
+      messages: [{ role: "user", content: [{ type: "text", text: "read it" }, { type: "document", source: { type: "base64", data: "AAAA" } }] }],
+    });
+    assert.equal(response.status, 200);
+    const events = await response.text();
+    assert.match(events, /"usage":\{"input_tokens":60,"output_tokens":7,"cache_read_input_tokens":40\}/);
+    assert.match(upstream.requests[0]!.body, /Unsupported content block \\"document\\" omitted/);
+  });
+});
+
 test("resolveModelSlug prefers an exact slug, maps Claude tiers, and falls back to the default", () => {
   const slugs = new Set(["gpt-6-sol", "gpt-6.1-sol", "gpt-5.6-sol"]);
   assert.equal(resolveModelSlug("gpt-5.6-sol", "gpt-6-sol", slugs), "gpt-5.6-sol");

@@ -3,10 +3,13 @@ import { z } from "zod";
 import {
   AnthropicStream,
   BridgeError,
+  estimateInputTokens,
   MessageAccumulator,
   MessageRequest,
   readSse,
   toOpenAIRequest,
+  unsupportedBlockTypes,
+  unsupportedToolNames,
 } from "./bridge.js";
 import { checkClient, checkHost, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
 
@@ -139,13 +142,21 @@ async function handleMessage(
   clientGone: AbortSignal,
 ): Promise<void> {
   const inbound = parseRequest(await readBody(request, options.maxBodyBytes));
+  const omittedBlocks = unsupportedBlockTypes(inbound);
+  if (omittedBlocks.length > 0) {
+    process.stderr.write(`${JSON.stringify({ level: "warn", operation: "unsupported_blocks", types: omittedBlocks })}\n`);
+  }
+  const omittedTools = unsupportedToolNames(inbound);
+  if (omittedTools.length > 0) {
+    process.stderr.write(`${JSON.stringify({ level: "warn", operation: "unsupported_tools", names: omittedTools })}\n`);
+  }
   const activeModel = resolveModelSlug(inbound.model, options.defaultModel, options.modelSlugs);
   const outgoing = toOpenAIRequest(inbound, activeModel);
   const upstream = await openInference(options, outgoing, clientGone);
   const toolNames = (inbound.tools ?? []).map((tool) => tool.name);
   if (inbound.stream) {
     response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-    const encoder = new AnthropicStream(response, activeModel, toolNames);
+    const encoder = new AnthropicStream(response, activeModel, toolNames, estimateInputTokens(inbound));
     await readSse(upstream.body!, (event) => encoder.accept(event));
     encoder.assertCompleted();
     response.end();
@@ -154,6 +165,15 @@ async function handleMessage(
     await readSse(upstream.body!, (event) => accumulator.accept(event));
     response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(accumulator.buildMessage()));
   }
+}
+
+async function handleCountTokens(
+  options: ResolvedGatewayOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const inbound = parseRequest(await readBody(request, options.maxBodyBytes));
+  response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ input_tokens: estimateInputTokens(inbound) }));
 }
 
 function toBridgeError(error: Error): BridgeError {
@@ -210,18 +230,22 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
       );
       return;
     }
-    if (request.method !== "POST" || path !== "/v1/messages") {
+    const route = request.method !== "POST" ? undefined
+      : path === "/v1/messages" ? handleMessage
+      : path === "/v1/messages/count_tokens" ? handleCountTokens
+      : undefined;
+    if (route === undefined) {
       response.writeHead(404).end();
       return;
     }
 
     const clientGone = new AbortController();
     response.on("close", () => clientGone.abort());
-    handleMessage(options, request, response, clientGone.signal).catch((error: Error) => {
-      if (clientGone.signal.aborted) return;
+    route(options, request, response, clientGone.signal).catch((error: Error) => {
       const typed = toBridgeError(error);
-      process.stderr.write(`${JSON.stringify({ level: "error", operation: "bridge_request", code: typed.code, status: typed.status, message: typed.message })}\n`);
-      sendError(response, typed);
+      const clientDisconnected = clientGone.signal.aborted;
+      process.stderr.write(`${JSON.stringify({ level: clientDisconnected ? "info" : "error", operation: "bridge_request", code: typed.code, status: typed.status, message: typed.message, clientDisconnected })}\n`);
+      if (!clientDisconnected) sendError(response, typed);
     });
   });
 }
@@ -230,7 +254,10 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
 export async function listenOnLoopback(server: Server, port: number): Promise<number> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, "127.0.0.1", resolve);
+    server.listen(port, "127.0.0.1", () => {
+      server.removeListener("error", reject);
+      resolve();
+    });
   });
   const address = server.address();
   if (address === null || typeof address === "string") {

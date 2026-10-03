@@ -12,7 +12,7 @@ export type CliCommand =
 
 function valueAfter(options: readonly string[], flag: string): string | undefined {
   const index = options.indexOf(flag);
-  return index >= 0 ? options[index + 1] : undefined;
+  return index >= 0 ? options[index + 1] || undefined : undefined;
 }
 
 /**

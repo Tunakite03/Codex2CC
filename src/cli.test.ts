@@ -18,6 +18,10 @@ test("parseCli reads serve options and defaults the port", () => {
   });
 });
 
+test("parseCli treats an empty --model value as not provided", () => {
+  assert.deepEqual(parseCli(["--model", ""]), { kind: "claude", model: undefined, claudeArgs: [] });
+});
+
 test("parseCli passes arguments after -- to Claude Code untouched", () => {
   assert.deepEqual(parseCli(["--model", "gpt-6-sol", "--", "--resume", "abc"]), {
     kind: "claude",

@@ -17,6 +17,7 @@ import {
 import { killAllProcesses, runProcess } from "./runner.js";
 
 const FALLBACK_MODEL = "gpt-6-sol";
+const MCP_MAX_BODY_BYTES = 64 * 1024 * 1024;
 const TIMEOUT_TAIL_CHARS = 2_000;
 
 const TaskArgs = z.object({
@@ -55,6 +56,7 @@ async function executeAgentTask(
     defaultModel: model,
     availableModels: [{ slug: model, displayName: model }],
     policy: { mode: "token", token: secret },
+    maxBodyBytes: MCP_MAX_BODY_BYTES,
   });
   let port: number;
   try {
