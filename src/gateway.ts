@@ -12,6 +12,7 @@ import {
   unsupportedToolNames,
 } from "./bridge.js";
 import { checkClient, checkHost, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
+import { DEFAULT_TIER_MODELS, resolveModel, type TierModels } from "./models.js";
 
 export const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 
@@ -36,12 +37,15 @@ export type GatewayOptions = {
   readonly policy: GuardPolicy;
   readonly upstreamUrl?: string;
   readonly maxBodyBytes?: number;
+  readonly tiers?: TierModels;
 };
 
 type ResolvedGatewayOptions = GatewayOptions & {
   readonly upstreamUrl: string;
   readonly maxBodyBytes: number;
+  readonly tiers: TierModels;
   readonly modelSlugs: ReadonlySet<string>;
+  readonly warnedModels: Set<string>;
 };
 
 function errorType(status: number): string {
@@ -138,20 +142,6 @@ async function openInference(options: ResolvedGatewayOptions, body: object, clie
   }
 }
 
-export function resolveModelSlug(
-  inboundModel: string | undefined,
-  defaultModel: string,
-  modelSlugs: ReadonlySet<string>,
-): string {
-  if (!inboundModel) return defaultModel;
-  if (modelSlugs.has(inboundModel)) return inboundModel;
-  const lower = inboundModel.toLowerCase();
-  if (lower.includes("opus") && modelSlugs.has("gpt-6.1-sol")) return "gpt-6.1-sol";
-  if (lower.includes("haiku") && modelSlugs.has("gpt-5.6-sol")) return "gpt-5.6-sol";
-  if (lower.includes("sonnet") && modelSlugs.has("gpt-6-sol")) return "gpt-6-sol";
-  return defaultModel;
-}
-
 async function handleMessage(
   options: ResolvedGatewayOptions,
   request: IncomingMessage,
@@ -167,7 +157,12 @@ async function handleMessage(
   if (omittedTools.length > 0) {
     process.stderr.write(`${JSON.stringify({ level: "warn", operation: "unsupported_tools", names: omittedTools })}\n`);
   }
-  const activeModel = resolveModelSlug(inbound.model, options.defaultModel, options.modelSlugs);
+  const resolution = resolveModel(inbound.model, options.defaultModel, options.modelSlugs, options.tiers);
+  const activeModel = resolution.slug;
+  if (resolution.fellBack && !options.warnedModels.has(inbound.model)) {
+    options.warnedModels.add(inbound.model);
+    process.stderr.write(`${JSON.stringify({ level: "warn", operation: "model_fallback", requested: inbound.model, using: activeModel })}\n`);
+  }
   const outgoing = toOpenAIRequest(inbound, activeModel);
   const upstream = await openInference(options, outgoing, clientGone);
   if (inbound.stream) {
@@ -207,7 +202,9 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
     ...gatewayOptions,
     upstreamUrl: gatewayOptions.upstreamUrl ?? CHATGPT_RESPONSES_URL,
     maxBodyBytes: gatewayOptions.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+    tiers: gatewayOptions.tiers ?? DEFAULT_TIER_MODELS,
     modelSlugs: new Set(gatewayOptions.availableModels.map((model) => model.slug)),
+    warnedModels: new Set<string>(),
   };
 
   return createServer((request, response) => {

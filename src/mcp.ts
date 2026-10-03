@@ -130,7 +130,7 @@ export async function runMcpServer(): Promise<void> {
   const session = await ChatGPTSession.open();
   const models = await session.listModels();
   const catalogSlugs = models.map((m) => m.slug);
-  const modelSlugs = catalogSlugs.length > 0 ? catalogSlugs : ["gpt-6-sol", "gpt-6.1-sol", "gpt-5.6-sol"];
+  const modelSlugs = catalogSlugs.length > 0 ? catalogSlugs : ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"];
   const defaultModel = modelSlugs.includes(FALLBACK_MODEL) ? FALLBACK_MODEL : modelSlugs[0] ?? FALLBACK_MODEL;
 
   const rl = createInterface({

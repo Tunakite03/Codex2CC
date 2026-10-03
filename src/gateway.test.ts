@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { connect } from "node:net";
 import test from "node:test";
-import { createGatewayServer, listenOnLoopback, resolveModelSlug, type GatewayOptions } from "./gateway.js";
+import { createGatewayServer, listenOnLoopback, type GatewayOptions } from "./gateway.js";
 
 const TOKEN = "test-token-0123456789";
 const AUTH = { Authorization: `Bearer ${TOKEN}` };
@@ -250,6 +250,21 @@ test("gateway passes an upstream 403 through as a permission error", async () =>
   });
 });
 
+test("gateway retries a transient 503 and substitutes the default model for an unknown one", async () => {
+  await withGateway((_request, response, attempt) => {
+    if (attempt === 1) {
+      response.writeHead(503).end("busy");
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/event-stream" }).end(HELLO_STREAM);
+  }, async (gateway, upstream) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, model: "totally-unknown-model", stream: false });
+    assert.equal(response.status, 200);
+    assert.equal(upstream.requests.length, 2);
+    assert.equal((JSON.parse(upstream.requests[1]!.body) as { model: string }).model, "gpt-6-sol");
+  });
+});
+
 test("gateway maps an upstream server error to 502 without retrying", async () => {
   await withGateway((_request, response) => {
     response.writeHead(500).end("boom");
@@ -332,15 +347,4 @@ test("gateway reports real input and cached tokens in the stream and keeps going
     assert.match(events, /"usage":\{"input_tokens":60,"output_tokens":7,"cache_read_input_tokens":40\}/);
     assert.match(upstream.requests[0]!.body, /Unsupported content block \\"document\\" omitted/);
   });
-});
-
-test("resolveModelSlug prefers an exact slug, maps Claude tiers, and falls back to the default", () => {
-  const slugs = new Set(["gpt-6-sol", "gpt-6.1-sol", "gpt-5.6-sol"]);
-  assert.equal(resolveModelSlug("gpt-5.6-sol", "gpt-6-sol", slugs), "gpt-5.6-sol");
-  assert.equal(resolveModelSlug("claude-opus-4", "gpt-6-sol", slugs), "gpt-6.1-sol");
-  assert.equal(resolveModelSlug("claude-sonnet-4", "gpt-5.6-sol", slugs), "gpt-6-sol");
-  assert.equal(resolveModelSlug("claude-haiku-4", "gpt-6-sol", slugs), "gpt-5.6-sol");
-  assert.equal(resolveModelSlug("something-else", "gpt-6-sol", slugs), "gpt-6-sol");
-  assert.equal(resolveModelSlug(undefined, "gpt-6-sol", slugs), "gpt-6-sol");
-  assert.equal(resolveModelSlug("claude-opus-4", "gpt-6-sol", new Set(["gpt-6-sol"])), "gpt-6-sol");
 });

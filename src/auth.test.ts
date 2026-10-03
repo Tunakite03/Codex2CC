@@ -207,7 +207,7 @@ test("listModels prefers the remote catalog, then the local cache, then built-in
 
     await writeFile(join(dir, "models_cache.json"), JSON.stringify({ models: [] }));
     const defaults = await session.listModels();
-    assert.deepEqual(defaults.map((model) => model.slug), ["gpt-6-sol", "gpt-6.1-sol", "gpt-5.6-sol"]);
+    assert.deepEqual(defaults.map((model) => model.slug), ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"]);
   });
 });
 
