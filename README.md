@@ -55,7 +55,7 @@ Launch with `node dist/main.js --ui` (or visit `http://127.0.0.1:3456/ui` while 
 
 The Control Panel provides:
 - **Client Configuration & Status**: Auto-detects configuration states for Claude Code CLI (`~/.claude/settings.json`) and Claude Desktop (`Claude-3p/configLibrary`), offering one-click configuration and factory resets.
-- **Claude Tier Model Mapping**: Assigns a ChatGPT account model to each Claude tier (Fable, Opus, Sonnet, and Haiku). Changes apply immediately, persist to `logs/tier-models.json`, and are used by future gateway starts. The dashboard can restore the environment-variable or built-in defaults.
+- **Claude Tier Model Mapping**: Assigns a ChatGPT account model to each Claude tier (Fable, Opus, Sonnet, and Haiku). Gateway routing updates immediately; mappings persist to `logs/tier-models.json` and apply to future starts. Re-apply client configuration and reload Claude Code sessions to update their saved tier aliases. The dashboard can restore environment-variable or built-in defaults.
 - **Token Usage Summary Table (Bảng Tổng Hợp Token Đã Dùng)**:
   - Tracks total tokens used across models and sessions in real time.
   - KPI summary metrics: **Total Tokens (Grand Total)**, **Prompt Tokens (Input)**, **Completion Tokens (Output)**, and **Cached Tokens (Read)**.
@@ -127,9 +127,9 @@ node dist/main.js --reset-config
 3. **Claude Code CLI**: Open a new terminal tab or reload your editor and run `claude` normally.
 
 ### Effort Selection
-Claude Desktop displays the ChatGPT model assigned to each Claude tier route. In the Code tab:
-- Press **Cmd+Shift+E** (macOS) or **Ctrl+Shift+E** (Windows) to select reasoning effort.
-- The Sonnet and Opus routes support reasoning effort. The Haiku route supports it when mapped to `gpt-6-luna`; Codex2CC forwards the selected level (`low`, `medium`, `high`, `xhigh`, `max`) to ChatGPT. [GPT-6 Luna supports these effort levels in the Responses API](https://developers.openai.com/api/docs/models/gpt-6-luna).
+The model picker and effort picker are separate menus. In Claude Desktop's **Code** tab, close the model picker and press **Cmd+Shift+E** (macOS) or **Ctrl+Shift+E** (Windows) to open the effort picker. Claude Code's terminal interface can open the same choice with `/effort`, or set it directly with `/effort xhigh`.
+
+The Haiku route remains mapped to `gpt-6-luna`. Codex2CC applies `max` effort to that route when Claude omits an effort value, and preserves any effort included in the request. Other model routes keep their existing effort behavior. Claude Code's `/effort` command or the left and right arrows in `/model` can set the effort sent by the client ([Claude Code model configuration](https://code.claude.com/docs/en/model-config)).
 
 ---
 

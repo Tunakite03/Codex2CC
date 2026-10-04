@@ -10,6 +10,9 @@ import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, type TierModels } from "./m
 export const CODEX2CC_DESKTOP_CONFIG_ID = "c0d3e2cc-0000-4000-8000-000000000001";
 export const DEFAULT_CONFIG_NAME = "Codex2CC Gateway";
 export const DEFAULT_GATEWAY_URL = "http://127.0.0.1:3456";
+const HAIKU_MODEL_CAPABILITIES = "effort,xhigh_effort,max_effort";
+const LEGACY_MODEL_CAPABILITIES = "effort,max_effort,xhigh_effort";
+const LEGACY_HAIKU_PROFILE_DESCRIPTION = "Codex2CC Haiku route with Sonnet 4.6 client behavior";
 
 export type SetupTarget = "cli" | "desktop" | "all";
 
@@ -195,6 +198,29 @@ function writeJson(filePath: string, data: object): void {
   writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf8");
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isLegacyHaikuProfileRow(value: unknown): boolean {
+  return isRecord(value)
+    && typeof value.description === "string"
+    && value.description.startsWith(LEGACY_HAIKU_PROFILE_DESCRIPTION);
+}
+
+function removeLegacyHaikuProfileRow(settings: Record<string, unknown>): void {
+  const currentPicker = settings.modelPicker;
+  if (!isRecord(currentPicker) || !Array.isArray(currentPicker.options)) return;
+
+  const retainedOptions = currentPicker.options.filter((row) => !isLegacyHaikuProfileRow(row));
+  if (retainedOptions.length === currentPicker.options.length) return;
+  if (retainedOptions.length === 0 && Object.keys(currentPicker).every((key) => key === "options")) {
+    delete settings.modelPicker;
+    return;
+  }
+  settings.modelPicker = { ...currentPicker, options: retainedOptions };
+}
+
 export function setupClaudeCodeCli(options: SetupOptions): readonly string[] {
   const paths = resolvePaths(options.paths);
   const tiers = options.tiers ?? DEFAULT_TIER_MODELS;
@@ -212,17 +238,22 @@ export function setupClaudeCodeCli(options: SetupOptions): readonly string[] {
   currentEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = tiers.opus;
   currentEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = tiers.sonnet;
   currentEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = tiers.haiku;
+  currentEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES = HAIKU_MODEL_CAPABILITIES;
   currentEnv.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
   currentEnv.CLAUDE_CODE_USE_GATEWAY = "1";
   currentEnv.CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK = "1";
   currentEnv.API_TIMEOUT_MS = "600000";
-  currentEnv.CLAUDE_CODE_MODEL_CAPABILITIES = "effort,max_effort,xhigh_effort";
+  currentEnv.CLAUDE_CODE_MODEL_CAPABILITIES = LEGACY_MODEL_CAPABILITIES;
+  delete currentEnv.ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES;
+  delete currentEnv.ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES;
+  delete currentEnv.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES;
   if (options.effort) {
     currentEnv.CLAUDE_CODE_EFFORT_LEVEL = options.effort;
   }
   delete currentEnv.ANTHROPIC_API_KEY;
 
   settingsData.env = currentEnv;
+  removeLegacyHaikuProfileRow(settingsData);
   const currentPermissions = typeof settingsData.permissions === "object" && settingsData.permissions !== null && !Array.isArray(settingsData.permissions)
     ? { ...(settingsData.permissions as Record<string, unknown>) }
     : {};
@@ -324,6 +355,10 @@ export function resetClaudeCodeCli(pathsInput?: SetupPaths | undefined): readonl
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
         "CLAUDE_CODE_USE_GATEWAY",
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK",
@@ -332,6 +367,7 @@ export function resetClaudeCodeCli(pathsInput?: SetupPaths | undefined): readonl
         "API_TIMEOUT_MS",
       ];
       for (const k of keysToRemove) delete env[k];
+      removeLegacyHaikuProfileRow(settings);
       writeJson(paths.claudeSettingsPath, settings);
       modified.push(paths.claudeSettingsPath);
     }

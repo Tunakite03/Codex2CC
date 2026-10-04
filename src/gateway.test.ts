@@ -188,9 +188,36 @@ test("Haiku route forwards reasoning effort to GPT-6 Luna", async () => {
     assert.deepEqual(sent.reasoning, { effort: "xhigh" });
   }, {
     availableModels: [
-      { slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 272000 },
-      { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 272000 },
-      { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 272000 },
+      { slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 1000000 },
+      { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 1000000 },
+      { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 1000000 },
+      { slug: "gpt-6-luna", displayName: "GPT-6 Luna", contextWindow: 272000 },
+    ],
+  });
+});
+
+test("Haiku route defaults to max effort for GPT-6 Luna when the client omits effort", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, model: "claude-haiku-5" });
+    assert.equal(response.status, 200);
+    await response.text();
+
+    const sent = JSON.parse(upstream.requests[0]!.body) as { model: string; reasoning: { effort: string } };
+    assert.equal(sent.model, "gpt-6-luna");
+    assert.deepEqual(sent.reasoning, { effort: "max" });
+
+    const sonnetResponse = await post(gateway, CHAT_REQUEST);
+    assert.equal(sonnetResponse.status, 200);
+    await sonnetResponse.text();
+
+    const sonnetSent = JSON.parse(upstream.requests[1]!.body) as { model: string; reasoning?: { effort: string } };
+    assert.equal(sonnetSent.model, "gpt-6-sol");
+    assert.equal(sonnetSent.reasoning, undefined);
+  }, {
+    availableModels: [
+      { slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 1000000 },
+      { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 1000000 },
+      { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 1000000 },
       { slug: "gpt-6-luna", displayName: "GPT-6 Luna", contextWindow: 272000 },
     ],
   });

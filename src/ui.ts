@@ -62,6 +62,7 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
   const paths = resolveDefaultPaths();
   const gatewayUrl = `http://127.0.0.1:${port}`;
   const token = options.policy.mode === "token" ? options.policy.token : "";
+  const currentTiers = activeTierModels(options);
   // A stored config only works when it points at this gateway and carries its current token.
   const inSync = (baseUrl: string, storedToken: string): boolean =>
     baseUrl.replace(/\/+$/, "") === gatewayUrl && (options.policy.mode === "open" || storedToken === token);
@@ -76,7 +77,10 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
       if (data?.env?.ANTHROPIC_BASE_URL) {
         cliConfigured = true;
         cliBaseUrl = String(data.env.ANTHROPIC_BASE_URL);
-        cliInSync = inSync(cliBaseUrl, String(data.env.ANTHROPIC_AUTH_TOKEN ?? ""));
+        cliInSync = inSync(cliBaseUrl, String(data.env.ANTHROPIC_AUTH_TOKEN ?? ""))
+          && data.env.ANTHROPIC_DEFAULT_OPUS_MODEL === currentTiers.opus
+          && data.env.ANTHROPIC_DEFAULT_SONNET_MODEL === currentTiers.sonnet
+          && data.env.ANTHROPIC_DEFAULT_HAIKU_MODEL === currentTiers.haiku;
       }
     } catch {
       // Ignore
@@ -124,7 +128,7 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
       path: paths.claudeDesktopDir,
     },
     tierMapping: {
-      current: activeTierModels(options),
+      current: currentTiers,
       defaults: options.tierStore?.defaults() ?? options.tiers ?? DEFAULT_TIER_MODELS,
       custom: options.tierStore?.isCustom() ?? false,
       models: options.availableModels.map(({ slug, displayName }) => ({ slug, displayName })),
@@ -1066,7 +1070,7 @@ export function renderDashboardHtml(): string {
         </h2>
         <span class="badge-sub" id="tier-mapping-status">Loading…</span>
       </div>
-      <p class="supporting-text">Choose which ChatGPT model handles each Claude model tier. Changes take effect immediately and are saved for future gateway starts.</p>
+      <p class="supporting-text">Choose which ChatGPT model handles each Claude model tier. Gateway routing updates immediately and is saved for future starts. Re-apply client configuration and reload Claude Code sessions to update their saved tier aliases.</p>
       <div class="tier-grid">
         <div class="field">
           <label for="tier-fable">Fable</label>

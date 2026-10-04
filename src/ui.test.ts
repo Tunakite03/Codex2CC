@@ -115,6 +115,8 @@ test("getStatus provides gateway metadata and client detection without model con
   assert.equal(status.account, undefined);
   const cli = status.cli as Record<string, unknown>;
   assert.equal(cli.effort, undefined);
+  const tierMapping = status.tierMapping as { current: typeof DEFAULT_TIER_MODELS };
+  assert.deepEqual(tierMapping.current, DEFAULT_TIER_MODELS);
 });
 
 test("handleUiRoute serves HTML dashboard on /ui and /", async () => {

@@ -12,7 +12,7 @@ import {
   unsupportedToolNames,
 } from "./bridge.js";
 import { checkClient, checkHost, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
-import { CLAUDE_GATEWAY_MODELS, resolveModel, type TierModels } from "./models.js";
+import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, resolveModel, type TierModels } from "./models.js";
 import { activeTierModels, type TierModelStore } from "./tier-store.js";
 import { handleUiRoute } from "./ui.js";
 import { recordLog } from "./logger.js";
@@ -168,12 +168,13 @@ async function handleMessage(
 ): Promise<void> {
   const startTime = Date.now();
   const inbound = parseRequest(await readBody(request, options.maxBodyBytes));
-  const effort = inbound.output_config?.effort ?? inbound.reasoning_effort ?? "upstream_default";
+  const requestedEffort = inbound.output_config?.effort ?? inbound.reasoning_effort;
+  const loggedRequestedEffort = requestedEffort ?? "upstream_default";
   recordLog({
     level: "info",
     operation: "inbound_request",
-    message: `Received message request for model "${inbound.model}" (stream: ${Boolean(inbound.stream)}, effort: ${effort})`,
-    details: { model: inbound.model, stream: Boolean(inbound.stream), effort },
+    message: `Received message request for model "${inbound.model}" (stream: ${Boolean(inbound.stream)}, effort: ${loggedRequestedEffort})`,
+    details: { model: inbound.model, stream: Boolean(inbound.stream), effort: loggedRequestedEffort },
   });
   const omittedBlocks = unsupportedBlockTypes(inbound);
   if (omittedBlocks.length > 0) {
@@ -208,6 +209,10 @@ async function handleMessage(
     });
   }
   const outgoing = toOpenAIRequest(inbound, activeModel);
+  if (activeModel === DEFAULT_TIER_MODELS.haiku && outgoing.reasoning === undefined) {
+    outgoing.reasoning = { effort: "max" };
+  }
+  const effort = outgoing.reasoning?.effort ?? "upstream_default";
   const upstream = await openInference(options, outgoing, clientGone);
   if (inbound.stream) {
     response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });

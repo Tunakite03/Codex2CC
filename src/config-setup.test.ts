@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -57,13 +57,27 @@ test("validateToken generates fresh tokens when empty and enforces length", () =
 });
 
 test("setupConfig configures Claude Code CLI atomically and cleans old credentials", () => {
-  const { paths, cleanup } = createSandbox();
+  const { sandboxDir, paths, cleanup } = createSandbox();
   try {
     writeFileSync(
       paths.claudeJsonPath,
       JSON.stringify({ primaryApiKey: "old-secret", customApiKeyResponses: { test: true }, otherSetting: 123 }),
       "utf8",
     );
+    mkdirSync(join(sandboxDir, ".claude"), { recursive: true });
+    writeFileSync(paths.claudeSettingsPath, JSON.stringify({
+      modelPicker: {
+        options: [
+          {
+            model: "gpt-6-luna",
+            label: "Sonnet 4.6 via gpt-6-luna",
+            description: "Codex2CC Haiku route with Sonnet 4.6 client behavior; GPT backend model: gpt-6-luna",
+            behavesAs: "claude-sonnet-4-6",
+          },
+          { model: "custom-model", label: "My model", description: "Keep this user option" },
+        ],
+      },
+    }), "utf8");
 
     const result = setupConfig("cli", {
       gatewayUrl: "http://127.0.0.1:3456",
@@ -82,8 +96,15 @@ test("setupConfig configures Claude Code CLI atomically and cleans old credentia
     assert.equal(settings.env.ANTHROPIC_MODEL, "gpt-6-sol");
     assert.equal(settings.env.CLAUDE_CODE_EFFORT_LEVEL, "high");
     assert.equal(settings.env.CLAUDE_CODE_USE_GATEWAY, "1");
+    assert.equal(settings.env.ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES, undefined);
+    assert.equal(settings.env.ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES, undefined);
+    assert.equal(settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES, undefined);
+    assert.equal(settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES, "effort,xhigh_effort,max_effort");
     assert.equal(settings.env.CLAUDE_CODE_MODEL_CAPABILITIES, "effort,max_effort,xhigh_effort");
     assert.equal(settings.env.API_TIMEOUT_MS, "600000");
+    assert.deepEqual(settings.modelPicker.options, [
+      { model: "custom-model", label: "My model", description: "Keep this user option" },
+    ]);
     assert.equal(settings.permissions.defaultMode, "bypassPermissions");
     assert.equal(settings.skipDangerousModePermissionPrompt, true);
 
@@ -187,6 +208,11 @@ test("resetConfig cleanly strips gateway settings from CLI and Desktop without c
     assert.equal(settingsAfter.env.ANTHROPIC_AUTH_TOKEN, undefined);
     assert.equal(settingsAfter.env.CLAUDE_CODE_EFFORT_LEVEL, undefined);
     assert.equal(settingsAfter.env.CLAUDE_CODE_MODEL_CAPABILITIES, undefined);
+    assert.equal(settingsAfter.env.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES, undefined);
+    assert.equal(settingsAfter.env.ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES, undefined);
+    assert.equal(settingsAfter.env.ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES, undefined);
+    assert.equal(settingsAfter.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES, undefined);
+    assert.equal(settingsAfter.modelPicker, undefined);
     assert.equal(settingsAfter.env.MY_CUSTOM_VAR, "keep-me");
     assert.equal(settingsAfter.permissions, undefined);
     assert.equal(settingsAfter.skipDangerousModePermissionPrompt, undefined);
