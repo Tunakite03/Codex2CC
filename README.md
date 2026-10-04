@@ -1,107 +1,174 @@
 # Codex2CC
 
-Runs [Claude Code](https://claude.com/claude-code) on your ChatGPT (Codex) login. Codex2CC is a local gateway that
-accepts Anthropic `/v1/messages` requests and forwards them to the ChatGPT Codex Responses API, translating requests,
-tool calls and streaming events in both directions.
+Runs [Claude Code](https://claude.com/claude-code) and [Claude Desktop](https://claude.ai/download) on your ChatGPT (Codex) login. Codex2CC is a local gateway that accepts Anthropic `/v1/messages` requests and forwards them to the ChatGPT Codex Responses API, translating requests, tool calls, streaming SSE events, and reasoning effort in both directions.
 
-It has three modes:
+It includes an interactive Web Control Panel with real-time request logs and a comprehensive token usage summary table.
+
+## Operating Modes
 
 | Mode | Command | What it does |
 |---|---|---|
-| Claude Code | `codex2cc [options] [-- <claude args>]` | Starts a private gateway and launches `claude` pointed at it |
-| Standalone gateway | `codex2cc --serve` | Serves the gateway for other Anthropic-compatible clients |
-| MCP server | `codex2cc --mcp` | Exposes Claude Code-on-ChatGPT as MCP tools over stdio |
+| **Web Control Panel** | `codex2cc --ui` | Launches the interactive browser dashboard to configure clients, monitor live logs, and track token usage |
+| **Claude Code CLI** | `codex2cc [options] [-- <claude args>]` | Starts an ephemeral local gateway and launches `claude` pointed directly at it |
+| **Standalone Gateway** | `codex2cc --serve` | Serves the gateway (and `/ui`) continuously on loopback for Claude Code, Claude Desktop, and SDK clients |
+| **Automated Client Setup** | `codex2cc --setup` | Atomically configures Claude Code CLI and Claude Desktop to use the gateway |
+| **Configuration Reset** | `codex2cc --reset-config` | Restores standard Anthropic defaults cleanly without deleting chat history |
 
-Run `codex2cc --help` for all options.
+Run `codex2cc --help` for full CLI options.
+
+---
 
 ## Requirements
 
-- Node.js 22.12 or newer
-- A ChatGPT login created by the Codex CLI (`codex login`), stored in `~/.codex/auth.json`
-- The `claude` command on your `PATH` (Claude Code mode and MCP mode)
+- **Node.js** 22.12 or newer
+- An authenticated ChatGPT session created by the Codex CLI (`codex login`), stored in `~/.codex/auth.json`
+- The `claude` command on your `PATH` (for Claude Code CLI mode)
 
-## Build and run
+---
+
+## Build and Quick Start
 
 ```bash
 npm ci
 npm run build
+
+# 1. Open the interactive Web Control Panel
+node dist/main.js --ui
+
+# 2. Or list models available to your ChatGPT account
 node dist/main.js --list-models
+
+# 3. Or launch Claude Code directly through the gateway
 node dist/main.js --model gpt-6-sol -- --resume
+
+# 4. Or run non-interactively and pipe the output
 node dist/main.js -p "Summarize this repository" | tee summary.txt
 ```
 
-Status messages go to stderr, so the output of `-p` can be piped.
+Status messages and diagnostics are emitted to `stderr`, keeping `stdout` clean for piping.
 
-## Standalone gateway
+---
+
+## Web Control Panel & Dashboard
+
+Launch with `node dist/main.js --ui` (or visit `http://127.0.0.1:3456/ui` while running `--serve`).
+
+The Control Panel provides:
+- **Client Configuration & Status**: Auto-detects configuration states for Claude Code CLI (`~/.claude/settings.json`) and Claude Desktop (`Claude-3p/configLibrary`), offering one-click configuration and factory resets.
+- **Token Usage Summary Table (Bảng Tổng Hợp Token Đã Dùng)**:
+  - Tracks total tokens used across models and sessions in real time.
+  - KPI summary metrics: **Total Tokens (Grand Total)**, **Prompt Tokens (Input)**, **Completion Tokens (Output)**, and **Cached Tokens (Read)**.
+  - Per-model breakdown with request count, token categories, and usage share percentage (`%`).
+  - Dedicated **Refresh** and **Reset Counter** controls.
+- **Live Activity & Debug Logs**:
+  - Live streaming log terminal monitoring incoming messages, model routing, token counts, and upstream errors.
+  - Filters by severity (`info`, `warn`, `error`) and search keyword.
+  - Real-time 2-second auto-refresh toggle, clipboard copy, and file persistence (`logs/gateway.log`).
+
+---
+
+## Standalone Gateway
 
 ```bash
 node dist/main.js --serve --port 3456
 ```
 
-The gateway listens on `127.0.0.1` only. Every request must carry a token, as `Authorization: Bearer <token>` or
-`x-api-key: <token>`. Set `CODEX2CC_TOKEN` (at least 16 characters) to choose it, otherwise a random one is generated
-and printed once at startup. `--no-auth` disables the token and is not recommended: any local process could then spend
-your ChatGPT quota. Requests whose `Host` is not a loopback name are refused, which blocks DNS rebinding.
+The gateway binds exclusively to `127.0.0.1`. Every request must provide a valid authentication token via `Authorization: Bearer <token>` or `x-api-key: <token>`.
+- Set `CODEX2CC_TOKEN` (at least 16 characters) to specify a fixed token.
+- If omitted, a cryptographically secure random token is generated and printed at startup.
+- `--no-auth` disables token verification (not recommended for shared machines).
+- Requests containing non-loopback `Host` headers are rejected to prevent DNS rebinding attacks.
 
-Endpoints: `POST /v1/messages` (streaming and non-streaming), `POST /v1/messages/count_tokens` (a local estimate),
-`GET /v1/models`, and `HEAD /api/hello`.
+### Endpoints
 
-## MCP server
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/messages` | `POST` | Anthropic Messages API (streaming SSE and JSON batch responses) |
+| `/v1/messages/count_tokens` | `POST` | Local token estimation for client pre-calculations |
+| `/v1/models` | `GET` | Catalog of Claude model routes mapped to ChatGPT backend models |
+| `/ui` or `/` | `GET` | Web Control Panel dashboard |
+| `/api/ui/status` | `GET` | Gateway port, auth mode, and client configuration status |
+| `/api/ui/usage` | `GET` | Real-time token usage summary and per-model statistics |
+| `/api/ui/usage/reset` | `POST` | Resets all accumulated token counters |
+| `/api/ui/logs` | `GET` | Query recent gateway activity logs with level and keyword filters |
+| `/api/ui/logs/clear` | `POST` | Clears in-memory log buffer and truncates log file |
+| `/api/hello` | `HEAD` | Loopback gateway healthcheck |
 
-```json
-{
-  "mcpServers": {
-    "codex2cc": {
-      "command": "node",
-      "args": ["/absolute/path/to/Codex2CC/dist/main.js", "--mcp"],
-      "env": { "CODEX2CC_ALLOWED_ROOTS": "/Users/me/projects" }
-    }
-  }
-}
+---
+
+## Configuring Claude Code & Claude Desktop
+
+Codex2CC provides built-in commands to configure clients safely:
+
+```bash
+# Configure both Claude Code CLI and Claude Desktop to point to the local gateway:
+node dist/main.js --setup
+
+# Configure only Claude Code CLI (~/.claude/settings.json):
+node dist/main.js --setup-cli
+
+# Configure only Claude Desktop:
+node dist/main.js --setup-desktop
+
+# Configure with a custom remote gateway URL and explicit token:
+node dist/main.js --setup --gateway-url https://my-gateway.internal --token "my-secure-token-12345"
+
+# Reset all configurations back to standard Anthropic defaults:
+node dist/main.js --reset-config
 ```
 
-Tools: `run_claude_code_with_chatgpt`, `start_claude_code_task`, `check_claude_code_task`,
-`list_available_chatgpt_models`. Tasks run `claude -p` in a `project_dir` that must be inside
-`CODEX2CC_ALLOWED_ROOTS`. The default permission mode is `acceptEdits`; `bypassPermissions` is refused unless the
-operator also sets `CODEX2CC_ALLOW_BYPASS=1`.
+### Next Steps after Setup
+1. **Start the gateway**:
+   ```bash
+   CODEX2CC_TOKEN="<token>" node dist/main.js --serve --port 3456
+   ```
+2. **Claude Desktop**: Restart the app and select **"Continue with Gateway"** (do not sign in with claude.ai).
+3. **Claude Code CLI**: Open a new terminal tab or reload your editor and run `claude` normally.
 
-## Environment variables
+### Effort Selection
+Claude Desktop displays the ChatGPT model assigned to each Claude tier route. In the Code tab:
+- Press **Cmd+Shift+E** (macOS) or **Ctrl+Shift+E** (Windows) to select reasoning effort.
+- The Sonnet and Opus routes support reasoning effort; Codex2CC translates and forwards the selected level (`low`, `medium`, `high`, `xhigh`, `max`) to ChatGPT.
 
-| Variable | Used by | Meaning |
+---
+
+## Environment Variables
+
+| Variable | Used by | Description |
 |---|---|---|
-| `CODEX2CC_TOKEN` | `--serve` | Gateway token (min. 16 characters); random if unset |
-| `CODEX2CC_MODEL_OPUS`, `_SONNET`, `_HAIKU` | all gateways | Account model used for each Claude tier (defaults `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`) |
-| `CODEX2CC_ALLOWED_ROOTS` | MCP | Path-delimited absolute directories tasks may run in (default: the server's working directory, none if that is `/`) |
-| `CODEX2CC_ALLOW_BYPASS` | MCP | `1` allows `permission_mode: bypassPermissions` |
-| `CODEX2CC_TASK_TIMEOUT_MS` | MCP | Per-task time limit in milliseconds (default 1800000, max 2147483647) |
-| `CODEX2CC_MAX_CONCURRENT` | MCP | Concurrent tasks (default 3) |
-| `CODEX2CC_TASK_TTL_MS`, `CODEX2CC_MAX_STORED_TASKS` | MCP | How long and how many finished tasks are kept (defaults 3600000, 100) |
-| `CODEX2CC_MAX_OUTPUT_CHARS` | MCP | Output kept per task, the last N characters (default 1000000) |
-| `CODEX2CC_CLAUDE_BIN` | MCP | Claude Code executable (default `claude`) |
+| `CODEX2CC_TOKEN` | `--serve`, `--ui`, setup | Gateway authentication token (min. 16 chars; random if unset) |
+| `CODEX2CC_LOG_FILE` | all | Path to write formatted gateway logs (default: `logs/gateway.log`) |
+| `CODEX2CC_MODEL_FABLE` | all | ChatGPT model for Claude Fable tier (default: `gpt-6-astra`) |
+| `CODEX2CC_MODEL_OPUS` | all | ChatGPT model for Claude Opus tier (default: `gpt-6.1-sol`) |
+| `CODEX2CC_MODEL_SONNET` | all | ChatGPT model for Claude Sonnet tier (default: `gpt-6-sol`) |
+| `CODEX2CC_MODEL_HAIKU` | all | ChatGPT model for Claude Haiku tier (default: `gpt-6-luna`) |
 
-## How authentication works
+---
 
-Codex2CC reads the Codex CLI login from `~/.codex/auth.json` and never asks for credentials itself. When the access
-token expires it refreshes it and writes the rotated tokens back to the same file. Refresh tokens are single-use, so the
-file is re-read before and after a refresh to pick up tokens another process already rotated. If the Codex login switches
-to another ChatGPT account while the gateway runs, the gateway stops using it and asks you to restart.
+## Authentication Mechanism
+
+Codex2CC reads credentials directly from `~/.codex/auth.json` and never prompts for usernames or passwords:
+- When the access token expires, Codex2CC automatically refreshes it and writes the rotated token atomically back to `~/.codex/auth.json`.
+- Because ChatGPT refresh tokens are single-use, the auth file is checked before and after refresh operations to adopt tokens rotated by concurrent processes.
+- If the Codex CLI switches to a different ChatGPT account while the gateway is active, the gateway detects the mismatch, halts requests, and instructs you to restart.
+
+---
 
 ## Limitations
 
-- This uses ChatGPT's private Codex backend, which can change without notice. Using a ChatGPT subscription through a
-  third-party gateway may not be permitted by OpenAI's terms; check them before relying on it.
-- `max_tokens`, `stop_sequences` and `thinking` are not forwarded upstream.
-- Content blocks the Responses API cannot represent (for example `document`) are replaced by a visible note, and tools
-  without an `input_schema` (for example server-side web search) are dropped; both are logged as warnings.
-- `count_tokens` is a heuristic (about four characters per token), not an exact count.
-- A model name the account does not have falls back to the selected default model, with a one-time warning per name.
+- Uses ChatGPT's internal Codex backend endpoint (`/backend-api/codex/responses`), which may change without notice. Check OpenAI's terms before production reliance.
+- `max_tokens`, `stop_sequences`, and raw `thinking` blocks are not forwarded upstream.
+- Content block types unsupported by the Codex Responses API (such as `document`) are stripped with an explicit note, and tools lacking an `input_schema` are omitted; both are recorded in the activity log.
+- `count_tokens` calculates a local heuristic (~4 characters per token).
+- If a requested model is not available in your ChatGPT account, the gateway falls back to your account's default model with a logged warning.
 
-## Development
+---
+
+## Development & Testing
 
 ```bash
 npm run typecheck
 npm test
 ```
 
-Tests run against the compiled output in `dist/` using the Node test runner, with local fake servers for the ChatGPT
-upstream and auth endpoints. Nothing in the test suite contacts OpenAI or touches your real `~/.codex` directory.
+Tests run via Node.js native test runner against compiled output in `dist/`. All upstream network requests and auth files are mocked locally; tests never contact external endpoints or touch your real `~/.codex/auth.json`.

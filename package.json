@@ -10,10 +10,10 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && chmod +x dist/main.js",
     "start": "npm run build && node dist/main.js",
     "serve": "npm run build && node dist/main.js --serve",
-    "mcp": "npm run build && node dist/main.js --mcp",
+    "ui": "npm run build && node dist/main.js --ui",
     "test": "npm run build && node --test dist/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

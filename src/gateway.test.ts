@@ -3,6 +3,7 @@ import { createServer, request as httpRequest, type IncomingHttpHeaders, type In
 import { connect } from "node:net";
 import test from "node:test";
 import { createGatewayServer, listenOnLoopback, type GatewayOptions } from "./gateway.js";
+import { getTokenUsageStats, resetTokenUsage } from "./usage.js";
 
 const TOKEN = "test-token-0123456789";
 const AUTH = { Authorization: `Bearer ${TOKEN}` };
@@ -54,7 +55,7 @@ async function startGateway(upstreamUrl: string, overrides: Partial<GatewayOptio
   const server = createGatewayServer({
     session: { accessToken: async () => "upstream-token", refreshAfterRejection: async () => "refreshed-token", accountId: () => "acct_1" },
     defaultModel: "gpt-6-sol",
-    availableModels: [{ slug: "gpt-6-sol", displayName: "GPT-6 Sol" }, { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol" }],
+    availableModels: [{ slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 272000 }, { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 272000 }, { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 272000 }],
     policy: { mode: "token", token: TOKEN },
     upstreamUrl,
     ...overrides,
@@ -97,7 +98,7 @@ function rawRequest(port: number, options: { method: string; path: string; heade
   });
 }
 
-const CHAT_REQUEST = { model: "claude-sonnet-4", max_tokens: 64, messages: [{ role: "user", content: "hi" }] };
+const CHAT_REQUEST = { model: "claude-sonnet-5-5", max_tokens: 64, messages: [{ role: "user", content: "hi" }] };
 
 test("gateway enforces Host and credential checks and never reaches upstream when rejected", async () => {
   await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
@@ -128,19 +129,26 @@ test("gateway answers a malformed request target with 400 instead of crashing", 
   });
 });
 
-test("gateway lists the account models plus the Claude aliases", async () => {
+test("gateway discovery lists only Claude-compatible routes", async () => {
   await withGateway(replyWithStream(HELLO_STREAM), async (gateway) => {
-    const body = await (await fetch(`${gateway.base}/v1/models`, { headers: AUTH })).json() as { data: Array<{ id: string }>; first_id: string };
+    const body = await (await fetch(`${gateway.base}/v1/models`, { headers: AUTH })).json() as { data: Array<{ id: string; display_name: string; max_input_tokens?: number }>; first_id: string; last_id: string };
     const ids = body.data.map((model) => model.id);
-    assert.deepEqual(ids.slice(0, 2), ["gpt-6-sol", "gpt-6.1-sol"]);
-    assert.ok(ids.includes("claude-3-7-sonnet-20250219"));
-    assert.equal(body.first_id, "gpt-6-sol");
+    assert.deepEqual(ids, ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5", "claude-fable-5-1"]);
+    assert.deepEqual(body.data.map((model) => model.display_name), [
+      "gpt-6-sol (ChatGPT via sonnet route)",
+      "gpt-6.1-sol (ChatGPT via opus route)",
+      "gpt-6-sol (ChatGPT via haiku route, fallback)",
+      "gpt-6-astra (ChatGPT via fable route)",
+    ]);
+    assert.deepEqual(body.data.map((model) => model.max_input_tokens), [272000, 272000, 272000, 272000]);
+    assert.equal(body.first_id, ids[0]);
+    assert.equal(body.last_id, ids[3]);
   });
 });
 
 test("gateway streams an Anthropic response and forwards the mapped model with upstream credentials", async () => {
   await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
-    const response = await post(gateway, { ...CHAT_REQUEST, stream: true, system: "Be brief." });
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: true, system: "Be brief.", output_config: { effort: "max" } });
     assert.equal(response.status, 200);
     assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
     const events = await response.text();
@@ -153,13 +161,22 @@ test("gateway streams an Anthropic response and forwards the mapped model with u
     const sent = upstream.requests[0]!;
     assert.equal(sent.headers.authorization, "Bearer upstream-token");
     assert.equal(sent.headers["chatgpt-account-id"], "acct_1");
-    const body = JSON.parse(sent.body) as { model: string; stream: boolean; store: boolean; instructions: string };
-    assert.deepEqual({ model: body.model, stream: body.stream, store: body.store, instructions: body.instructions }, {
+    const body = JSON.parse(sent.body) as { model: string; stream: boolean; store: boolean; instructions: string; reasoning: { effort: string } };
+    assert.deepEqual({ model: body.model, stream: body.stream, store: body.store, instructions: body.instructions, reasoning: body.reasoning }, {
       model: "gpt-6-sol",
       stream: true,
       store: false,
       instructions: "Be brief.",
+      reasoning: { effort: "max" },
     });
+  });
+});
+
+test("Fable route sends requests to GPT-6 Astra", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, model: "claude-fable-5-1", stream: false });
+    assert.equal(response.status, 200);
+    assert.equal((JSON.parse(upstream.requests[0]!.body) as { model: string }).model, "gpt-6-astra");
   });
 });
 
@@ -346,5 +363,19 @@ test("gateway reports real input and cached tokens in the stream and keeps going
     const events = await response.text();
     assert.match(events, /"usage":\{"input_tokens":60,"output_tokens":7,"cache_read_input_tokens":40\}/);
     assert.match(upstream.requests[0]!.body, /Unsupported content block \\"document\\" omitted/);
+  });
+});
+
+test("gateway records token usage metrics for processed requests", async () => {
+  resetTokenUsage();
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
+    assert.equal(response.status, 200);
+    const usage = getTokenUsageStats();
+    assert.equal(usage.totalRequests, 1);
+    assert.equal(usage.totalInputTokens, 3);
+    assert.equal(usage.totalOutputTokens, 2);
+    assert.equal(usage.grandTotalTokens, 5);
+    assert.equal(usage.models[0]?.model, "gpt-6-sol");
   });
 });

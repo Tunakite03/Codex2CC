@@ -33,6 +33,7 @@ const ToolChoice = z.discriminatedUnion("type", [
   z.object({ type: z.literal("none") }).passthrough(),
   z.object({ type: z.literal("tool"), name: z.string().min(1) }).passthrough(),
 ]);
+const Effort = z.enum(["low", "medium", "high", "xhigh", "max"]);
 export const MessageRequest = z.object({
   model: z.string().min(1),
   max_tokens: z.number().int().positive().optional().default(4096),
@@ -40,6 +41,8 @@ export const MessageRequest = z.object({
   system: z.union([z.string(), z.array(TextBlock)]).optional(),
   tools: z.array(Tool).optional(),
   tool_choice: ToolChoice.optional(),
+  output_config: z.object({ effort: Effort.optional() }).optional(),
+  reasoning_effort: Effort.optional(),
   stream: z.boolean().default(false),
 }).passthrough();
 export type MessageRequest = z.infer<typeof MessageRequest>;
@@ -69,6 +72,7 @@ export type OpenAIRequest = {
   tool_choice?: "none" | "auto" | "required" | { type: "function"; name: string };
   store: false;
   stream: true;
+  reasoning?: { effort: z.infer<typeof Effort> };
 };
 
 function imageContent(block: z.infer<typeof ImageBlock>): InputImage {
@@ -188,6 +192,10 @@ export function toOpenAIRequest(request: MessageRequest, model: string): OpenAIR
   else if (request.tool_choice?.type === "any") result.tool_choice = "required";
   else if (request.tool_choice?.type === "auto") result.tool_choice = "auto";
   else if (request.tool_choice?.type === "tool") result.tool_choice = { type: "function", name: request.tool_choice.name };
+
+  const effort = request.output_config?.effort ?? request.reasoning_effort;
+  if (effort) result.reasoning = { effort };
+
   return result;
 }
 
@@ -314,6 +322,7 @@ export class AnthropicStream {
   private readonly functionBlocks = new Map<number, number>();
   private readonly functionArguments = new Map<number, string>();
   private usedTool = false;
+  private finalUsage: AnthropicUsage | undefined;
 
   constructor(
     private readonly response: ServerResponse,
@@ -421,16 +430,22 @@ export class AnthropicStream {
         writeEvent(this.response, "content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
         writeEvent(this.response, "content_block_stop", { type: "content_block_stop", index });
       }
+      const usage = toAnthropicUsage(event.response?.usage);
+      this.finalUsage = usage;
       writeEvent(this.response, "message_delta", {
         type: "message_delta",
         delta: { stop_reason: this.usedTool ? "tool_use" : "end_turn", stop_sequence: null },
-        usage: toAnthropicUsage(event.response?.usage),
+        usage,
       });
       writeEvent(this.response, "message_stop", { type: "message_stop" });
       this.stopped = true;
     } else if (["response.failed", "response.incomplete", "error"].includes(event.type)) {
       throw new BridgeError(502, event.response?.error?.code ?? "upstream_incomplete", event.response?.error?.message ?? "OpenAI did not complete the response.");
     }
+  }
+
+  getUsage(): AnthropicUsage | undefined {
+    return this.finalUsage;
   }
 
   assertCompleted(): void {
@@ -496,6 +511,10 @@ export class MessageAccumulator {
       }
       this.usage = toAnthropicUsage(event.response?.usage);
     }
+  }
+
+  getUsage(): AnthropicUsage {
+    return this.usage;
   }
 
   buildMessage(): object {

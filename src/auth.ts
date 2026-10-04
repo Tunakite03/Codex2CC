@@ -49,6 +49,7 @@ const ModelsApiResponse = z.object({
   models: z.array(z.object({
     slug: z.string().min(1),
     display_name: z.string().optional(),
+    context_window: z.number().int().positive().optional(),
   })),
 });
 
@@ -322,7 +323,7 @@ export class ChatGPTSession {
     }
   }
 
-  async listModels(): Promise<Array<{ slug: string; displayName: string }>> {
+  async listModels(): Promise<Array<{ slug: string; displayName: string; contextWindow?: number }>> {
     try {
       const response = await fetchRetry(
         `${this.options.backendOrigin}/codex/models?client_version=${CODEX_CLIENT_VERSION}`,
@@ -338,7 +339,11 @@ export class ChatGPTSession {
       if (response.ok) {
         const parsed = ModelsApiResponse.safeParse(await response.json());
         if (parsed.success && parsed.data.models.length > 0) {
-          return parsed.data.models.map((m) => ({ slug: m.slug, displayName: m.display_name ?? m.slug }));
+          return parsed.data.models.map((m) => ({
+            slug: m.slug,
+            displayName: m.display_name ?? m.slug,
+            ...(m.context_window === undefined ? {} : { contextWindow: m.context_window }),
+          }));
         }
       }
     } catch (error) {
@@ -348,7 +353,11 @@ export class ChatGPTSession {
     try {
       const parsed = ModelsApiResponse.safeParse(JSON.parse(await readFile(this.options.modelsCachePath, "utf8")));
       if (parsed.success && parsed.data.models.length > 0) {
-        return parsed.data.models.map((m) => ({ slug: m.slug, displayName: m.display_name ?? m.slug }));
+        return parsed.data.models.map((m) => ({
+          slug: m.slug,
+          displayName: m.display_name ?? m.slug,
+          ...(m.context_window === undefined ? {} : { contextWindow: m.context_window }),
+        }));
       }
     } catch (error) {
       if (!isErrnoException(error, "ENOENT")) {
@@ -357,6 +366,7 @@ export class ChatGPTSession {
     }
 
     return [
+      { slug: "gpt-6-astra", displayName: "GPT-6 Astra" },
       { slug: "gpt-6-sol", displayName: "GPT-6 Sol" },
       { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol" },
       { slug: "gpt-6-luna", displayName: "GPT-6 Luna" },

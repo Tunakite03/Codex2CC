@@ -532,3 +532,35 @@ test("MessageAccumulator returns every parallel tool call and tolerates malforme
   ]);
   assert.equal(message.stop_reason, "tool_use");
 });
+
+test("toOpenAIRequest translates output_config.effort and reasoning_effort into reasoning object", () => {
+  const req1 = MessageRequest.parse({
+    model: "claude-3-7-sonnet-20250219",
+    messages: [{ role: "user", content: "hello" }],
+    output_config: { effort: "high" },
+  });
+  const converted1 = toOpenAIRequest(req1, "gpt-6.1-sol");
+  assert.deepEqual(converted1.reasoning, { effort: "high" });
+
+  const req2 = MessageRequest.parse({
+    model: "claude-3-7-sonnet-20250219",
+    messages: [{ role: "user", content: "solve this" }],
+    output_config: { effort: "max" },
+  });
+  const converted2 = toOpenAIRequest(req2, "gpt-6.1-sol");
+  assert.deepEqual(converted2.reasoning, { effort: "max" });
+
+  const req3 = MessageRequest.parse({
+    model: "claude-3-7-sonnet-20250219",
+    messages: [{ role: "user", content: "simple task" }],
+    reasoning_effort: "low",
+  });
+  const converted3 = toOpenAIRequest(req3, "gpt-6-sol");
+  assert.deepEqual(converted3.reasoning, { effort: "low" });
+
+  assert.throws(() => MessageRequest.parse({
+    model: "claude-sonnet-5-5",
+    messages: [{ role: "user", content: "hello" }],
+    output_config: { effort: "invalid" },
+  }));
+});

@@ -5,6 +5,7 @@ import { ChatGPTSession } from "./auth.js";
 import { BridgeError } from "./bridge.js";
 import { parseCli, standalonePolicy, USAGE } from "./cli.js";
 import { createGatewayServer, listenOnLoopback, type ModelInfo } from "./gateway.js";
+import { getActiveLogFilePath } from "./logger.js";
 import { loadTierModels, tierModel } from "./models.js";
 import type { GuardPolicy } from "./guard.js";
 
@@ -17,9 +18,14 @@ async function serveStandalone(
 ): Promise<void> {
   const server = createGatewayServer({ session, defaultModel, availableModels, policy, tiers: loadTierModels(process.env) });
   const port = await listenOnLoopback(server, requestedPort);
+  const logFile = getActiveLogFilePath();
 
   process.stdout.write(`\n🚀 Codex2CC Standalone Gateway is RUNNING!\n`);
   process.stdout.write(`   Base URL: http://127.0.0.1:${port}\n`);
+  process.stdout.write(`   Web Control Panel: http://127.0.0.1:${port}/ui\n`);
+  if (logFile) {
+    process.stdout.write(`   Log File: ${logFile}\n`);
+  }
   process.stdout.write(`   Active Codex Model: ${defaultModel}\n`);
   process.stdout.write(`   Available Models: ${availableModels.map((m) => m.slug).join(", ")}\n`);
   if (policy.mode === "token") {
@@ -68,6 +74,7 @@ async function serveClaudeCli(
     ANTHROPIC_DEFAULT_OPUS_MODEL: opusModel,
     ANTHROPIC_DEFAULT_SONNET_MODEL: sonnetModel,
     ANTHROPIC_DEFAULT_HAIKU_MODEL: haikuModel,
+    ...(process.env.CLAUDE_CODE_EFFORT_LEVEL ? { CLAUDE_CODE_EFFORT_LEVEL: process.env.CLAUDE_CODE_EFFORT_LEVEL } : {}),
     CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
     CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1",
   };
@@ -97,9 +104,136 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (command.kind === "mcp") {
-    const { runMcpServer } = await import("./mcp.js");
-    await runMcpServer();
+  if (command.kind === "ui") {
+    const { openBrowser } = await import("./ui.js");
+    let session: ChatGPTSession | undefined;
+    let models: ModelInfo[] = [];
+
+    try {
+      session = await ChatGPTSession.open();
+      models = await session.listModels();
+    } catch {
+      models = [
+        { slug: "gpt-6-astra", displayName: "ChatGPT Fable Tier (gpt-6-astra)" },
+        { slug: "gpt-6-sol", displayName: "ChatGPT Sonnet Tier (gpt-6-sol)" },
+        { slug: "gpt-6.1-sol", displayName: "ChatGPT Opus Tier (gpt-6.1-sol)" },
+        { slug: "gpt-6-luna", displayName: "ChatGPT Haiku Tier (gpt-6-luna)" },
+      ];
+    }
+
+    const selectedModel = command.model ?? models[0]?.slug ?? "gpt-6-sol";
+    const policy = standalonePolicy(false, process.env.CODEX2CC_TOKEN);
+    const fakeSession = session ?? {
+      async accessToken() { throw new BridgeError(401, "unauthorized", "Not logged into ChatGPT. Run 'codex login'."); },
+      async refreshAfterRejection() { throw new BridgeError(401, "unauthorized", "Not logged into ChatGPT."); },
+      accountId: () => "",
+    };
+
+    const server = createGatewayServer({
+      session: fakeSession,
+      defaultModel: selectedModel,
+      availableModels: models,
+      policy,
+      tiers: loadTierModels(process.env),
+    });
+    const port = await listenOnLoopback(server, command.port);
+
+    const uiUrl = `http://127.0.0.1:${port}/ui`;
+    const logFile = getActiveLogFilePath();
+    process.stdout.write(`\n🚀 Codex2CC Web Control Panel is RUNNING!\n`);
+    process.stdout.write(`   Control Panel: ${uiUrl}\n`);
+    process.stdout.write(`   API Gateway:   http://127.0.0.1:${port}\n`);
+    if (logFile) {
+      process.stdout.write(`   Log File:      ${logFile}\n`);
+    }
+    if (policy.mode === "token") {
+      process.stdout.write(`   Gateway Token: ${policy.token}\n`);
+    }
+    process.stdout.write(`   Opening browser...\n`);
+    process.stdout.write(`   Press Ctrl+C to stop.\n\n`);
+
+    openBrowser(uiUrl);
+
+    await new Promise<void>((resolve) => {
+      process.once("SIGINT", () => resolve());
+      process.once("SIGTERM", () => resolve());
+    });
+
+    server.close();
+    return;
+  }
+
+  if (command.kind === "reset-config") {
+    const { resetConfig } = await import("./config-setup.js");
+    const result = resetConfig(command.target);
+    process.stdout.write(`\n🧹 Codex2CC Configuration Reset Complete!\n`);
+    if (result.cliReset) process.stdout.write(`   ✓ Claude Code CLI config cleaned (~/.claude/settings.json, ~/.claude.json)\n`);
+    if (result.desktopReset) process.stdout.write(`   ✓ Claude Desktop config removed\n`);
+    if (result.filesModified.length > 0) {
+      process.stdout.write(`   Files updated:\n`);
+      for (const file of result.filesModified) process.stdout.write(`     - ${file}\n`);
+    }
+    process.stdout.write(`\nPlease restart Claude Desktop and any active terminal/IDE sessions.\n\n`);
+    return;
+  }
+
+  if (command.kind === "setup") {
+    const { setupConfig } = await import("./config-setup.js");
+    const tiers = loadTierModels(process.env);
+    let availableModels: string[] | undefined;
+    let selectedModel = command.model;
+
+    try {
+      const session = await ChatGPTSession.open();
+      const models = await session.listModels();
+      availableModels = models.map((m) => m.slug);
+      if (!selectedModel) {
+        selectedModel = models[0]?.slug;
+      }
+    } catch {
+      // ChatGPT session is optional for setup (e.g. configuring external gateway or before login)
+    }
+
+    const token = command.token || process.env.CODEX2CC_TOKEN;
+    const effort = command.effort || process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    const result = setupConfig(command.target, {
+      gatewayUrl: command.gatewayUrl,
+      token: token ?? "",
+      model: selectedModel,
+      effort,
+      tiers,
+      availableModels,
+    });
+
+    process.stdout.write(`\n✅ Codex2CC Gateway Configuration Applied!\n`);
+    process.stdout.write(`   Gateway URL: ${result.gatewayUrl}\n`);
+    process.stdout.write(`   Token: ${result.token}\n`);
+    process.stdout.write(`   Default Model: ${result.model}\n`);
+    if (result.effort) {
+      process.stdout.write(`   Reasoning Effort: ${result.effort}\n`);
+    }
+    if (result.cliConfigured) {
+      process.stdout.write(`   ✓ Claude Code CLI: configured (~/.claude/settings.json)\n`);
+    }
+    if (result.desktopConfigured) {
+      process.stdout.write(`   ✓ Claude Desktop: configured with provider "gateway"\n`);
+    }
+    process.stdout.write(`\n   Files updated:\n`);
+    for (const file of result.filesModified) {
+      process.stdout.write(`     - ${file}\n`);
+    }
+
+    if (!token && result.gatewayUrl.startsWith("http://127.0.0.1")) {
+      const parsedPort = new URL(result.gatewayUrl).port || "3456";
+      process.stdout.write(`\n💡 To start the standalone gateway with this token, run:\n`);
+      process.stdout.write(`   CODEX2CC_TOKEN="${result.token}" node dist/main.js --serve --port ${parsedPort}\n`);
+    }
+    if (result.desktopConfigured) {
+      process.stdout.write(`\n👉 Claude Desktop: Restart Claude Desktop, then select "Continue with Gateway".\n`);
+    }
+    if (result.cliConfigured) {
+      process.stdout.write(`👉 Claude Code CLI: Reload VS Code/Cursor or terminal, then run: claude\n\n`);
+    }
     return;
   }
 

@@ -7,9 +7,21 @@ export const DEFAULT_PORT = 3456;
 
 export type CliCommand =
   | { readonly kind: "help" }
-  | { readonly kind: "mcp" }
+  | { readonly kind: "ui"; readonly model: string | undefined; readonly port: number }
   | { readonly kind: "list-models" }
   | { readonly kind: "serve"; readonly model: string | undefined; readonly port: number; readonly noAuth: boolean }
+  | {
+      readonly kind: "setup";
+      readonly target: "cli" | "desktop" | "all";
+      readonly gatewayUrl: string;
+      readonly token: string | undefined;
+      readonly model: string | undefined;
+      readonly effort: string | undefined;
+    }
+  | {
+      readonly kind: "reset-config";
+      readonly target: "cli" | "desktop" | "all";
+    }
   | { readonly kind: "claude"; readonly model: string | undefined; readonly claudeArgs: readonly string[] };
 
 export const USAGE = `Usage: codex2cc [options] [-- <claude arguments>]
@@ -17,15 +29,24 @@ export const USAGE = `Usage: codex2cc [options] [-- <claude arguments>]
 Run Claude Code on your ChatGPT (Codex) login, or serve a local Anthropic-compatible gateway.
 
 Modes (default: launch Claude Code):
+  --ui                      Launch the Web UI control panel in your default browser
   --serve                   Run a standalone gateway
-  --mcp                     Run as an MCP server over stdio
+  --setup                   Configure Claude Code CLI and Claude Desktop for the gateway
+  --setup-cli               Configure only Claude Code CLI (~/.claude/settings.json)
+  --setup-desktop           Configure only Claude Desktop
+  --reset-config            Reset both Claude Code CLI and Claude Desktop configurations
+  --reset-cli               Reset Claude Code CLI configuration
+  --reset-desktop           Reset Claude Desktop configuration
   --list-models             Print the models available to your ChatGPT account
   -h, --help                Show this help
 
 Options:
   --model <slug>            Model to use (default: first model of your account)
+  --effort <level>          Reasoning effort level: low, medium, high, xhigh, max
   --port <n>                Standalone gateway port, 0-65535 (default: ${DEFAULT_PORT})
   --no-auth                 Standalone gateway without a token (not recommended)
+  --gateway-url, --url <u>  Base URL for setup (default: http://127.0.0.1:${DEFAULT_PORT})
+  --token <secret>          API key/token for setup (or CODEX2CC_TOKEN)
   -p, --print <prompt>      Run Claude Code non-interactively
   -c, --continue            Continue the previous Claude Code session
   --permission-mode <mode>  Claude Code permission mode
@@ -33,23 +54,32 @@ Options:
                             Pass --dangerously-skip-permissions to Claude Code
 
 Arguments after "--" are passed to Claude Code unchanged.
-Environment: CODEX2CC_TOKEN (standalone gateway token), CODEX2CC_ALLOWED_ROOTS and other
-CODEX2CC_* variables for the MCP server, CODEX2CC_MODEL_OPUS/SONNET/HAIKU (model tiers).
+Environment: CODEX2CC_TOKEN (standalone gateway token), CODEX2CC_MODEL_OPUS/SONNET/HAIKU (model tiers).
 `;
 
 const OPTIONS = {
   help: { type: "boolean", short: "h" },
-  mcp: { type: "boolean" },
+  ui: { type: "boolean" },
   "list-models": { type: "boolean" },
   serve: { type: "boolean" },
   "no-auth": { type: "boolean" },
   model: { type: "string" },
+  effort: { type: "string" },
   port: { type: "string" },
   "permission-mode": { type: "string" },
   print: { type: "string", short: "p" },
   continue: { type: "boolean", short: "c" },
   "dangerously-skip-permissions": { type: "boolean", short: "y" },
   "skip-permissions": { type: "boolean" },
+  setup: { type: "boolean" },
+  "setup-cli": { type: "boolean" },
+  "setup-desktop": { type: "boolean" },
+  "reset-config": { type: "boolean" },
+  "reset-cli": { type: "boolean" },
+  "reset-desktop": { type: "boolean" },
+  "gateway-url": { type: "string" },
+  url: { type: "string" },
+  token: { type: "string" },
 } as const;
 
 function parseGatewayOptions(options: readonly string[]) {
@@ -74,7 +104,7 @@ function parsePort(raw: string | undefined): number {
 /**
  * Parses codex2cc arguments. Everything before `--` configures the gateway and is validated
  * strictly; everything after it is passed to Claude Code unchanged. Mode precedence:
- * --help, --mcp, --list-models, --serve.
+ * --help, --ui, --list-models, --reset-config/cli/desktop, --setup/cli/desktop, --serve.
  */
 export function parseCli(argv: readonly string[]): CliCommand {
   const separator = argv.indexOf("--");
@@ -83,8 +113,23 @@ export function parseCli(argv: readonly string[]): CliCommand {
   const model = values.model || undefined;
 
   if (values.help) return { kind: "help" };
-  if (values.mcp) return { kind: "mcp" };
+  if (values.ui) return { kind: "ui", model, port: parsePort(values.port) };
   if (values["list-models"]) return { kind: "list-models" };
+
+  if (values["reset-config"] || values["reset-cli"] || values["reset-desktop"]) {
+    const target = values["reset-config"] ? "all" : values["reset-desktop"] ? "desktop" : "cli";
+    return { kind: "reset-config", target };
+  }
+
+  if (values.setup || values["setup-cli"] || values["setup-desktop"]) {
+    const target = values.setup ? "all" : values["setup-desktop"] ? "desktop" : "cli";
+    const port = values.port ? parsePort(values.port) : DEFAULT_PORT;
+    const gatewayUrl = values["gateway-url"] || values.url || `http://127.0.0.1:${port}`;
+    const token = values.token?.trim() || undefined;
+    const effort = values.effort?.trim() || undefined;
+    return { kind: "setup", target, gatewayUrl, token, model, effort };
+  }
+
   if (values.serve) return { kind: "serve", model, port: parsePort(values.port), noAuth: values["no-auth"] === true };
 
   const forwarded = [...claudeArgs];
@@ -94,6 +139,9 @@ export function parseCli(argv: readonly string[]): CliCommand {
   }
   if (values["permission-mode"] && !forwarded.includes("--permission-mode")) {
     forwarded.unshift("--permission-mode", values["permission-mode"]);
+  }
+  if (values.effort && !forwarded.includes("--effort")) {
+    forwarded.unshift("--effort", values.effort);
   }
   if (values.print && !forwarded.includes("-p")) {
     forwarded.push("-p", values.print);

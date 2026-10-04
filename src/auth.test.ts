@@ -198,16 +198,16 @@ test("listModels prefers the remote catalog, then the local cache, then built-in
   await withFixture({ access: jwt(Date.now() + HOUR_MS), refresh: "r1" }, async ({ options, dir, fake }) => {
     const session = await ChatGPTSession.open(options);
 
-    fake.onModels((response) => json(response, 200, { models: [{ slug: "remote-model", display_name: "Remote" }] }));
-    assert.deepEqual(await session.listModels(), [{ slug: "remote-model", displayName: "Remote" }]);
+    fake.onModels((response) => json(response, 200, { models: [{ slug: "remote-model", display_name: "Remote", context_window: 272000 }] }));
+    assert.deepEqual(await session.listModels(), [{ slug: "remote-model", displayName: "Remote", contextWindow: 272000 }]);
 
     fake.onModels((response) => json(response, 404, {}));
-    await writeFile(join(dir, "models_cache.json"), JSON.stringify({ models: [{ slug: "cached-model" }] }));
-    assert.deepEqual(await session.listModels(), [{ slug: "cached-model", displayName: "cached-model" }]);
+    await writeFile(join(dir, "models_cache.json"), JSON.stringify({ models: [{ slug: "cached-model", context_window: 180000 }] }));
+    assert.deepEqual(await session.listModels(), [{ slug: "cached-model", displayName: "cached-model", contextWindow: 180000 }]);
 
     await writeFile(join(dir, "models_cache.json"), JSON.stringify({ models: [] }));
     const defaults = await session.listModels();
-    assert.deepEqual(defaults.map((model) => model.slug), ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"]);
+    assert.deepEqual(defaults.map((model) => model.slug), ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"]);
   });
 });
 

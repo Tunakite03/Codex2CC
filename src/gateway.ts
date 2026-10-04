@@ -12,7 +12,10 @@ import {
   unsupportedToolNames,
 } from "./bridge.js";
 import { checkClient, checkHost, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
-import { DEFAULT_TIER_MODELS, resolveModel, type TierModels } from "./models.js";
+import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, resolveModel, type TierModels } from "./models.js";
+import { handleUiRoute } from "./ui.js";
+import { recordLog } from "./logger.js";
+import { recordTokenUsage } from "./usage.js";
 
 export const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 
@@ -20,7 +23,7 @@ const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024;
 const UPSTREAM_TIMEOUT_MS = 600_000;
 const UPSTREAM_ATTEMPTS = 3;
 
-export type ModelInfo = { slug: string; displayName: string };
+export type ModelInfo = { slug: string; displayName: string; contextWindow?: number };
 
 /** The part of a ChatGPT session the gateway needs to call the upstream API. */
 export type UpstreamSession = {
@@ -119,11 +122,23 @@ async function openInference(options: ResolvedGatewayOptions, body: object, clie
       attempt--;
       await response.body?.cancel();
       process.stderr.write(`${JSON.stringify({ level: "warn", operation: "inference", status: 401, action: "refresh_token" })}\n`);
+      recordLog({
+        level: "warn",
+        operation: "inference",
+        message: "ChatGPT token rejected (401), refreshing access token",
+        details: { status: 401, action: "refresh_token" },
+      });
       token = await options.session.refreshAfterRejection(token);
       continue;
     }
     if ((response.status === 429 || response.status === 503) && attempt < UPSTREAM_ATTEMPTS) {
       process.stderr.write(`${JSON.stringify({ level: "warn", operation: "inference", attempt, status: response.status })}\n`);
+      recordLog({
+        level: "warn",
+        operation: "inference",
+        message: `Upstream HTTP ${response.status} on attempt ${attempt}, retrying in ${300 * attempt}ms`,
+        details: { attempt, status: response.status },
+      });
       await response.body?.cancel();
       await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
       continue;
@@ -148,20 +163,45 @@ async function handleMessage(
   response: ServerResponse,
   clientGone: AbortSignal,
 ): Promise<void> {
+  const startTime = Date.now();
   const inbound = parseRequest(await readBody(request, options.maxBodyBytes));
+  recordLog({
+    level: "info",
+    operation: "inbound_request",
+    message: `Received message request for model "${inbound.model}" (stream: ${Boolean(inbound.stream)})`,
+    details: { model: inbound.model, stream: Boolean(inbound.stream) },
+  });
   const omittedBlocks = unsupportedBlockTypes(inbound);
   if (omittedBlocks.length > 0) {
     process.stderr.write(`${JSON.stringify({ level: "warn", operation: "unsupported_blocks", types: omittedBlocks })}\n`);
+    recordLog({
+      level: "warn",
+      operation: "unsupported_blocks",
+      message: `Unsupported blocks omitted: ${omittedBlocks.join(", ")}`,
+      details: { types: omittedBlocks.join(", ") },
+    });
   }
   const omittedTools = unsupportedToolNames(inbound);
   if (omittedTools.length > 0) {
     process.stderr.write(`${JSON.stringify({ level: "warn", operation: "unsupported_tools", names: omittedTools })}\n`);
+    recordLog({
+      level: "warn",
+      operation: "unsupported_tools",
+      message: `Unsupported tools omitted: ${omittedTools.join(", ")}`,
+      details: { names: omittedTools.join(", ") },
+    });
   }
   const resolution = resolveModel(inbound.model, options.defaultModel, options.modelSlugs, options.tiers);
   const activeModel = resolution.slug;
   if (resolution.fellBack && !options.warnedModels.has(inbound.model)) {
     options.warnedModels.add(inbound.model);
     process.stderr.write(`${JSON.stringify({ level: "warn", operation: "model_fallback", requested: inbound.model, using: activeModel })}\n`);
+    recordLog({
+      level: "warn",
+      operation: "model_fallback",
+      message: `Requested model "${inbound.model}" unavailable; routed to "${activeModel}"`,
+      details: { requested: inbound.model, using: activeModel },
+    });
   }
   const outgoing = toOpenAIRequest(inbound, activeModel);
   const upstream = await openInference(options, outgoing, clientGone);
@@ -171,10 +211,57 @@ async function handleMessage(
     await readSse(upstream.body!, (event) => encoder.accept(event));
     encoder.assertCompleted();
     response.end();
+    const usage = encoder.getUsage();
+    const inputTokens = usage?.input_tokens ?? estimateInputTokens(inbound);
+    const outputTokens = usage?.output_tokens ?? 0;
+    const cachedTokens = usage?.cache_read_input_tokens ?? 0;
+    recordTokenUsage({
+      model: activeModel,
+      inputTokens,
+      outputTokens,
+      cachedTokens,
+    });
+    recordLog({
+      level: "info",
+      operation: "stream_complete",
+      message: `Stream completed for model "${activeModel}" in ${Date.now() - startTime}ms`,
+      details: {
+        model: activeModel,
+        durationMs: Date.now() - startTime,
+        inputTokens,
+        outputTokens,
+        cachedTokens,
+        totalTokens: inputTokens + outputTokens + cachedTokens,
+      },
+    });
   } else {
     const accumulator = new MessageAccumulator(activeModel);
     await readSse(upstream.body!, (event) => accumulator.accept(event));
-    response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(accumulator.buildMessage()));
+    const msg = accumulator.buildMessage();
+    response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(msg));
+    const usage = accumulator.getUsage();
+    const inputTokens = usage.input_tokens;
+    const outputTokens = usage.output_tokens;
+    const cachedTokens = usage.cache_read_input_tokens ?? 0;
+    recordTokenUsage({
+      model: activeModel,
+      inputTokens,
+      outputTokens,
+      cachedTokens,
+    });
+    recordLog({
+      level: "info",
+      operation: "message_complete",
+      message: `Message completed for model "${activeModel}" in ${Date.now() - startTime}ms`,
+      details: {
+        model: activeModel,
+        durationMs: Date.now() - startTime,
+        inputTokens,
+        outputTokens,
+        cachedTokens,
+        totalTokens: inputTokens + outputTokens + cachedTokens,
+      },
+    });
   }
 }
 
@@ -184,7 +271,14 @@ async function handleCountTokens(
   response: ServerResponse,
 ): Promise<void> {
   const inbound = parseRequest(await readBody(request, options.maxBodyBytes));
-  response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ input_tokens: estimateInputTokens(inbound) }));
+  const count = estimateInputTokens(inbound);
+  recordLog({
+    level: "info",
+    operation: "count_tokens",
+    message: `Estimated tokens for model "${inbound.model}": ${count} tokens`,
+    details: { model: inbound.model, tokens: count },
+  });
+  response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ input_tokens: count }));
 }
 
 function toBridgeError(error: Error): BridgeError {
@@ -210,6 +304,12 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
   return createServer((request, response) => {
     const hostCheck = checkHost(request.headers);
     if (!hostCheck.ok) {
+      recordLog({
+        level: "error",
+        operation: "guard_host",
+        message: `Blocked request with invalid Host: ${hostCheck.message}`,
+        details: { status: hostCheck.status, type: hostCheck.type },
+      });
       sendGuardFailure(response, hostCheck);
       return;
     }
@@ -222,24 +322,47 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
       response.writeHead(200).end();
       return;
     }
+    if (path === "/" || path === "/ui" || path.startsWith("/api/ui/")) {
+      const port = (request.socket.localPort) || 3456;
+      handleUiRoute(gatewayOptions, request, response, path, port).catch(() => {
+        response.writeHead(500).end();
+      });
+      return;
+    }
     const clientCheck = checkClient(request.headers, options.policy);
     if (!clientCheck.ok) {
+      recordLog({
+        level: "warn",
+        operation: "guard_auth",
+        message: `Client auth check failed: ${clientCheck.message}`,
+        details: { status: clientCheck.status, type: clientCheck.type },
+      });
       sendGuardFailure(response, clientCheck);
       return;
     }
     if (request.method === "GET" && path === "/v1/models") {
-      const list = options.availableModels.map((model) => ({
-        id: model.slug,
-        type: "model",
-        display_name: `${model.displayName} (ChatGPT Plus)`,
-      }));
-      list.push(
-        { id: "claude-3-7-sonnet-20250219", type: "model", display_name: "Claude 3.7 Sonnet (via ChatGPT)" },
-        { id: "claude-3-5-sonnet-20241022", type: "model", display_name: "Claude 3.5 Sonnet (via ChatGPT)" },
-        { id: "claude-3-5-haiku-20241022", type: "model", display_name: "Claude 3.5 Haiku (via ChatGPT)" },
-      );
+      recordLog({
+        level: "info",
+        operation: "models",
+        message: `Client queried models catalog (${CLAUDE_GATEWAY_MODELS.length} models returned)`,
+      });
+      const list = CLAUDE_GATEWAY_MODELS.map((model) => {
+        const resolution = resolveModel(model.id, options.defaultModel, options.modelSlugs, options.tiers);
+        const targetModel = options.availableModels.find((available) => available.slug === resolution.slug);
+        return {
+          id: model.id,
+          type: "model",
+          display_name: `${resolution.slug} (ChatGPT via ${model.tier} route${resolution.fellBack ? ", fallback" : ""})`,
+          ...(targetModel?.contextWindow === undefined ? {} : { max_input_tokens: targetModel.contextWindow }),
+        };
+      });
       response.writeHead(200, { "Content-Type": "application/json" }).end(
-        JSON.stringify({ data: list, has_more: false, first_id: options.defaultModel, last_id: options.defaultModel }),
+        JSON.stringify({
+          data: list,
+          has_more: false,
+          first_id: CLAUDE_GATEWAY_MODELS[0].id,
+          last_id: CLAUDE_GATEWAY_MODELS.at(-1)!.id,
+        }),
       );
       return;
     }
@@ -258,6 +381,12 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
       const typed = toBridgeError(error);
       const clientDisconnected = clientGone.signal.aborted;
       process.stderr.write(`${JSON.stringify({ level: clientDisconnected ? "info" : "error", operation: "bridge_request", code: typed.code, status: typed.status, message: typed.message, clientDisconnected })}\n`);
+      recordLog({
+        level: clientDisconnected ? "info" : "error",
+        operation: "bridge_request",
+        message: clientDisconnected ? "Client closed connection before completion" : `${typed.code} (${typed.status}): ${typed.message}`,
+        details: { code: typed.code, status: typed.status, clientDisconnected },
+      });
       if (!clientDisconnected) sendError(response, typed);
     });
   });

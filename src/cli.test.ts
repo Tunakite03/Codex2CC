@@ -3,13 +3,13 @@ import test from "node:test";
 import { BridgeError } from "./bridge.js";
 import { DEFAULT_PORT, parseCli, standalonePolicy } from "./cli.js";
 
-test("parseCli gives --help precedence, then --mcp, then --list-models, then --serve", () => {
-  assert.deepEqual(parseCli(["--mcp", "-h"]), { kind: "help" });
-  assert.deepEqual(parseCli(["--mcp", "--serve", "--list-models"]), { kind: "mcp" });
+test("parseCli gives --help precedence, then --ui, then --list-models, then --serve", () => {
+  assert.deepEqual(parseCli(["--ui", "-h"]), { kind: "help" });
+  assert.deepEqual(parseCli(["--ui", "--serve", "--list-models"]), { kind: "ui", model: undefined, port: DEFAULT_PORT });
   assert.deepEqual(parseCli(["--list-models", "--serve"]), { kind: "list-models" });
 });
 
-test("parseCli reads serve options and defaults the port", () => {
+test("parseCli reads serve and ui options and defaults the port", () => {
   assert.deepEqual(parseCli(["--serve"]), { kind: "serve", model: undefined, port: DEFAULT_PORT, noAuth: false });
   assert.deepEqual(parseCli(["--serve", "--port", "4000", "--model", "gpt-6-sol", "--no-auth"]), {
     kind: "serve",
@@ -17,6 +17,42 @@ test("parseCli reads serve options and defaults the port", () => {
     port: 4000,
     noAuth: true,
   });
+  assert.deepEqual(parseCli(["--ui"]), { kind: "ui", model: undefined, port: DEFAULT_PORT });
+  assert.deepEqual(parseCli(["--ui", "--port", "3900", "--model", "gpt-6.1-sol"]), {
+    kind: "ui",
+    model: "gpt-6.1-sol",
+    port: 3900,
+  });
+});
+
+test("parseCli parses setup and reset options with proper targets and defaults", () => {
+  assert.deepEqual(parseCli(["--setup"]), {
+    kind: "setup",
+    target: "all",
+    gatewayUrl: `http://127.0.0.1:${DEFAULT_PORT}`,
+    token: undefined,
+    model: undefined,
+    effort: undefined,
+  });
+  assert.deepEqual(parseCli(["--setup-cli", "--gateway-url", "https://my-gateway.com", "--token", "secret1234567890", "--model", "gpt-6-sol", "--effort", "high"]), {
+    kind: "setup",
+    target: "cli",
+    gatewayUrl: "https://my-gateway.com",
+    token: "secret1234567890",
+    model: "gpt-6-sol",
+    effort: "high",
+  });
+  assert.deepEqual(parseCli(["--setup-desktop", "--port", "8080"]), {
+    kind: "setup",
+    target: "desktop",
+    gatewayUrl: "http://127.0.0.1:8080",
+    token: undefined,
+    model: undefined,
+    effort: undefined,
+  });
+  assert.deepEqual(parseCli(["--reset-config"]), { kind: "reset-config", target: "all" });
+  assert.deepEqual(parseCli(["--reset-cli"]), { kind: "reset-config", target: "cli" });
+  assert.deepEqual(parseCli(["--reset-desktop"]), { kind: "reset-config", target: "desktop" });
 });
 
 test("parseCli treats an empty --model value as not provided", () => {
