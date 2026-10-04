@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import test from "node:test";
 import type { GatewayOptions } from "./gateway.js";
+import { DEFAULT_TIER_MODELS } from "./models.js";
+import { TierModelStore } from "./tier-store.js";
 import { getStatus, handleUiRoute, renderDashboardHtml } from "./ui.js";
 
 function createMockResponse(): { response: ServerResponse; getOutput: () => { statusCode: number; headers: Record<string, string>; body: string } } {
@@ -67,6 +72,12 @@ test("renderDashboardHtml generates rich HTML markup with control panel componen
   const html = renderDashboardHtml();
   assert.ok(html.includes("Codex2CC Control Panel"));
   assert.ok(html.includes("btn-apply"));
+  assert.ok(html.includes("tier-fable"));
+  assert.ok(html.includes("tier-opus"));
+  assert.ok(html.includes("tier-sonnet"));
+  assert.ok(html.includes("tier-haiku"));
+  assert.ok(html.includes("btn-save-tier-mapping"));
+  assert.ok(html.includes("btn-reset-tier-mapping"));
   assert.ok(html.includes("btn-reset-all"));
   assert.ok(html.includes("input-token"));
   assert.ok(html.includes("section-logs"));
@@ -77,7 +88,8 @@ test("renderDashboardHtml generates rich HTML markup with control panel componen
   assert.ok(html.includes("input-log-search"));
   assert.ok(html.includes("select-log-level"));
   assert.ok(html.includes("log-terminal"));
-  assert.ok(html.includes("badge-log-file"));
+  assert.ok(html.includes('id="input-token" autocomplete="off" placeholder="No token required" readonly'));
+  assert.ok(!html.includes('id="btn-gen-token"'));
   assert.ok(html.includes("section-usage"));
   assert.ok(html.includes("usage-title"));
   assert.ok(html.includes("usage-table"));
@@ -87,7 +99,7 @@ test("renderDashboardHtml generates rich HTML markup with control panel componen
   assert.ok(!html.includes('id="slider-effort"'));
   assert.ok(!html.includes("Reasoning Effort"));
   assert.ok(html.includes("color-scheme: light"));
-  assert.ok(html.includes("--background: #f3efe6"));
+  assert.ok(html.includes("--background: #f5f7f6"));
   assert.ok(!html.includes("prefers-color-scheme: dark"));
   assert.ok(html.includes("family=Lexend"));
   assert.ok(html.includes("family=Plus+Jakarta+Sans"));
@@ -157,6 +169,68 @@ test("handleUiRoute rejects invalid gateway setup without writing client files",
   const data = JSON.parse(out.body);
   assert.equal(data.ok, false);
   assert.match(data.error, /Invalid gateway URL/);
+});
+
+test("handleUiRoute rejects a token that differs from the running gateway", async () => {
+  const { response, getOutput } = createMockResponse();
+  const req = createMockRequest("POST", "/api/ui/setup", {
+    target: "desktop",
+    gatewayUrl: "http://127.0.0.1:3456",
+    token: "different-token-1234567890",
+  });
+  const handled = await handleUiRoute(mockOptions, req, response, "/api/ui/setup", 3456);
+  assert.equal(handled, true);
+  const out = getOutput();
+  assert.equal(out.statusCode, 400);
+  assert.match(JSON.parse(out.body).error, /does not match the running gateway/);
+});
+
+test("tier mapping API saves, applies, and resets the UI mapping", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex2cc-tier-mapping-"));
+  const filePath = join(directory, "tier-models.json");
+  const tierStore = TierModelStore.open(filePath, {});
+  const options: GatewayOptions = { ...mockOptions, tierStore };
+  const tiers = { fable: "gpt-6-sol", opus: "gpt-6.1-sol", sonnet: "gpt-6.1-sol", haiku: "gpt-6-sol" };
+
+  try {
+    const saveOutput = createMockResponse();
+    await handleUiRoute(
+      options,
+      createMockRequest("POST", "/api/ui/tiers", { tiers }),
+      saveOutput.response,
+      "/api/ui/tiers",
+      3456,
+    );
+    assert.equal(saveOutput.getOutput().statusCode, 200);
+    assert.deepEqual(tierStore.current(), tiers);
+    assert.deepEqual(JSON.parse(readFileSync(filePath, "utf8")).tiers, tiers);
+    assert.deepEqual(TierModelStore.open(filePath, {}).current(), tiers);
+
+    const invalidOutput = createMockResponse();
+    await handleUiRoute(
+      options,
+      createMockRequest("POST", "/api/ui/tiers", { tiers: { ...tiers, opus: "not-in-account" } }),
+      invalidOutput.response,
+      "/api/ui/tiers",
+      3456,
+    );
+    assert.equal(invalidOutput.getOutput().statusCode, 400);
+    assert.deepEqual(tierStore.current(), tiers);
+
+    const resetOutput = createMockResponse();
+    await handleUiRoute(
+      options,
+      createMockRequest("POST", "/api/ui/tiers/reset"),
+      resetOutput.response,
+      "/api/ui/tiers/reset",
+      3456,
+    );
+    assert.equal(resetOutput.getOutput().statusCode, 200);
+    assert.deepEqual(tierStore.current(), DEFAULT_TIER_MODELS);
+    assert.equal(tierStore.isCustom(), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("handleUiRoute provides log retrieval and log clearing endpoints", async () => {

@@ -6,6 +6,7 @@ import test from "node:test";
 import { BridgeError } from "./bridge.js";
 import {
   CODEX2CC_DESKTOP_CONFIG_ID,
+  configuredGatewayToken,
   resetConfig,
   setupConfig,
   validateGatewayUrl,
@@ -81,6 +82,7 @@ test("setupConfig configures Claude Code CLI atomically and cleans old credentia
     assert.equal(settings.env.ANTHROPIC_MODEL, "gpt-6-sol");
     assert.equal(settings.env.CLAUDE_CODE_EFFORT_LEVEL, "high");
     assert.equal(settings.env.CLAUDE_CODE_USE_GATEWAY, "1");
+    assert.equal(settings.env.CLAUDE_CODE_MODEL_CAPABILITIES, "effort,max_effort,xhigh_effort");
     assert.equal(settings.env.API_TIMEOUT_MS, "600000");
     assert.equal(settings.permissions.defaultMode, "bypassPermissions");
     assert.equal(settings.skipDangerousModePermissionPrompt, true);
@@ -135,6 +137,30 @@ test("setupConfig configures Claude Desktop library, models and _meta.json", () 
   }
 });
 
+test("configuredGatewayToken reuses only a credential for the requested local gateway", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    setupConfig("all", {
+      gatewayUrl: "http://127.0.0.1:3456",
+      token: "persistent-token-1234567890",
+      paths,
+    });
+    assert.equal(configuredGatewayToken("http://127.0.0.1:3456", paths), "persistent-token-1234567890");
+    assert.equal(configuredGatewayToken("http://127.0.0.1:4567", paths), undefined);
+
+    resetConfig("desktop", paths);
+    assert.equal(configuredGatewayToken("http://127.0.0.1:3456", paths), "persistent-token-1234567890");
+
+    writeFileSync(join(paths.claudeDesktopDir, "_meta.json"), "{invalid json", "utf8");
+    assert.throws(
+      () => configuredGatewayToken("http://127.0.0.1:3456", paths),
+      (error: unknown) => error instanceof BridgeError && error.code === "invalid_saved_gateway_config",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test("resetConfig cleanly strips gateway settings from CLI and Desktop without corrupting files", () => {
   const { paths, cleanup } = createSandbox();
   try {
@@ -160,6 +186,7 @@ test("resetConfig cleanly strips gateway settings from CLI and Desktop without c
     assert.equal(settingsAfter.env.ANTHROPIC_BASE_URL, undefined);
     assert.equal(settingsAfter.env.ANTHROPIC_AUTH_TOKEN, undefined);
     assert.equal(settingsAfter.env.CLAUDE_CODE_EFFORT_LEVEL, undefined);
+    assert.equal(settingsAfter.env.CLAUDE_CODE_MODEL_CAPABILITIES, undefined);
     assert.equal(settingsAfter.env.MY_CUSTOM_VAR, "keep-me");
     assert.equal(settingsAfter.permissions, undefined);
     assert.equal(settingsAfter.skipDangerousModePermissionPrompt, undefined);

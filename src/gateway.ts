@@ -12,7 +12,8 @@ import {
   unsupportedToolNames,
 } from "./bridge.js";
 import { checkClient, checkHost, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
-import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, resolveModel, type TierModels } from "./models.js";
+import { CLAUDE_GATEWAY_MODELS, resolveModel, type TierModels } from "./models.js";
+import { activeTierModels, type TierModelStore } from "./tier-store.js";
 import { handleUiRoute } from "./ui.js";
 import { recordLog } from "./logger.js";
 import { recordTokenUsage } from "./usage.js";
@@ -41,12 +42,14 @@ export type GatewayOptions = {
   readonly upstreamUrl?: string;
   readonly maxBodyBytes?: number;
   readonly tiers?: TierModels;
+  /** Live, UI-editable mapping; when present it takes precedence over `tiers`. */
+  readonly tierStore?: TierModelStore;
 };
 
 type ResolvedGatewayOptions = GatewayOptions & {
   readonly upstreamUrl: string;
   readonly maxBodyBytes: number;
-  readonly tiers: TierModels;
+  readonly currentTiers: () => TierModels;
   readonly modelSlugs: ReadonlySet<string>;
   readonly warnedModels: Set<string>;
 };
@@ -165,11 +168,12 @@ async function handleMessage(
 ): Promise<void> {
   const startTime = Date.now();
   const inbound = parseRequest(await readBody(request, options.maxBodyBytes));
+  const effort = inbound.output_config?.effort ?? inbound.reasoning_effort ?? "upstream_default";
   recordLog({
     level: "info",
     operation: "inbound_request",
-    message: `Received message request for model "${inbound.model}" (stream: ${Boolean(inbound.stream)})`,
-    details: { model: inbound.model, stream: Boolean(inbound.stream) },
+    message: `Received message request for model "${inbound.model}" (stream: ${Boolean(inbound.stream)}, effort: ${effort})`,
+    details: { model: inbound.model, stream: Boolean(inbound.stream), effort },
   });
   const omittedBlocks = unsupportedBlockTypes(inbound);
   if (omittedBlocks.length > 0) {
@@ -191,7 +195,7 @@ async function handleMessage(
       details: { names: omittedTools.join(", ") },
     });
   }
-  const resolution = resolveModel(inbound.model, options.defaultModel, options.modelSlugs, options.tiers);
+  const resolution = resolveModel(inbound.model, options.defaultModel, options.modelSlugs, options.currentTiers());
   const activeModel = resolution.slug;
   if (resolution.fellBack && !options.warnedModels.has(inbound.model)) {
     options.warnedModels.add(inbound.model);
@@ -227,6 +231,7 @@ async function handleMessage(
       message: `Stream completed for model "${activeModel}" in ${Date.now() - startTime}ms`,
       details: {
         model: activeModel,
+        effort,
         durationMs: Date.now() - startTime,
         inputTokens,
         outputTokens,
@@ -255,6 +260,7 @@ async function handleMessage(
       message: `Message completed for model "${activeModel}" in ${Date.now() - startTime}ms`,
       details: {
         model: activeModel,
+        effort,
         durationMs: Date.now() - startTime,
         inputTokens,
         outputTokens,
@@ -296,7 +302,7 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
     ...gatewayOptions,
     upstreamUrl: gatewayOptions.upstreamUrl ?? CHATGPT_RESPONSES_URL,
     maxBodyBytes: gatewayOptions.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
-    tiers: gatewayOptions.tiers ?? DEFAULT_TIER_MODELS,
+    currentTiers: () => activeTierModels(gatewayOptions),
     modelSlugs: new Set(gatewayOptions.availableModels.map((model) => model.slug)),
     warnedModels: new Set<string>(),
   };
@@ -346,8 +352,9 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
         operation: "models",
         message: `Client queried models catalog (${CLAUDE_GATEWAY_MODELS.length} models returned)`,
       });
+      const tiers = options.currentTiers();
       const list = CLAUDE_GATEWAY_MODELS.map((model) => {
-        const resolution = resolveModel(model.id, options.defaultModel, options.modelSlugs, options.tiers);
+        const resolution = resolveModel(model.id, options.defaultModel, options.modelSlugs, tiers);
         const targetModel = options.availableModels.find((available) => available.slug === resolution.slug);
         return {
           id: model.id,

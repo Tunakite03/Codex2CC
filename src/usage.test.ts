@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { getTokenUsageStats, recordTokenUsage, resetTokenUsage } from "./usage.js";
+import { enableUsagePersistence, getTokenUsageStats, recordTokenUsage, resetTokenUsage } from "./usage.js";
 
 test("usage tracker aggregates token usage by model and overall statistics", () => {
   resetTokenUsage();
@@ -83,4 +86,30 @@ test("usage tracker handles zero, negative or missing values gracefully", () => 
   assert.equal(stats.totalCachedTokens, 0);
   assert.equal(stats.grandTotalTokens, 0);
   assert.equal(stats.models[0]?.model, "gpt-6-astra");
+});
+
+test("usage tracker persists counters across restarts and quarantines corrupt files", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex2cc-usage-"));
+  const file = join(dir, "usage.json");
+  try {
+    enableUsagePersistence(file);
+    recordTokenUsage({ model: "gpt-6-sol", inputTokens: 10, outputTokens: 5, cachedTokens: 2 });
+    assert.ok(existsSync(file));
+
+    // Simulated restart: reload from disk.
+    enableUsagePersistence(file);
+    const restored = getTokenUsageStats();
+    assert.equal(restored.totalRequests, 1);
+    assert.equal(restored.grandTotalTokens, 17);
+
+    resetTokenUsage();
+    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { version: 1, models: {} });
+
+    writeFileSync(file, "{not json", "utf8");
+    enableUsagePersistence(file);
+    assert.equal(getTokenUsageStats().totalRequests, 0);
+    assert.ok(existsSync(`${file}.corrupt`));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -54,7 +54,7 @@ Options:
                             Pass --dangerously-skip-permissions to Claude Code
 
 Arguments after "--" are passed to Claude Code unchanged.
-Environment: CODEX2CC_TOKEN (standalone gateway token), CODEX2CC_MODEL_OPUS/SONNET/HAIKU (model tiers).
+Environment: CODEX2CC_TOKEN, CODEX2CC_MODEL_FABLE/OPUS/SONNET/HAIKU, CODEX2CC_TIERS_FILE.
 `;
 
 const OPTIONS = {

@@ -3,6 +3,7 @@ import { createServer, request as httpRequest, type IncomingHttpHeaders, type In
 import { connect } from "node:net";
 import test from "node:test";
 import { createGatewayServer, listenOnLoopback, type GatewayOptions } from "./gateway.js";
+import { getLogs } from "./logger.js";
 import { getTokenUsageStats, resetTokenUsage } from "./usage.js";
 
 const TOKEN = "test-token-0123456789";
@@ -169,6 +170,51 @@ test("gateway streams an Anthropic response and forwards the mapped model with u
       instructions: "Be brief.",
       reasoning: { effort: "max" },
     });
+  });
+});
+
+test("Haiku route forwards reasoning effort to GPT-6 Luna", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
+    const response = await post(gateway, {
+      ...CHAT_REQUEST,
+      model: "claude-haiku-5",
+      output_config: { effort: "xhigh" },
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+
+    const sent = JSON.parse(upstream.requests[0]!.body) as { model: string; reasoning: { effort: string } };
+    assert.equal(sent.model, "gpt-6-luna");
+    assert.deepEqual(sent.reasoning, { effort: "xhigh" });
+  }, {
+    availableModels: [
+      { slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 272000 },
+      { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 272000 },
+      { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 272000 },
+      { slug: "gpt-6-luna", displayName: "GPT-6 Luna", contextWindow: 272000 },
+    ],
+  });
+});
+
+test("gateway logs requested effort for streamed and non-streamed messages", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway) => {
+    const sinceId = getLogs().at(-1)?.id ?? 0;
+    for (const request of [
+      { ...CHAT_REQUEST, stream: true, output_config: { effort: "high" }, reasoning_effort: "low" },
+      { ...CHAT_REQUEST, reasoning_effort: "max" },
+      CHAT_REQUEST,
+    ]) {
+      const response = await post(gateway, request);
+      assert.equal(response.status, 200);
+      await response.text();
+    }
+    const logs = getLogs({ sinceId });
+    assert.deepEqual(logs.filter((entry) => entry.operation === "inbound_request").map((entry) => entry.details?.effort), ["high", "max", "upstream_default"]);
+    assert.deepEqual(logs.filter((entry) => entry.operation === "stream_complete" || entry.operation === "message_complete").map((entry) => [entry.operation, entry.details?.effort]), [
+      ["stream_complete", "high"],
+      ["message_complete", "max"],
+      ["message_complete", "upstream_default"],
+    ]);
   });
 });
 

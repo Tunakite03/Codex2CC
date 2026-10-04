@@ -55,6 +55,7 @@ Launch with `node dist/main.js --ui` (or visit `http://127.0.0.1:3456/ui` while 
 
 The Control Panel provides:
 - **Client Configuration & Status**: Auto-detects configuration states for Claude Code CLI (`~/.claude/settings.json`) and Claude Desktop (`Claude-3p/configLibrary`), offering one-click configuration and factory resets.
+- **Claude Tier Model Mapping**: Assigns a ChatGPT account model to each Claude tier (Fable, Opus, Sonnet, and Haiku). Changes apply immediately, persist to `logs/tier-models.json`, and are used by future gateway starts. The dashboard can restore the environment-variable or built-in defaults.
 - **Token Usage Summary Table (Bảng Tổng Hợp Token Đã Dùng)**:
   - Tracks total tokens used across models and sessions in real time.
   - KPI summary metrics: **Total Tokens (Grand Total)**, **Prompt Tokens (Input)**, **Completion Tokens (Output)**, and **Cached Tokens (Read)**.
@@ -75,7 +76,7 @@ node dist/main.js --serve --port 3456
 
 The gateway binds exclusively to `127.0.0.1`. Every request must provide a valid authentication token via `Authorization: Bearer <token>` or `x-api-key: <token>`.
 - Set `CODEX2CC_TOKEN` (at least 16 characters) to specify a fixed token.
-- If omitted, a cryptographically secure random token is generated and printed at startup.
+- If omitted, `--ui` and `--serve` reuse the token already saved for this local gateway URL. On first launch, a cryptographically secure random token is generated and printed at startup.
 - `--no-auth` disables token verification (not recommended for shared machines).
 - Requests containing non-loopback `Host` headers are rejected to prevent DNS rebinding attacks.
 
@@ -128,7 +129,7 @@ node dist/main.js --reset-config
 ### Effort Selection
 Claude Desktop displays the ChatGPT model assigned to each Claude tier route. In the Code tab:
 - Press **Cmd+Shift+E** (macOS) or **Ctrl+Shift+E** (Windows) to select reasoning effort.
-- The Sonnet and Opus routes support reasoning effort; Codex2CC translates and forwards the selected level (`low`, `medium`, `high`, `xhigh`, `max`) to ChatGPT.
+- The Sonnet and Opus routes support reasoning effort. The Haiku route supports it when mapped to `gpt-6-luna`; Codex2CC forwards the selected level (`low`, `medium`, `high`, `xhigh`, `max`) to ChatGPT. [GPT-6 Luna supports these effort levels in the Responses API](https://developers.openai.com/api/docs/models/gpt-6-luna).
 
 ---
 
@@ -136,12 +137,15 @@ Claude Desktop displays the ChatGPT model assigned to each Claude tier route. In
 
 | Variable | Used by | Description |
 |---|---|---|
-| `CODEX2CC_TOKEN` | `--serve`, `--ui`, setup | Gateway authentication token (min. 16 chars; random if unset) |
+| `CODEX2CC_TOKEN` | `--serve`, `--ui`, setup | Gateway authentication token (min. 16 chars; saved local token reused when unset) |
 | `CODEX2CC_LOG_FILE` | all | Path to write formatted gateway logs (default: `logs/gateway.log`) |
 | `CODEX2CC_MODEL_FABLE` | all | ChatGPT model for Claude Fable tier (default: `gpt-6-astra`) |
 | `CODEX2CC_MODEL_OPUS` | all | ChatGPT model for Claude Opus tier (default: `gpt-6.1-sol`) |
 | `CODEX2CC_MODEL_SONNET` | all | ChatGPT model for Claude Sonnet tier (default: `gpt-6-sol`) |
 | `CODEX2CC_MODEL_HAIKU` | all | ChatGPT model for Claude Haiku tier (default: `gpt-6-luna`) |
+| `CODEX2CC_TIERS_FILE` | all | Optional path for the persisted Web UI tier mapping (default: `logs/tier-models.json` under the project directory) |
+
+Tier mapping precedence is saved Web UI mapping, then `CODEX2CC_MODEL_*` environment variables, then built-in defaults. Use **Use defaults** in the dashboard to remove the saved mapping and return to the environment/default values.
 
 ---
 

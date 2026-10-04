@@ -1,3 +1,8 @@
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { z } from "zod";
+import { resolveProjectRoot } from "./logger.js";
+
 export type ModelUsage = {
   readonly model: string;
   readonly requests: number;
@@ -26,6 +31,70 @@ type ModelUsageState = {
 };
 
 const usageStore = new Map<string, ModelUsageState>();
+
+const persistedUsageSchema = z.object({
+  version: z.literal(1),
+  models: z.record(
+    z.string(),
+    z.object({
+      requests: z.number().int().nonnegative(),
+      inputTokens: z.number().int().nonnegative(),
+      outputTokens: z.number().int().nonnegative(),
+      cachedTokens: z.number().int().nonnegative(),
+      lastUsed: z.string(),
+    }),
+  ),
+});
+
+let usageFilePath: string | null = null;
+
+/**
+ * Resolves the usage persistence file (CODEX2CC_USAGE_FILE, else <project>/logs/usage.json).
+ */
+export function resolveUsageFilePath(env: NodeJS.ProcessEnv = process.env): string {
+  const custom = env.CODEX2CC_USAGE_FILE?.trim();
+  if (custom && custom.length > 0) return resolve(custom);
+  return join(resolveProjectRoot(), "logs", "usage.json");
+}
+
+function writeWarning(operation: string, message: string, path: string): void {
+  process.stderr.write(`${JSON.stringify({ level: "warn", operation, message, path })}\n`);
+}
+
+function saveUsage(): void {
+  if (usageFilePath === null) return;
+  const models: Record<string, ModelUsageState> = {};
+  for (const [model, state] of usageStore.entries()) models[model] = { ...state };
+  const tempPath = `${usageFilePath}.tmp`;
+  try {
+    mkdirSync(dirname(usageFilePath), { recursive: true });
+    writeFileSync(tempPath, JSON.stringify({ version: 1, models }), "utf8");
+    renameSync(tempPath, usageFilePath);
+  } catch (err) {
+    writeWarning("usage_save_failed", (err as Error).message, usageFilePath);
+  }
+}
+
+/**
+ * Enables on-disk persistence: loads existing counters from `path` and saves after every change.
+ * A corrupt file is moved aside to `<path>.corrupt` and counters start empty.
+ */
+export function enableUsagePersistence(path: string): void {
+  usageFilePath = path;
+  usageStore.clear();
+  if (!existsSync(path)) return;
+  try {
+    const parsed = persistedUsageSchema.parse(JSON.parse(readFileSync(path, "utf8")));
+    for (const [model, state] of Object.entries(parsed.models)) usageStore.set(model, { ...state });
+  } catch (err) {
+    writeWarning("usage_load_failed", `Discarding unreadable usage file: ${(err as Error).message}`, path);
+    try {
+      renameSync(path, `${path}.corrupt`);
+    } catch (renameErr) {
+      writeWarning("usage_backup_failed", (renameErr as Error).message, path);
+    }
+  }
+}
 
 /**
  * Records tokens consumed by a completed inference request.
@@ -57,6 +126,7 @@ export function recordTokenUsage(params: {
       lastUsed: new Date().toISOString(),
     });
   }
+  saveUsage();
 }
 
 /**
@@ -107,4 +177,5 @@ export function getTokenUsageStats(): TokenUsageSummary {
  */
 export function resetTokenUsage(): void {
   usageStore.clear();
+  saveUsage();
 }

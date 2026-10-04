@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { z } from "zod";
 import { BridgeError } from "./bridge.js";
 import { MIN_TOKEN_LENGTH } from "./guard.js";
 import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, type TierModels } from "./models.js";
@@ -130,6 +131,54 @@ export function validateToken(token: string | undefined): string {
   return trimmed;
 }
 
+function readSavedGatewayConfig<T>(filePath: string, schema: z.ZodType<T>): T | undefined {
+  if (!existsSync(filePath)) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(filePath, "utf8"));
+  } catch (error) {
+    const reason = error instanceof SyntaxError ? "invalid JSON" : "file could not be read";
+    throw new BridgeError(500, "invalid_saved_gateway_config", `Could not load saved gateway configuration at ${filePath}: ${reason}.`);
+  }
+  const result = schema.safeParse(parsed);
+  if (!result.success) {
+    throw new BridgeError(500, "invalid_saved_gateway_config", `Saved gateway configuration at ${filePath} is missing required fields.`);
+  }
+  return result.data;
+}
+
+/** Reuses a local UI gateway credential across restarts when no explicit token is supplied. */
+export function configuredGatewayToken(gatewayUrl: string, pathsInput?: SetupPaths): string | undefined {
+  const paths = resolvePaths(pathsInput);
+  const meta = readSavedGatewayConfig(join(paths.claudeDesktopDir, "_meta.json"), z.object({ appliedId: z.string() }));
+  if (meta?.appliedId === CODEX2CC_DESKTOP_CONFIG_ID) {
+    const desktop = readSavedGatewayConfig(
+      join(paths.claudeDesktopDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`),
+      z.object({ inferenceGatewayBaseUrl: z.string(), inferenceGatewayApiKey: z.string() }),
+    );
+    if (desktop === undefined) {
+      throw new BridgeError(500, "missing_saved_gateway_config", "Applied Claude Desktop gateway configuration file is missing.");
+    }
+    const token = desktop.inferenceGatewayApiKey;
+    if (desktop.inferenceGatewayBaseUrl === gatewayUrl && token.length >= MIN_TOKEN_LENGTH) {
+      return token;
+    }
+  }
+
+  const cli = readSavedGatewayConfig(
+    paths.claudeSettingsPath,
+    z.object({ env: z.object({ ANTHROPIC_BASE_URL: z.string().optional(), ANTHROPIC_AUTH_TOKEN: z.string().optional() }).optional() }),
+  );
+  const env = cli?.env;
+  if (env !== undefined) {
+    const token = env.ANTHROPIC_AUTH_TOKEN;
+    if (env.ANTHROPIC_BASE_URL === gatewayUrl && typeof token === "string" && token.length >= MIN_TOKEN_LENGTH) {
+      return token;
+    }
+  }
+  return undefined;
+}
+
 function safeReadJson(filePath: string): Record<string, unknown> | null {
   if (!existsSync(filePath)) return null;
   try {
@@ -167,6 +216,7 @@ export function setupClaudeCodeCli(options: SetupOptions): readonly string[] {
   currentEnv.CLAUDE_CODE_USE_GATEWAY = "1";
   currentEnv.CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK = "1";
   currentEnv.API_TIMEOUT_MS = "600000";
+  currentEnv.CLAUDE_CODE_MODEL_CAPABILITIES = "effort,max_effort,xhigh_effort";
   if (options.effort) {
     currentEnv.CLAUDE_CODE_EFFORT_LEVEL = options.effort;
   }
@@ -278,6 +328,7 @@ export function resetClaudeCodeCli(pathsInput?: SetupPaths | undefined): readonl
         "CLAUDE_CODE_USE_GATEWAY",
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK",
         "CLAUDE_CODE_EFFORT_LEVEL",
+        "CLAUDE_CODE_MODEL_CAPABILITIES",
         "API_TIMEOUT_MS",
       ];
       for (const k of keysToRemove) delete env[k];

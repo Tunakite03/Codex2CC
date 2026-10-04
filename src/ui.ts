@@ -2,15 +2,18 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { BridgeError } from "./bridge.js";
 import {
   CODEX2CC_DESKTOP_CONFIG_ID,
   resetConfig,
   resolveDefaultPaths,
   setupConfig,
+  validateGatewayUrl,
   type SetupTarget,
 } from "./config-setup.js";
 import type { GatewayOptions } from "./gateway.js";
-import { loadTierModels } from "./models.js";
+import { DEFAULT_TIER_MODELS } from "./models.js";
+import { activeTierModels, parseTierModels } from "./tier-store.js";
 import { clearLogs, getActiveLogFilePath, getLogs, getLogStats, recordLog, type LogLevel } from "./logger.js";
 import { getTokenUsageStats, resetTokenUsage } from "./usage.js";
 
@@ -57,8 +60,15 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
 
 export function getStatus(options: GatewayOptions, port: number): Record<string, unknown> {
   const paths = resolveDefaultPaths();
+  const gatewayUrl = `http://127.0.0.1:${port}`;
+  const token = options.policy.mode === "token" ? options.policy.token : "";
+  // A stored config only works when it points at this gateway and carries its current token.
+  const inSync = (baseUrl: string, storedToken: string): boolean =>
+    baseUrl.replace(/\/+$/, "") === gatewayUrl && (options.policy.mode === "open" || storedToken === token);
+
   let cliConfigured = false;
   let cliBaseUrl = "";
+  let cliInSync = false;
 
   if (existsSync(paths.claudeSettingsPath)) {
     try {
@@ -66,6 +76,7 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
       if (data?.env?.ANTHROPIC_BASE_URL) {
         cliConfigured = true;
         cliBaseUrl = String(data.env.ANTHROPIC_BASE_URL);
+        cliInSync = inSync(cliBaseUrl, String(data.env.ANTHROPIC_AUTH_TOKEN ?? ""));
       }
     } catch {
       // Ignore
@@ -74,6 +85,7 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
 
   let desktopConfigured = false;
   let desktopBaseUrl = "";
+  let desktopInSync = false;
   const metaFile = `${paths.claudeDesktopDir}/_meta.json`;
   if (existsSync(metaFile)) {
     try {
@@ -84,6 +96,7 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
         if (existsSync(configFile)) {
           const cfg = JSON.parse(readFileSync(configFile, "utf8"));
           desktopBaseUrl = String(cfg?.inferenceGatewayBaseUrl || "");
+          desktopInSync = inSync(desktopBaseUrl, String(cfg?.inferenceGatewayApiKey ?? ""));
         }
       }
     } catch {
@@ -91,24 +104,30 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
     }
   }
 
-  const token = options.policy.mode === "token" ? options.policy.token : "";
-
   return {
     gateway: {
       port,
-      url: `http://127.0.0.1:${port}`,
+      url: gatewayUrl,
       policyMode: options.policy.mode,
       token,
     },
     cli: {
       configured: cliConfigured,
+      inSync: cliInSync,
       baseUrl: cliBaseUrl,
       path: paths.claudeSettingsPath,
     },
     desktop: {
       configured: desktopConfigured,
+      inSync: desktopInSync,
       baseUrl: desktopBaseUrl,
       path: paths.claudeDesktopDir,
+    },
+    tierMapping: {
+      current: activeTierModels(options),
+      defaults: options.tierStore?.defaults() ?? options.tiers ?? DEFAULT_TIER_MODELS,
+      custom: options.tierStore?.isCustom() ?? false,
+      models: options.availableModels.map(({ slug, displayName }) => ({ slug, displayName })),
     },
   };
 }
@@ -200,17 +219,88 @@ export async function handleUiRoute(
     return true;
   }
 
+  if (pathname === "/api/ui/tiers" && request.method === "POST") {
+    const store = options.tierStore;
+    if (!store) {
+      response.writeHead(503, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: false, error: "Tier mapping storage is unavailable in this gateway mode." }));
+      return true;
+    }
+    try {
+      const body = await readJsonBody(request);
+      const tiers = parseTierModels(body.tiers);
+      const availableModels = new Set(options.availableModels.map((model) => model.slug));
+      const unavailable = Object.entries(tiers).find(([, model]) => !availableModels.has(model));
+      if (unavailable) {
+        throw new BridgeError(400, "model_unavailable", `Tier mapping model "${unavailable[1]}" is not in the current ChatGPT account model catalog.`);
+      }
+      store.save(tiers);
+      recordLog({
+        level: "info",
+        operation: "tier_mapping_saved",
+        message: "Saved Claude tier to ChatGPT model mapping",
+        details: { fable: tiers.fable, opus: tiers.opus, sonnet: tiers.sonnet, haiku: tiers.haiku },
+      });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: true, tiers: store.current(), custom: store.isCustom() }));
+    } catch (error) {
+      const failure = error instanceof BridgeError
+        ? error
+        : new BridgeError(500, "tier_mapping_save_failed", `Could not save the tier mapping: ${error instanceof Error ? error.message : "unknown error"}.`);
+      recordLog({
+        level: failure.status >= 500 ? "error" : "warn",
+        operation: "tier_mapping_save_failed",
+        message: failure.message,
+      });
+      response.writeHead(failure.status, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: false, error: failure.message }));
+    }
+    return true;
+  }
+
+  if (pathname === "/api/ui/tiers/reset" && request.method === "POST") {
+    const store = options.tierStore;
+    if (!store) {
+      response.writeHead(503, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: false, error: "Tier mapping storage is unavailable in this gateway mode." }));
+      return true;
+    }
+    try {
+      store.reset();
+      recordLog({ level: "info", operation: "tier_mapping_reset", message: "Reset Claude tier mapping to environment or built-in defaults" });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: true, tiers: store.current(), custom: store.isCustom() }));
+    } catch (error) {
+      const failure = new BridgeError(
+        500,
+        "tier_mapping_reset_failed",
+        `Could not reset the tier mapping: ${error instanceof Error ? error.message : "unknown error"}.`,
+      );
+      recordLog({ level: "error", operation: "tier_mapping_reset_failed", message: failure.message });
+      response.writeHead(failure.status, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: false, error: failure.message }));
+    }
+    return true;
+  }
+
   if (pathname === "/api/ui/setup" && request.method === "POST") {
     const body = await readJsonBody(request);
     const target = (body.target as SetupTarget) || "all";
     const gatewayUrl = typeof body.gatewayUrl === "string" ? body.gatewayUrl.trim() : `http://127.0.0.1:${port}`;
     const token = typeof body.token === "string" ? body.token.trim() : options.policy.mode === "token" ? options.policy.token : "";
     try {
+      const cleanUrl = validateGatewayUrl(gatewayUrl);
+      if (cleanUrl !== `http://127.0.0.1:${port}`) {
+        throw new BridgeError(400, "gateway_url_mismatch", "Client setup must use this running gateway URL. Use the CLI setup command for another gateway.");
+      }
+      if (options.policy.mode === "token" && token !== options.policy.token) {
+        throw new BridgeError(400, "gateway_token_mismatch", "Client setup token does not match the running gateway. Restart with CODEX2CC_TOKEN to change it.");
+      }
       const result = setupConfig(target, {
-        gatewayUrl,
+        gatewayUrl: cleanUrl,
         token,
         model: options.defaultModel,
-        tiers: options.tiers ?? loadTierModels(process.env),
+        tiers: activeTierModels(options),
       });
       recordLog({
         level: "info",
@@ -278,25 +368,25 @@ export function renderDashboardHtml(): string {
   <style>
     :root {
       color-scheme: light;
-      --background: #f3efe6;
+      --background: #f5f7f6;
       --foreground: #17201d;
-      --card: #fffdf8;
+      --card: #ffffff;
       --card-foreground: #17201d;
-      --primary: #247b79;
+      --primary: #176b64;
       --primary-foreground: #ffffff;
-      --secondary: #e7dfd1;
+      --secondary: #edf2ef;
       --secondary-foreground: #26322c;
-      --muted: #eae5db;
-      --muted-foreground: #53605a;
-      --accent: #dcece6;
+      --muted: #f3f6f4;
+      --muted-foreground: #5d6d65;
+      --accent: #e5f3ee;
       --accent-foreground: #174d48;
       --destructive: #b44235;
       --destructive-foreground: #ffffff;
-      --border: #d3cabd;
-      --input: #c8bfb2;
+      --border: #dce4df;
+      --input: #cbd6cf;
       --ring: #17635e;
-      --hard-shadow: #17201d;
-      --radius: 0.625rem;
+      --hard-shadow: rgba(23, 32, 29, 0.08);
+      --radius: 0.5rem;
       --font-display: 'Lexend', sans-serif;
       --font-body: 'Plus Jakarta Sans', sans-serif;
       --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -310,8 +400,8 @@ export function renderDashboardHtml(): string {
       background: var(--background);
       color: var(--foreground);
       min-height: 100vh;
-      padding: clamp(1rem, 3vw, 2rem);
-      line-height: 1.5;
+      padding: clamp(0.875rem, 2vw, 1.5rem);
+      line-height: 1.45;
     }
     h1, h2, p { margin: 0; }
     button, input, select { font: inherit; }
@@ -322,35 +412,34 @@ export function renderDashboardHtml(): string {
     }
     .container {
       width: 100%;
-      max-width: 1100px;
+      max-width: 1200px;
       margin: 0 auto;
       display: flex;
       flex-direction: column;
-      gap: 1.5rem;
+      gap: 1rem;
     }
     header {
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 1rem;
-      padding: 1.5rem;
+      padding: 1rem 1.25rem;
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 1rem 0.9rem 1.1rem 0.95rem;
-      box-shadow: 6px 6px 0 var(--secondary);
+      border-radius: 0.75rem;
+      box-shadow: 0 1px 3px var(--hard-shadow);
     }
     .brand {
       display: flex;
       align-items: center;
-      gap: 1rem;
+      gap: 0.75rem;
     }
     .brand-icon {
-      width: 3rem;
-      height: 3rem;
+      width: 2.5rem;
+      height: 2.5rem;
       flex: none;
       background: var(--primary);
-      border: 1px solid var(--hard-shadow);
-      border-radius: 0.625rem;
+      border-radius: 0.5rem;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -358,16 +447,15 @@ export function renderDashboardHtml(): string {
       font-family: var(--font-display);
       font-size: 1.125rem;
       color: var(--primary-foreground);
-      box-shadow: 3px 3px 0 var(--hard-shadow);
     }
     .brand-text h1 {
       font-family: var(--font-display);
-      font-size: clamp(1.2rem, 3vw, 1.6rem);
+      font-size: clamp(1.1rem, 2vw, 1.35rem);
       line-height: 1.2;
     }
     .brand-text p {
-      margin-top: 0.25rem;
-      font-size: 0.875rem;
+      margin-top: 0.1rem;
+      font-size: 0.75rem;
       color: var(--muted-foreground);
     }
     .status-badge {
@@ -392,21 +480,21 @@ export function renderDashboardHtml(): string {
     .metrics-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 1rem;
+      gap: 0.75rem;
     }
     .metric-card {
       min-width: 0;
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 1rem 0.9rem 1.1rem 0.95rem;
-      padding: 1.25rem;
+      border-radius: 0.75rem;
+      padding: 0.875rem 1rem;
       display: flex;
       flex-direction: column;
-      gap: 0.5rem;
-      box-shadow: 6px 6px 0 var(--secondary);
+      gap: 0.25rem;
+      box-shadow: 0 1px 3px var(--hard-shadow);
     }
     .metric-title {
-      font-size: 0.75rem;
+      font-size: 0.6875rem;
       text-transform: uppercase;
       letter-spacing: 0.06em;
       color: var(--muted-foreground);
@@ -440,38 +528,44 @@ export function renderDashboardHtml(): string {
     .card {
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 1rem 0.9rem 1.1rem 0.95rem;
-      padding: 1.5rem;
+      border-radius: 0.75rem;
+      padding: 1.25rem;
       display: flex;
       flex-direction: column;
-      gap: 1.25rem;
-      box-shadow: 6px 6px 0 var(--secondary);
+      gap: 1rem;
+      box-shadow: 0 1px 3px var(--hard-shadow);
     }
     .card-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
       border-bottom: 1px solid var(--border);
-      padding-bottom: 0.875rem;
+      padding-bottom: 0.75rem;
+      gap: 0.75rem;
     }
     .card-title {
       font-family: var(--font-display);
-      font-size: 1rem;
+      font-size: 0.9375rem;
       font-weight: 600;
       display: flex;
       align-items: center;
-      gap: 0.625rem;
+      gap: 0.5rem;
     }
     .form-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 1rem;
+      gap: 0.875rem;
+    }
+    .tier-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.875rem;
     }
     .field {
       display: flex;
       flex-direction: column;
       min-width: 0;
-      gap: 0.5rem;
+      gap: 0.375rem;
     }
     label {
       font-size: 0.8125rem;
@@ -488,7 +582,7 @@ export function renderDashboardHtml(): string {
       background: var(--card);
       border: 1px solid var(--input);
       border-radius: var(--radius);
-      padding: 0.75rem 1rem;
+      padding: 0.625rem 0.75rem;
       font-size: 0.875rem;
       color: var(--foreground);
     }
@@ -502,21 +596,23 @@ export function renderDashboardHtml(): string {
       align-items: center;
       justify-content: center;
       gap: 0.5rem;
-      padding: 0.75rem 1rem;
+      padding: 0.625rem 0.875rem;
       border-radius: var(--radius);
       font-size: 0.875rem;
       font-weight: 600;
-      border: 1px solid var(--hard-shadow);
-      box-shadow: 3px 3px 0 var(--hard-shadow);
-      transition: transform 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+      border: 1px solid var(--border);
+      transition: background-color 0.15s ease, border-color 0.15s ease;
       white-space: nowrap;
     }
-    .btn:hover { transform: translate(-1px, -1px); box-shadow: 4px 4px 0 var(--hard-shadow); }
-    .btn:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--hard-shadow); }
+    .btn:hover { border-color: var(--primary); }
+    .btn:active { background: var(--accent); }
     .btn-primary {
       background: var(--primary);
       color: var(--primary-foreground);
+      border-color: var(--primary);
     }
+    .btn-primary:hover { background: #125950; }
+    .btn-primary:active { background: #104c45; }
     .btn-secondary {
       background: var(--secondary);
       color: var(--secondary-foreground);
@@ -524,15 +620,16 @@ export function renderDashboardHtml(): string {
     .btn-danger {
       background: var(--destructive);
       color: var(--destructive-foreground);
+      border-color: var(--destructive);
     }
     .btn-sm {
-      padding: 0.5rem 0.75rem;
+      padding: 0.4rem 0.7rem;
       font-size: 0.75rem;
     }
     .action-bar {
       display: flex;
       flex-wrap: wrap;
-      gap: 0.75rem;
+      gap: 0.5rem;
       align-items: center;
       justify-content: flex-end;
       padding-top: 0.5rem;
@@ -541,7 +638,7 @@ export function renderDashboardHtml(): string {
       background: var(--accent);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 1rem 1.25rem;
+      padding: 0.75rem 1rem;
       font-size: 0.8125rem;
       line-height: 1.6;
       color: var(--accent-foreground);
@@ -570,7 +667,7 @@ export function renderDashboardHtml(): string {
       border-radius: var(--radius);
       font-size: 0.875rem;
       font-weight: 600;
-      box-shadow: 3px 3px 0 var(--hard-shadow);
+      box-shadow: 0 6px 20px var(--hard-shadow);
       opacity: 0;
       transform: translateY(1rem);
       transition: opacity 0.2s ease, transform 0.2s ease;
@@ -584,6 +681,24 @@ export function renderDashboardHtml(): string {
     .danger-title { color: var(--destructive); }
     .reset-actions { justify-content: flex-start; }
     .supporting-text { font-size: 0.8125rem; color: var(--muted-foreground); }
+    .usage-metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      padding: 0.75rem 0;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--muted);
+    }
+    .usage-stat {
+      min-width: 0;
+      padding: 0.25rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.2rem;
+    }
+    .usage-stat + .usage-stat { border-left: 1px solid var(--border); }
+    .usage-stat .metric-value { font-size: 1.25rem; line-height: 1.2; }
+    .usage-stat .metric-sub { font-size: 0.6875rem; }
     .logs-header {
       display: flex;
       justify-content: space-between;
@@ -596,6 +711,16 @@ export function renderDashboardHtml(): string {
       align-items: center;
       gap: 0.5rem;
       flex-wrap: wrap;
+    }
+    #badge-log-file {
+      max-width: 14rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted-foreground);
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      font-weight: 400;
     }
     .badge-error {
       background: #fde8e8;
@@ -613,14 +738,14 @@ export function renderDashboardHtml(): string {
       align-items: center;
       flex-wrap: wrap;
       gap: 0.75rem;
-      padding: 0.25rem 0;
+      padding: 0;
     }
     .logs-filter-group {
       display: flex;
       align-items: center;
       gap: 0.5rem;
       flex: 1;
-      min-width: 260px;
+      min-width: 18rem;
     }
     .logs-filter-group input {
       flex: 1;
@@ -629,7 +754,7 @@ export function renderDashboardHtml(): string {
     }
     .logs-filter-group select {
       width: auto;
-      min-width: 120px;
+      min-width: 7rem;
       padding: 0.5rem 0.75rem;
       font-size: 0.8125rem;
     }
@@ -663,14 +788,15 @@ export function renderDashboardHtml(): string {
       font-family: var(--font-mono);
       font-size: 0.8125rem;
       line-height: 1.6;
-      height: 380px;
-      max-height: 480px;
+      height: 320px;
       overflow-y: auto;
       overflow-x: hidden;
       display: flex;
       flex-direction: column;
       gap: 0.35rem;
-      box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.3);
+    }
+    .log-terminal.is-empty {
+      height: 144px;
     }
     .log-row {
       display: flex;
@@ -734,10 +860,10 @@ export function renderDashboardHtml(): string {
       align-items: center;
       justify-content: center;
       height: 100%;
-      color: #7b948b;
-      font-style: italic;
+      color: #a9bcb2;
       text-align: center;
-      padding: 2rem;
+      padding: 1.25rem;
+      font-size: 0.8125rem;
     }
     .usage-table-wrapper {
       overflow-x: auto;
@@ -747,6 +873,7 @@ export function renderDashboardHtml(): string {
     }
     .usage-table {
       width: 100%;
+      min-width: 760px;
       border-collapse: collapse;
       font-size: 0.8125rem;
       text-align: left;
@@ -758,12 +885,12 @@ export function renderDashboardHtml(): string {
       text-transform: uppercase;
       letter-spacing: 0.05em;
       font-weight: 700;
-      padding: 0.75rem 1rem;
+      padding: 0.625rem 0.75rem;
       border-bottom: 1px solid var(--border);
       white-space: nowrap;
     }
     .usage-table td {
-      padding: 0.75rem 1rem;
+      padding: 0.625rem 0.75rem;
       border-bottom: 1px solid var(--border);
       color: var(--foreground);
       white-space: nowrap;
@@ -778,6 +905,12 @@ export function renderDashboardHtml(): string {
       border-top: 2px solid var(--primary);
       border-bottom: none;
     }
+    .usage-table .usage-empty {
+      padding: 1.25rem 0.75rem;
+      color: var(--muted-foreground);
+      text-align: center;
+      white-space: normal;
+    }
     .num-col {
       text-align: right;
       font-family: var(--font-mono);
@@ -787,14 +920,11 @@ export function renderDashboardHtml(): string {
       display: inline-flex;
       align-items: center;
       gap: 0.35rem;
-      padding: 0.2rem 0.6rem;
-      border-radius: 9999px;
+      padding: 0;
       font-family: var(--font-mono);
       font-size: 0.75rem;
       font-weight: 600;
-      background: var(--secondary);
-      color: var(--secondary-foreground);
-      border: 1px solid var(--border);
+      color: var(--foreground);
     }
     .share-pill {
       display: inline-block;
@@ -807,21 +937,32 @@ export function renderDashboardHtml(): string {
     }
     @media (max-width: 900px) {
       .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .form-grid { grid-template-columns: 1fr; }
+      .form-grid, .tier-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .usage-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 0.75rem; }
+      .usage-stat:nth-child(3) { border-left: 0; }
     }
     @media (max-width: 640px) {
+      body { padding: 0.75rem; }
+      .card { padding: 1rem; }
       header { flex-direction: column; align-items: flex-start; }
+      .card-header { align-items: flex-start; flex-wrap: wrap; }
       .input-group { flex-wrap: wrap; }
       .input-group input { flex-basis: 100%; }
       .action-bar { justify-content: flex-start; }
       .action-bar .btn { width: 100%; }
       .code-snippet { align-items: flex-start; flex-direction: column; }
       .logs-toolbar { flex-direction: column; align-items: stretch; }
-      .logs-filter-group { flex-direction: column; }
-      .logs-controls { justify-content: space-between; }
+      .logs-filter-group { min-width: 0; }
+      .logs-controls { justify-content: flex-start; }
+      .log-terminal { height: 280px; }
     }
     @media (max-width: 420px) {
       .metrics-grid { grid-template-columns: 1fr; }
+      .tier-grid { grid-template-columns: 1fr; }
+      .usage-stat { padding: 0.25rem 0.625rem; }
+      .usage-stat .metric-title { font-size: 0.625rem; }
+      .logs-filter-group { flex-direction: column; align-items: stretch; }
+      .logs-filter-group select { width: 100%; }
     }
     @media (prefers-reduced-motion: reduce) {
       .btn, #toast { transition: none; }
@@ -880,13 +1021,12 @@ export function renderDashboardHtml(): string {
       <div class="form-grid">
         <div class="field">
           <label for="input-url">Gateway Base URL</label>
-          <input type="text" id="input-url" placeholder="http://127.0.0.1:3456" />
+          <input type="text" id="input-url" placeholder="http://127.0.0.1:3456" readonly />
         </div>
         <div class="field">
           <label for="input-token">Gateway Auth Token</label>
           <div class="input-group">
-            <input type="text" id="input-token" placeholder="Leave empty or generate" />
-            <button class="btn btn-secondary btn-sm" id="btn-gen-token" type="button" title="Generate random token">New token</button>
+            <input type="password" id="input-token" autocomplete="off" placeholder="No token required" readonly />
             <button class="btn btn-secondary btn-sm" id="btn-copy-token" type="button" title="Copy token">Copy</button>
           </div>
         </div>
@@ -917,42 +1057,69 @@ export function renderDashboardHtml(): string {
       </div>
     </section>
 
+    <!-- Claude Tier Model Mapping -->
+    <section class="card" aria-labelledby="tier-mapping-title">
+      <div class="card-header">
+        <h2 class="card-title" id="tier-mapping-title">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+          Claude tier model mapping
+        </h2>
+        <span class="badge-sub" id="tier-mapping-status">Loading…</span>
+      </div>
+      <p class="supporting-text">Choose which ChatGPT model handles each Claude model tier. Changes take effect immediately and are saved for future gateway starts.</p>
+      <div class="tier-grid">
+        <div class="field">
+          <label for="tier-fable">Fable</label>
+          <select id="tier-fable" data-tier="fable"></select>
+        </div>
+        <div class="field">
+          <label for="tier-opus">Opus</label>
+          <select id="tier-opus" data-tier="opus"></select>
+        </div>
+        <div class="field">
+          <label for="tier-sonnet">Sonnet</label>
+          <select id="tier-sonnet" data-tier="sonnet"></select>
+        </div>
+        <div class="field">
+          <label for="tier-haiku">Haiku</label>
+          <select id="tier-haiku" data-tier="haiku"></select>
+        </div>
+      </div>
+      <div class="action-bar">
+        <button class="btn btn-secondary" id="btn-reset-tier-mapping" type="button">Use defaults</button>
+        <button class="btn btn-primary" id="btn-save-tier-mapping" type="button">Save mapping</button>
+      </div>
+    </section>
+
     <!-- Token Usage Summary Table -->
     <section class="card" id="section-usage" aria-labelledby="usage-title">
       <div class="card-header">
         <h2 class="card-title" id="usage-title">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
-          Bảng Tổng Hợp Token Đã Dùng (Token Usage Summary)
+          Token usage
         </h2>
         <div class="logs-controls">
-          <button class="btn btn-secondary btn-sm" id="btn-refresh-usage" type="button" title="Làm mới bảng token">Refresh</button>
-          <button class="btn btn-secondary btn-sm" id="btn-reset-usage" type="button" title="Đặt lại bộ đếm token">Reset Counter</button>
+          <button class="btn btn-secondary btn-sm" id="btn-refresh-usage" type="button" title="Refresh token usage">Refresh</button>
+          <button class="btn btn-secondary btn-sm" id="btn-reset-usage" type="button" title="Reset token usage counters">Reset counters</button>
         </div>
       </div>
-      <p class="supporting-text">
-        Thống kê tổng số lượng tokens (Prompt, Completion, Cache Read) đã tiêu thụ theo từng mô hình qua Gateway.
-      </p>
-
-      <div class="metrics-grid" style="grid-template-columns: repeat(4, minmax(0, 1fr));">
-        <div class="metric-card">
-          <span class="metric-title">Tổng Tokens (Grand Total)</span>
+      <div class="usage-metrics" aria-label="Token usage totals">
+        <div class="usage-stat">
+          <span class="metric-title">Total tokens</span>
           <span class="metric-value" id="val-total-tokens">0</span>
-          <span class="metric-sub" id="val-total-reqs">0 requests recorded</span>
+          <span class="metric-sub" id="val-total-reqs">0 requests</span>
         </div>
-        <div class="metric-card">
-          <span class="metric-title">Prompt Tokens (Input)</span>
+        <div class="usage-stat">
+          <span class="metric-title">Input</span>
           <span class="metric-value" id="val-input-tokens">0</span>
-          <span class="metric-sub">Token đầu vào</span>
         </div>
-        <div class="metric-card">
-          <span class="metric-title">Completion (Output)</span>
+        <div class="usage-stat">
+          <span class="metric-title">Output</span>
           <span class="metric-value" id="val-output-tokens">0</span>
-          <span class="metric-sub">Token đầu ra</span>
         </div>
-        <div class="metric-card">
-          <span class="metric-title">Cached Tokens (Read)</span>
+        <div class="usage-stat">
+          <span class="metric-title">Cache read</span>
           <span class="metric-value" id="val-cached-tokens">0</span>
-          <span class="metric-sub">Token từ cache</span>
         </div>
       </div>
 
@@ -960,23 +1127,23 @@ export function renderDashboardHtml(): string {
         <table class="usage-table" id="usage-table">
           <thead>
             <tr>
-              <th>Model (Mô hình)</th>
-              <th class="num-col">Requests (Lượt gọi)</th>
-              <th class="num-col">Input Tokens</th>
-              <th class="num-col">Output Tokens</th>
-              <th class="num-col">Cached Tokens</th>
-              <th class="num-col">Total Tokens</th>
-              <th class="num-col">Share (%)</th>
+              <th>Model</th>
+              <th class="num-col">Requests</th>
+              <th class="num-col">Input</th>
+              <th class="num-col">Output</th>
+              <th class="num-col">Cache read</th>
+              <th class="num-col">Total</th>
+              <th class="num-col">Share</th>
             </tr>
           </thead>
           <tbody id="usage-table-body">
             <tr>
-              <td colspan="7" class="log-empty">Chưa có dữ liệu sử dụng token. Hãy bắt đầu gửi lệnh từ Claude Code hoặc Claude Desktop.</td>
+              <td colspan="7" class="usage-empty">No usage yet. Send a request through the gateway to see model totals.</td>
             </tr>
           </tbody>
           <tfoot id="usage-table-foot" style="display: none;">
             <tr>
-              <td><strong>Tổng cộng (All Models)</strong></td>
+              <td><strong>All models</strong></td>
               <td class="num-col" id="foot-reqs">0</td>
               <td class="num-col" id="foot-input">0</td>
               <td class="num-col" id="foot-output">0</td>
@@ -994,27 +1161,22 @@ export function renderDashboardHtml(): string {
       <div class="card-header logs-header">
         <h2 class="card-title" id="logs-title">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-          Gateway Live Logs & Activity Monitor
+          Gateway activity
         </h2>
         <div class="logs-badges">
           <span class="badge-sub badge-active" id="badge-log-count">0 logs</span>
           <span class="badge-sub badge-warn" id="badge-warn-count" style="display:none;">0 warnings</span>
           <span class="badge-sub badge-error" id="badge-err-count" style="display:none;">0 errors</span>
-          <span class="badge-sub" id="badge-log-file" title="Project Log File">📁 logs/codex2cc.log</span>
         </div>
       </div>
-      <p class="supporting-text">
-        Real-time telemetry of Claude Code CLI & Claude Desktop requests, model routing, token estimation, and gateway diagnostics.
-      </p>
-
       <div class="logs-toolbar">
         <div class="logs-filter-group">
-          <input type="text" id="input-log-search" placeholder="Filter logs by keyword, model, status..." />
-          <select id="select-log-level">
-            <option value="all">All Levels</option>
-            <option value="info">Info only</option>
-            <option value="warn">Warnings only</option>
-            <option value="error">Errors only</option>
+          <input type="search" id="input-log-search" aria-label="Search logs" placeholder="Search logs" />
+          <select id="select-log-level" aria-label="Log level">
+            <option value="all">All levels</option>
+            <option value="info">Info</option>
+            <option value="warn">Warnings</option>
+            <option value="error">Errors</option>
           </select>
         </div>
         <div class="logs-controls">
@@ -1023,13 +1185,13 @@ export function renderDashboardHtml(): string {
             Live (2s)
           </label>
           <button class="btn btn-secondary btn-sm" id="btn-refresh-logs" type="button" title="Fetch latest logs">Refresh</button>
-          <button class="btn btn-secondary btn-sm" id="btn-copy-logs" type="button" title="Copy all visible logs">Copy Logs</button>
+          <button class="btn btn-secondary btn-sm" id="btn-copy-logs" type="button" title="Copy all visible logs">Copy</button>
           <button class="btn btn-secondary btn-sm" id="btn-clear-logs" type="button" title="Clear log history">Clear</button>
         </div>
       </div>
 
-      <div class="log-terminal" id="log-terminal" role="log" aria-live="polite">
-        <div class="log-empty">Connecting to gateway log feed...</div>
+      <div class="log-terminal is-empty" id="log-terminal" role="log" aria-live="polite">
+        <div class="log-empty">Connecting to gateway log feed…</div>
       </div>
     </section>
 
@@ -1087,7 +1249,7 @@ export function renderDashboardHtml(): string {
         if (!res.ok) throw new Error("HTTP " + res.status);
         currentStatus = await res.json();
         renderStatus(currentStatus);
-        document.getElementById("gateway-status-text").textContent = "Gateway Online";
+        document.getElementById("gateway-status-text").textContent = "Server running";
       } catch (err) {
         document.getElementById("gateway-status-text").textContent = "Gateway Unavailable";
         showToast("Failed to fetch gateway status: " + err.message, "error");
@@ -1098,32 +1260,50 @@ export function renderDashboardHtml(): string {
       document.getElementById("val-gateway-url").textContent = s.gateway.url;
       document.getElementById("val-auth-mode").textContent = s.gateway.policyMode === "token" ? "Token Protected" : "Open (--no-auth)";
 
-      const cliBadge = document.getElementById("badge-cli");
-      if (s.cli.configured) {
-        cliBadge.textContent = "Configured";
-        cliBadge.className = "badge-sub badge-active";
-      } else {
-        cliBadge.textContent = "Not Configured";
-        cliBadge.className = "badge-sub badge-inactive";
+      function applyBadge(badge, client) {
+        if (client.configured && client.inSync) {
+          badge.textContent = "Configured";
+          badge.className = "badge-sub badge-active";
+        } else if (client.configured) {
+          badge.textContent = "Out of sync - click Apply";
+          badge.className = "badge-sub badge-inactive";
+        } else {
+          badge.textContent = "Not Configured";
+          badge.className = "badge-sub badge-inactive";
+        }
       }
+      applyBadge(document.getElementById("badge-cli"), s.cli);
+      applyBadge(document.getElementById("badge-desktop"), s.desktop);
 
-      const deskBadge = document.getElementById("badge-desktop");
-      if (s.desktop.configured) {
-        deskBadge.textContent = "Configured";
-        deskBadge.className = "badge-sub badge-active";
-      } else {
-        deskBadge.textContent = "Not Configured";
-        deskBadge.className = "badge-sub badge-inactive";
-      }
-
-      if (!document.getElementById("input-url").value) {
-        document.getElementById("input-url").value = s.gateway.url;
-      }
-      if (!document.getElementById("input-token").value && s.gateway.token) {
-        document.getElementById("input-token").value = s.gateway.token;
-      }
+      document.getElementById("input-url").value = s.gateway.url;
+      document.getElementById("input-token").value = s.gateway.token;
+      renderTierMapping(s.tierMapping);
 
       updateRunCommand();
+    }
+
+    function renderTierMapping(mapping) {
+      const tiers = ["fable", "opus", "sonnet", "haiku"];
+      const models = Array.isArray(mapping.models) ? mapping.models : [];
+      for (const tier of tiers) {
+        const select = document.getElementById("tier-" + tier);
+        const selectedModel = mapping.current[tier];
+        const choices = [...models];
+        if (!choices.some((model) => model.slug === selectedModel)) {
+          choices.push({ slug: selectedModel, displayName: selectedModel + " (not in current account catalog)" });
+        }
+        select.replaceChildren();
+        for (const model of choices) {
+          const option = document.createElement("option");
+          option.value = model.slug;
+          option.textContent = model.displayName + " (" + model.slug + ")";
+          select.appendChild(option);
+        }
+        select.value = selectedModel;
+      }
+      const status = document.getElementById("tier-mapping-status");
+      status.textContent = mapping.custom ? "Saved mapping" : "Environment or built-in defaults";
+      status.className = mapping.custom ? "badge-sub badge-active" : "badge-sub";
     }
 
     function updateRunCommand() {
@@ -1133,21 +1313,6 @@ export function renderDashboardHtml(): string {
       const token = document.getElementById("input-token").value || "YOUR_SECRET_TOKEN";
       document.getElementById("text-run-cmd").textContent = 'CODEX2CC_TOKEN="' + token + '" node dist/main.js --serve --port ' + port;
     }
-
-    document.getElementById("input-url").addEventListener("input", updateRunCommand);
-    document.getElementById("input-token").addEventListener("input", updateRunCommand);
-
-    document.getElementById("btn-gen-token").addEventListener("click", async () => {
-      try {
-        const res = await fetch("/api/ui/token", { method: "POST" });
-        const data = await res.json();
-        document.getElementById("input-token").value = data.token;
-        updateRunCommand();
-        showToast("New secure token generated!");
-      } catch (err) {
-        showToast("Error generating token: " + err.message, "error");
-      }
-    });
 
     document.getElementById("btn-copy-token").addEventListener("click", () => {
       const val = document.getElementById("input-token").value;
@@ -1179,6 +1344,39 @@ export function renderDashboardHtml(): string {
         fetchStatus();
       } catch (err) {
         showToast("Failed to apply configuration: " + err.message, "error");
+      }
+    });
+
+    document.getElementById("btn-save-tier-mapping").addEventListener("click", async () => {
+      const tiers = Object.fromEntries(["fable", "opus", "sonnet", "haiku"].map((tier) => [
+        tier,
+        document.getElementById("tier-" + tier).value,
+      ]));
+      try {
+        const res = await fetch("/api/ui/tiers", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tiers }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
+        showToast("Tier model mapping saved.");
+        await fetchStatus();
+      } catch (err) {
+        showToast("Failed to save tier mapping: " + err.message, "error");
+      }
+    });
+
+    document.getElementById("btn-reset-tier-mapping").addEventListener("click", async () => {
+      if (!confirm("Reset the tier mapping to environment or built-in defaults?")) return;
+      try {
+        const res = await fetch("/api/ui/tiers/reset", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
+        showToast("Tier mapping reset to defaults.");
+        await fetchStatus();
+      } catch (err) {
+        showToast("Failed to reset tier mapping: " + err.message, "error");
       }
     });
 
@@ -1233,6 +1431,7 @@ export function renderDashboardHtml(): string {
     function renderLogs(logs, stats, logFile) {
       const terminal = document.getElementById("log-terminal");
       if (!terminal) return;
+      terminal.classList.toggle("is-empty", logs.length === 0);
 
       if (stats) {
         document.getElementById("badge-log-count").textContent = stats.total + " log" + (stats.total === 1 ? "" : "s");
@@ -1257,13 +1456,13 @@ export function renderDashboardHtml(): string {
         if (fileEl) {
           const parts = logFile.split(/[/\\\\]/);
           const shortPath = parts.slice(-2).join("/");
-          fileEl.textContent = "📁 " + shortPath;
+          fileEl.textContent = shortPath;
           fileEl.title = "Project log file: " + logFile;
         }
       }
 
       if (logs.length === 0) {
-        terminal.innerHTML = '<div class="log-empty">No gateway activity recorded yet. Run requests with Claude Code CLI or Claude Desktop to inspect live traffic.</div>';
+        terminal.innerHTML = '<div class="log-empty">No activity yet. Send a request through the gateway to see live logs.</div>';
         return;
       }
 
@@ -1374,7 +1573,7 @@ export function renderDashboardHtml(): string {
       if (!tbody || !tfoot) return;
 
       if (!data.models || data.models.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" class="log-empty">Chưa có dữ liệu sử dụng token. Hãy bắt đầu gửi lệnh từ Claude Code hoặc Claude Desktop.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="usage-empty">No usage yet. Send a request through the gateway to see model totals.</td></tr>';
         tfoot.style.display = "none";
         return;
       }
@@ -1408,15 +1607,15 @@ export function renderDashboardHtml(): string {
     function setupUsageControls() {
       document.getElementById("btn-refresh-usage").addEventListener("click", () => fetchUsage());
       document.getElementById("btn-reset-usage").addEventListener("click", async () => {
-        if (!confirm("Bạn có chắc chắn muốn đặt lại bộ đếm token về 0?")) return;
+        if (!confirm("Reset all token usage counters to zero?")) return;
         try {
           const res = await fetch("/api/ui/usage/reset", { method: "POST" });
           if (res.ok) {
-            showToast("Đã đặt lại bộ đếm token thành công!");
+            showToast("Token usage counters reset.");
             fetchUsage();
           }
         } catch (err) {
-          showToast("Lỗi đặt lại bộ đếm token: " + err.message, "error");
+          showToast("Failed to reset token usage: " + err.message, "error");
         }
       });
     }

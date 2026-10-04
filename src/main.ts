@@ -6,8 +6,10 @@ import { BridgeError } from "./bridge.js";
 import { parseCli, standalonePolicy, USAGE } from "./cli.js";
 import { createGatewayServer, listenOnLoopback, type ModelInfo } from "./gateway.js";
 import { getActiveLogFilePath } from "./logger.js";
-import { loadTierModels, tierModel } from "./models.js";
+import { tierModel } from "./models.js";
+import { resolveTierFilePath, TierModelStore } from "./tier-store.js";
 import type { GuardPolicy } from "./guard.js";
+import { enableUsagePersistence, resolveUsageFilePath } from "./usage.js";
 
 async function serveStandalone(
   session: ChatGPTSession,
@@ -16,7 +18,8 @@ async function serveStandalone(
   requestedPort: number,
   policy: GuardPolicy,
 ): Promise<void> {
-  const server = createGatewayServer({ session, defaultModel, availableModels, policy, tiers: loadTierModels(process.env) });
+  const tierStore = TierModelStore.open(resolveTierFilePath(process.env), process.env);
+  const server = createGatewayServer({ session, defaultModel, availableModels, policy, tiers: tierStore.defaults(), tierStore });
   const port = await listenOnLoopback(server, requestedPort);
   const logFile = getActiveLogFilePath();
 
@@ -51,13 +54,15 @@ async function serveClaudeCli(
   args: readonly string[],
 ): Promise<number> {
   const secret = randomBytes(32).toString("base64url");
-  const tiers = loadTierModels(process.env);
+  const tierStore = TierModelStore.open(resolveTierFilePath(process.env), process.env);
+  const tiers = tierStore.current();
   const server = createGatewayServer({
     session,
     defaultModel: selectedModel,
     availableModels,
     policy: { mode: "token", token: secret },
     tiers,
+    tierStore,
   });
   const port = await listenOnLoopback(server, 0);
 
@@ -104,8 +109,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  enableUsagePersistence(resolveUsageFilePath());
+
   if (command.kind === "ui") {
     const { openBrowser } = await import("./ui.js");
+    const { configuredGatewayToken } = await import("./config-setup.js");
     let session: ChatGPTSession | undefined;
     let models: ModelInfo[] = [];
 
@@ -122,7 +130,8 @@ async function main(): Promise<void> {
     }
 
     const selectedModel = command.model ?? models[0]?.slug ?? "gpt-6-sol";
-    const policy = standalonePolicy(false, process.env.CODEX2CC_TOKEN);
+    const policy = standalonePolicy(false, process.env.CODEX2CC_TOKEN ?? configuredGatewayToken(`http://127.0.0.1:${command.port}`));
+    const tierStore = TierModelStore.open(resolveTierFilePath(process.env), process.env);
     const fakeSession = session ?? {
       async accessToken() { throw new BridgeError(401, "unauthorized", "Not logged into ChatGPT. Run 'codex login'."); },
       async refreshAfterRejection() { throw new BridgeError(401, "unauthorized", "Not logged into ChatGPT."); },
@@ -134,7 +143,8 @@ async function main(): Promise<void> {
       defaultModel: selectedModel,
       availableModels: models,
       policy,
-      tiers: loadTierModels(process.env),
+      tiers: tierStore.defaults(),
+      tierStore,
     });
     const port = await listenOnLoopback(server, command.port);
 
@@ -179,7 +189,7 @@ async function main(): Promise<void> {
 
   if (command.kind === "setup") {
     const { setupConfig } = await import("./config-setup.js");
-    const tiers = loadTierModels(process.env);
+    const tiers = TierModelStore.open(resolveTierFilePath(process.env), process.env).current();
     let availableModels: string[] | undefined;
     let selectedModel = command.model;
 
@@ -251,7 +261,11 @@ async function main(): Promise<void> {
   }
 
   if (command.kind === "serve") {
-    await serveStandalone(session, selectedModel, models, command.port, standalonePolicy(command.noAuth, process.env.CODEX2CC_TOKEN));
+    const { configuredGatewayToken } = await import("./config-setup.js");
+    const policy = command.noAuth
+      ? standalonePolicy(true, undefined)
+      : standalonePolicy(false, process.env.CODEX2CC_TOKEN ?? configuredGatewayToken(`http://127.0.0.1:${command.port}`));
+    await serveStandalone(session, selectedModel, models, command.port, policy);
     return;
   }
 
