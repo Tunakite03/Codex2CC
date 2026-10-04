@@ -99,9 +99,10 @@ test("renderDashboardHtml generates rich HTML markup with control panel componen
   assert.ok(!html.includes('id="slider-effort"'));
   assert.ok(!html.includes("Reasoning Effort"));
   assert.ok(html.includes("color-scheme: light"));
-  assert.ok(html.includes("--background: #f5f7f6"));
+  assert.ok(html.includes("--background: #f3efe6"));
+  assert.ok(html.includes("--primary: #247b79"));
   assert.ok(!html.includes("prefers-color-scheme: dark"));
-  assert.ok(html.includes("family=Lexend"));
+  assert.ok(html.includes("family=Outfit"));
   assert.ok(html.includes("family=Plus+Jakarta+Sans"));
 });
 
