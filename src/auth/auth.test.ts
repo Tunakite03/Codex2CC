@@ -203,8 +203,8 @@ test("listModels prefers the remote catalog, then the local cache, then built-in
   await withFixture({ access: jwt(Date.now() + HOUR_MS), refresh: "r1" }, async ({ options, dir, fake }) => {
     const session = await ChatGPTSession.open(options);
 
-    fake.onModels((response) => json(response, 200, { models: [{ slug: "remote-model", display_name: "Remote", context_window: 272000 }] }));
-    assert.deepEqual(await session.listModels(), [{ slug: "remote-model", displayName: "Remote", contextWindow: 272000 }]);
+    fake.onModels((response) => json(response, 200, { models: [{ slug: "remote-model", display_name: "Remote", context_window: 1000000 }] }));
+    assert.deepEqual(await session.listModels(), [{ slug: "remote-model", displayName: "Remote", contextWindow: 1000000 }]);
 
     fake.onModels((response) => json(response, 404, {}));
     await writeFile(join(dir, "models_cache.json"), JSON.stringify({ models: [{ slug: "cached-model", context_window: 180000 }] }));

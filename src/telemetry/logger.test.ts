@@ -5,6 +5,8 @@ import {
   getActiveLogFilePath,
   getLogs,
   getLogStats,
+  onLog,
+  onLogsCleared,
   recordLog,
   resolveLogFilePath,
   setLogFilePath,
@@ -163,5 +165,37 @@ test("recordLog writes formatted log lines to disk and clearLogs can truncate fi
     setLogFilePath(undefined); // Reset to default
     rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+test("onLog and onLogsCleared notify active subscribers and unsubscribe cleanly", () => {
+  clearLogs();
+  const capturedLogs: string[] = [];
+  let clearedCount = 0;
+
+  const unsubscribeLog = onLog((entry) => {
+    capturedLogs.push(entry.message);
+  });
+
+  const unsubscribeClear = onLogsCleared(() => {
+    clearedCount++;
+  });
+
+  recordLog({ level: "info", operation: "stream_test", message: "First message" });
+  recordLog({ level: "warn", operation: "stream_test", message: "Second message" });
+
+  assert.deepEqual(capturedLogs, ["First message", "Second message"]);
+
+  clearLogs();
+  assert.equal(clearedCount, 1);
+
+  // Unsubscribe and verify no more events received
+  unsubscribeLog();
+  unsubscribeClear();
+
+  recordLog({ level: "error", operation: "stream_test", message: "Third message" });
+  clearLogs();
+
+  assert.deepEqual(capturedLogs, ["First message", "Second message"]);
+  assert.equal(clearedCount, 1);
 });
 

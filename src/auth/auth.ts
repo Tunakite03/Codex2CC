@@ -75,7 +75,7 @@ const WhamUsageWindowSchema = z.object({
   limit_window_seconds: z.number().int().nonnegative().optional(),
   reset_after_seconds: z.number().int().nonnegative().optional(),
   reset_at: z.number().int().nonnegative().optional(),
-}).passthrough();
+}).loose();
 
 const WhamUsageResponseSchema = z.object({
   plan_type: z.string().optional(),
@@ -84,8 +84,8 @@ const WhamUsageResponseSchema = z.object({
     limit_reached: z.boolean().optional(),
     primary_window: WhamUsageWindowSchema.nullable().optional(),
     secondary_window: WhamUsageWindowSchema.nullable().optional(),
-  }).passthrough().optional(),
-}).passthrough();
+  }).loose().optional(),
+}).loose();
 
 type Tokens = { access_token: string; refresh_token: string; id_token: string; account_id?: string | undefined };
 type AuthDocument = { readonly document: Record<string, unknown>; readonly tokens: Tokens };

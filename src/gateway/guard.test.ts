@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { checkClient, checkHost, requestPathname, type GuardPolicy } from "./guard.js";
+import { checkClient, checkHost, checkUiOrigin, requestPathname, type GuardPolicy } from "./guard.js";
 
 const tokenPolicy: GuardPolicy = { mode: "token", token: "s3cret-token-value-1234" };
 
@@ -51,3 +51,17 @@ test("requestPathname extracts the path and returns undefined for malformed requ
   assert.equal(requestPathname(undefined), "/");
   assert.equal(requestPathname("http://["), undefined);
 });
+
+test("checkUiOrigin allows missing origin and same-loopback origins, rejects external origins", () => {
+  assert.deepEqual(checkUiOrigin({}, 3456), { ok: true });
+  assert.deepEqual(checkUiOrigin({ origin: "http://127.0.0.1:3456" }, 3456), { ok: true });
+  assert.deepEqual(checkUiOrigin({ origin: "http://localhost:3456" }, 3456), { ok: true });
+
+  const rejected = ["http://evil.com", "http://evil.com:3456", "http://127.0.0.1:9999", "https://malicious.org"];
+  for (const origin of rejected) {
+    const result = checkUiOrigin({ origin }, 3456);
+    assert.equal(result.ok, false, origin);
+    if (!result.ok) assert.equal(result.status, 403);
+  }
+});
+

@@ -56,7 +56,7 @@ async function startGateway(upstreamUrl: string, overrides: Partial<GatewayOptio
   const server = createGatewayServer({
     session: { accessToken: async () => "upstream-token", refreshAfterRejection: async () => "refreshed-token", accountId: () => "acct_1" },
     defaultModel: "gpt-6-sol",
-    availableModels: [{ slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 272000 }, { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 272000 }, { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 272000 }],
+    availableModels: [{ slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 1000000 }, { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 1000000 }, { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 1000000 }],
     policy: { mode: "token", token: TOKEN },
     upstreamUrl,
     ...overrides,
@@ -141,7 +141,7 @@ test("gateway discovery lists only Claude-compatible routes", async () => {
       "gpt-6-sol (ChatGPT via haiku route, fallback)",
       "gpt-6-astra (ChatGPT via fable route)",
     ]);
-    assert.deepEqual(body.data.map((model) => model.max_input_tokens), [272000, 272000, 272000, 272000]);
+    assert.deepEqual(body.data.map((model) => model.max_input_tokens), [1000000, 1000000, 1000000, 1000000]);
     assert.equal(body.first_id, ids[0]);
     assert.equal(body.last_id, ids[3]);
   });
@@ -191,7 +191,7 @@ test("Haiku route forwards reasoning effort to GPT-6 Luna", async () => {
       { slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 1000000 },
       { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 1000000 },
       { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 1000000 },
-      { slug: "gpt-6-luna", displayName: "GPT-6 Luna", contextWindow: 272000 },
+      { slug: "gpt-6-luna", displayName: "GPT-6 Luna", contextWindow: 1000000 },
     ],
   });
 });
@@ -218,7 +218,7 @@ test("Haiku route defaults to max effort for GPT-6 Luna when the client omits ef
       { slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 1000000 },
       { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 1000000 },
       { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 1000000 },
-      { slug: "gpt-6-luna", displayName: "GPT-6 Luna", contextWindow: 272000 },
+      { slug: "gpt-6-luna", displayName: "GPT-6 Luna", contextWindow: 1000000 },
     ],
   });
 });
@@ -452,3 +452,103 @@ test("gateway records token usage metrics for processed requests", async () => {
     assert.equal(usage.models[0]?.model, "gpt-6-sol");
   });
 });
+
+test("gateway discovery lists Google Antigravity routes when provider is antigravity", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway) => {
+    const res = await fetch(`${gateway.base}/v1/models`, { headers: AUTH });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { data: Array<{ id: string; display_name: string }> };
+    assert.match(body.data[0]!.display_name, /Google Antigravity/);
+    assert.match(body.data[0]!.display_name, /claude-sonnet-4-6/);
+  }, { provider: "antigravity" });
+});
+
+test("gateway routes /v1/messages to antigravityRunner when provider is antigravity", async () => {
+  let runnerInvoked = false;
+  let receivedModel = "";
+  const mockRunner = async (opts: { model: string }, onEvent: (ev: any) => void) => {
+    runnerInvoked = true;
+    receivedModel = opts.model;
+    onEvent({
+      event: "result",
+      result: {
+        status: "SUCCESS",
+        response: "Response from Antigravity",
+        usage: { input_tokens: 5, output_tokens: 4, thinking_tokens: 0, total_tokens: 9 },
+      },
+    });
+  };
+
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
+    assert.equal(response.status, 200);
+    assert.equal(runnerInvoked, true);
+    assert.equal(receivedModel, "claude-sonnet-4-6");
+    assert.equal(upstream.requests.length, 0); // never reached ChatGPT upstream
+    const data = await response.json() as { content: Array<{ text: string }> };
+    assert.equal(data.content[0]?.text, "Response from Antigravity");
+  }, { provider: "antigravity", antigravityRunner: mockRunner });
+});
+
+test("UI endpoint /api/ui/provider dynamically switches active provider", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway) => {
+    // Check initial status
+    const statusRes1 = await fetch(`${gateway.base}/api/ui/status`);
+    const status1 = await statusRes1.json() as { provider: { active: string } };
+    assert.equal(status1.provider.active, "codex");
+
+    // Switch to antigravity
+    const switchRes = await fetch(`${gateway.base}/api/ui/provider`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider: "antigravity" }),
+    });
+    assert.equal(switchRes.status, 200);
+    const switchData = await switchRes.json() as { ok: boolean; provider: string };
+    assert.equal(switchData.ok, true);
+    assert.equal(switchData.provider, "antigravity");
+
+    // Verify status updated
+    const statusRes2 = await fetch(`${gateway.base}/api/ui/status`);
+    const status2 = await statusRes2.json() as { provider: { active: string } };
+    assert.equal(status2.provider.active, "antigravity");
+  });
+});
+
+test("UI endpoint blocks cross-origin requests with 403", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway) => {
+    const res = await fetch(`${gateway.base}/api/ui/provider`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://evil.example.com",
+      },
+      body: JSON.stringify({ provider: "antigravity" }),
+    });
+    assert.equal(res.status, 403);
+    const body = await res.json() as { type: string; error: { type: string; message: string } };
+    assert.equal(body.error.type, "permission_error");
+  });
+});
+
+test("UI endpoint returns 404 for unknown UI routes", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway) => {
+    const res = await fetch(`${gateway.base}/api/ui/nonexistent_route`);
+    assert.equal(res.status, 404);
+  });
+});
+
+test("UI endpoint rejects invalid provider with 400", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway) => {
+    const res = await fetch(`${gateway.base}/api/ui/provider`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider: "invalid_provider" }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json() as { ok: boolean; error: string };
+    assert.equal(body.ok, false);
+  });
+});
+
+

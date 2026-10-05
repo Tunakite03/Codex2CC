@@ -11,8 +11,17 @@ import {
   unsupportedBlockTypes,
   unsupportedToolNames,
 } from "../bridge/bridge.js";
-import { checkClient, checkHost, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
-import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, resolveModel, type TierModels } from "../models/models.js";
+import { handleAntigravityMessage, type AntigravityRunner } from "../bridge/antigravity.js";
+import { checkClient, checkHost, checkUiOrigin, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
+import {
+  ANTIGRAVITY_DEFAULT_MODEL,
+  ANTIGRAVITY_MODELS,
+  CLAUDE_GATEWAY_MODELS,
+  DEFAULT_TIER_MODELS,
+  resolveModel,
+  type ProviderType,
+  type TierModels,
+} from "../models/models.js";
 import { activeTierModels, type TierModelStore } from "../models/tier-store.js";
 import { handleUiRoute } from "../ui/ui.js";
 import type { AccountUsageLimits } from "../auth/auth.js";
@@ -46,14 +55,18 @@ export type GatewayOptions = {
   readonly tiers?: TierModels;
   /** Live, UI-editable mapping; when present it takes precedence over `tiers`. */
   readonly tierStore?: TierModelStore;
+  provider?: ProviderType;
+  readonly antigravityRunner?: AntigravityRunner;
+  readonly antigravityModels?: readonly ModelInfo[];
 };
 
 type ResolvedGatewayOptions = GatewayOptions & {
   readonly upstreamUrl: string;
   readonly maxBodyBytes: number;
   readonly currentTiers: () => TierModels;
-  readonly modelSlugs: ReadonlySet<string>;
+  readonly modelSlugs: () => ReadonlySet<string>;
   readonly warnedModels: Set<string>;
+  readonly activeProvider: () => ProviderType;
 };
 
 function errorType(status: number): string {
@@ -198,7 +211,54 @@ async function handleMessage(
       details: { names: omittedTools.join(", ") },
     });
   }
-  const resolution = resolveModel(inbound.model, options.defaultModel, options.modelSlugs, options.currentTiers());
+  if (options.activeProvider() === "antigravity") {
+    await routeToAntigravity(options, inbound, requestedEffort, response, clientGone);
+    return;
+  }
+  await routeToCodex(options, inbound, response, clientGone, startTime);
+}
+
+async function routeToAntigravity(
+  options: ResolvedGatewayOptions,
+  inbound: MessageRequest,
+  requestedEffort: string | undefined,
+  response: ServerResponse,
+  clientGone: AbortSignal,
+): Promise<void> {
+  const antModels = options.antigravityModels ?? ANTIGRAVITY_MODELS;
+  const antSlugs = new Set(antModels.map((m) => m.slug));
+  const antDefault = options.defaultModel && antSlugs.has(options.defaultModel)
+    ? options.defaultModel
+    : ANTIGRAVITY_DEFAULT_MODEL;
+  const resolution = resolveModel(inbound.model, antDefault, antSlugs, options.currentTiers());
+  const activeModel = resolution.slug;
+  if (resolution.fellBack && !options.warnedModels.has(inbound.model)) {
+    options.warnedModels.add(inbound.model);
+    process.stderr.write(`${JSON.stringify({ level: "warn", operation: "model_fallback", provider: "antigravity", requested: inbound.model, using: activeModel })}\n`);
+    recordLog({
+      level: "warn",
+      operation: "model_fallback",
+      message: `[Antigravity] Requested model "${inbound.model}" unavailable; routed to "${activeModel}"`,
+      details: { provider: "antigravity", requested: inbound.model, using: activeModel },
+    });
+  }
+  const defaultEffort = options.tierStore?.getEffort();
+  await handleAntigravityMessage(
+    { model: activeModel, runner: options.antigravityRunner, effort: requestedEffort ?? defaultEffort },
+    inbound,
+    response,
+    clientGone,
+  );
+}
+
+async function routeToCodex(
+  options: ResolvedGatewayOptions,
+  inbound: MessageRequest,
+  response: ServerResponse,
+  clientGone: AbortSignal,
+  startTime: number,
+): Promise<void> {
+  const resolution = resolveModel(inbound.model, options.defaultModel, options.modelSlugs(), options.currentTiers());
   const activeModel = resolution.slug;
   if (resolution.fellBack && !options.warnedModels.has(inbound.model)) {
     options.warnedModels.add(inbound.model);
@@ -211,8 +271,13 @@ async function handleMessage(
     });
   }
   const outgoing = toOpenAIRequest(inbound, activeModel);
-  if (activeModel === DEFAULT_TIER_MODELS.haiku && outgoing.reasoning === undefined) {
-    outgoing.reasoning = { effort: "max" };
+  const defaultEffort = options.tierStore?.getEffort();
+  if (outgoing.reasoning === undefined) {
+    if (defaultEffort) {
+      outgoing.reasoning = { effort: defaultEffort };
+    } else if (activeModel === options.currentTiers().haiku || activeModel === DEFAULT_TIER_MODELS.haiku) {
+      outgoing.reasoning = { effort: "max" };
+    }
   }
   const effort = outgoing.reasoning?.effort ?? "upstream_default";
   const upstream = await openInference(options, outgoing, clientGone);
@@ -310,7 +375,12 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
     upstreamUrl: gatewayOptions.upstreamUrl ?? CHATGPT_RESPONSES_URL,
     maxBodyBytes: gatewayOptions.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
     currentTiers: () => activeTierModels(gatewayOptions),
-    modelSlugs: new Set(gatewayOptions.availableModels.map((model) => model.slug)),
+    activeProvider: () => gatewayOptions.provider ?? "codex",
+    modelSlugs: () => {
+      const isAnt = (gatewayOptions.provider ?? "codex") === "antigravity";
+      const models = isAnt ? (gatewayOptions.antigravityModels ?? ANTIGRAVITY_MODELS) : gatewayOptions.availableModels;
+      return new Set(models.map((model) => model.slug));
+    },
     warnedModels: new Set<string>(),
   };
 
@@ -337,8 +407,32 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
     }
     if (path === "/" || path === "/ui" || path.startsWith("/api/ui/")) {
       const port = (request.socket.localPort) || 3456;
-      handleUiRoute(gatewayOptions, request, response, path, port).catch(() => {
-        response.writeHead(500).end();
+      const originCheck = checkUiOrigin(request.headers, port);
+      if (!originCheck.ok) {
+        recordLog({
+          level: "warn",
+          operation: "guard_ui_origin",
+          message: `Blocked control panel request: ${originCheck.message}`,
+          details: { status: originCheck.status, type: originCheck.type, path },
+        });
+        sendGuardFailure(response, originCheck);
+        return;
+      }
+      handleUiRoute(gatewayOptions, request, response, path, port).then((handled) => {
+        if (!handled) response.writeHead(404, { "Content-Type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "not_found_error", message: "Unknown control panel route." } }));
+      }).catch((error: Error) => {
+        const typed = toBridgeError(error);
+        recordLog({
+          level: typed.status >= 500 ? "error" : "warn",
+          operation: "ui_request_failed",
+          message: `Control panel request failed: ${typed.code} (${typed.status}): ${typed.message}`,
+          details: { code: typed.code, status: typed.status, path },
+        });
+        if (response.headersSent) {
+          response.end();
+          return;
+        }
+        response.writeHead(typed.status, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: false, error: typed.message }));
       });
       return;
     }
@@ -354,19 +448,28 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
       return;
     }
     if (request.method === "GET" && path === "/v1/models") {
+      const currentProvider = options.activeProvider();
+      const isAnt = currentProvider === "antigravity";
+      const availableModels = isAnt ? (options.antigravityModels ?? ANTIGRAVITY_MODELS) : options.availableModels;
+      const modelSlugs = new Set(availableModels.map((model) => model.slug));
+      const defaultModel = isAnt
+        ? (options.defaultModel && modelSlugs.has(options.defaultModel) ? options.defaultModel : ANTIGRAVITY_DEFAULT_MODEL)
+        : options.defaultModel;
+
       recordLog({
         level: "info",
         operation: "models",
-        message: `Client queried models catalog (${CLAUDE_GATEWAY_MODELS.length} models returned)`,
+        message: `Client queried models catalog for provider "${currentProvider}" (${CLAUDE_GATEWAY_MODELS.length} models returned)`,
       });
       const tiers = options.currentTiers();
+      const providerLabel = isAnt ? "Google Antigravity" : "ChatGPT";
       const list = CLAUDE_GATEWAY_MODELS.map((model) => {
-        const resolution = resolveModel(model.id, options.defaultModel, options.modelSlugs, tiers);
-        const targetModel = options.availableModels.find((available) => available.slug === resolution.slug);
+        const resolution = resolveModel(model.id, defaultModel, modelSlugs, tiers);
+        const targetModel = availableModels.find((available) => available.slug === resolution.slug);
         return {
           id: model.id,
           type: "model",
-          display_name: `${resolution.slug} (ChatGPT via ${model.tier} route${resolution.fellBack ? ", fallback" : ""})`,
+          display_name: `${resolution.slug} (${providerLabel} via ${model.tier} route${resolution.fellBack ? ", fallback" : ""})`,
           ...(targetModel?.contextWindow === undefined ? {} : { max_input_tokens: targetModel.contextWindow }),
         };
       });

@@ -3,35 +3,35 @@ import type { ServerResponse } from "node:http";
 import { z } from "zod";
 
 const JsonValue = z.json();
-const TextBlock = z.object({ type: z.literal("text"), text: z.string() }).passthrough();
+const TextBlock = z.object({ type: z.literal("text"), text: z.string() }).loose();
 const ImageBlock = z.object({
   type: z.literal("image"),
   source: z.discriminatedUnion("type", [
     z.object({ type: z.literal("base64"), media_type: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]), data: z.string() }),
     z.object({ type: z.literal("url"), url: z.string().min(1) }),
   ]),
-}).passthrough();
-const ToolUseBlock = z.object({ type: z.literal("tool_use"), id: z.string().min(1), name: z.string().min(1), input: JsonValue }).passthrough();
+}).loose();
+const ToolUseBlock = z.object({ type: z.literal("tool_use"), id: z.string().min(1), name: z.string().min(1), input: JsonValue }).loose();
 const KNOWN_BLOCK_TYPES: readonly string[] = ["text", "image", "tool_use", "tool_result", "thinking", "redacted_thinking"];
 // Block types Claude Code may send that the Responses API cannot take (document, server_tool_use, ...).
 // They pass validation and are replaced by a visible note instead of failing the whole request.
-const UnknownBlock = z.object({ type: z.string().refine((type) => !KNOWN_BLOCK_TYPES.includes(type)) }).passthrough();
+const UnknownBlock = z.object({ type: z.string().refine((type) => !KNOWN_BLOCK_TYPES.includes(type)) }).loose();
 const ToolResultBlock = z.object({
   type: z.literal("tool_result"), tool_use_id: z.string().min(1),
   content: z.union([z.string(), z.array(z.union([TextBlock, ImageBlock, UnknownBlock]))]).optional(),
   is_error: z.boolean().optional(),
-}).passthrough();
-const ThinkingBlock = z.object({ type: z.enum(["thinking", "redacted_thinking"]), thinking: z.string().optional() }).passthrough();
+}).loose();
+const ThinkingBlock = z.object({ type: z.enum(["thinking", "redacted_thinking"]), thinking: z.string().optional() }).loose();
 const Block = z.discriminatedUnion("type", [TextBlock, ImageBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock]);
 type KnownBlock = z.infer<typeof Block>;
-const Message = z.object({ role: z.enum(["user", "assistant", "system", "developer"]), content: z.union([z.string(), z.array(z.union([Block, UnknownBlock]))]) }).passthrough();
+const Message = z.object({ role: z.enum(["user", "assistant", "system", "developer"]), content: z.union([z.string(), z.array(z.union([Block, UnknownBlock]))]) }).loose();
 // Server-side tools (for example web_search) have no input_schema and cannot be offered as function tools.
-const Tool = z.object({ name: z.string().min(1), description: z.string().default(""), input_schema: JsonValue.optional() }).passthrough();
+const Tool = z.object({ name: z.string().min(1), description: z.string().default(""), input_schema: JsonValue.optional() }).loose();
 const ToolChoice = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("auto") }).passthrough(),
-  z.object({ type: z.literal("any") }).passthrough(),
-  z.object({ type: z.literal("none") }).passthrough(),
-  z.object({ type: z.literal("tool"), name: z.string().min(1) }).passthrough(),
+  z.object({ type: z.literal("auto") }).loose(),
+  z.object({ type: z.literal("any") }).loose(),
+  z.object({ type: z.literal("none") }).loose(),
+  z.object({ type: z.literal("tool"), name: z.string().min(1) }).loose(),
 ]);
 const Effort = z.enum(["low", "medium", "high", "xhigh", "max"]);
 export const MessageRequest = z.object({
@@ -44,7 +44,7 @@ export const MessageRequest = z.object({
   output_config: z.object({ effort: Effort.optional() }).optional(),
   reasoning_effort: Effort.optional(),
   stream: z.boolean().default(false),
-}).passthrough();
+}).loose();
 export type MessageRequest = z.infer<typeof MessageRequest>;
 
 export class BridgeError extends Error {
@@ -548,7 +548,7 @@ export async function readSse(body: ReadableStream<Uint8Array>, accept: (event: 
       const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
       if (data && data !== "[DONE]") {
         try {
-          const parsed = z.object({ type: z.string() }).passthrough().safeParse(JSON.parse(data));
+          const parsed = z.object({ type: z.string() }).loose().safeParse(JSON.parse(data));
           if (!parsed.success) throw new BridgeError(502, "invalid_upstream_event", "OpenAI sent an invalid SSE event.");
           accept(parsed.data as OpenAIEvent);
         } catch (error) {

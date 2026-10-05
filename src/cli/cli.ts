@@ -2,14 +2,15 @@ import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
 import { BridgeError } from "../bridge/bridge.js";
 import { MIN_TOKEN_LENGTH, type GuardPolicy } from "../gateway/guard.js";
+import type { ProviderType } from "../models/models.js";
 
 export const DEFAULT_PORT = 3456;
 
 export type CliCommand =
   | { readonly kind: "help" }
-  | { readonly kind: "ui"; readonly model: string | undefined; readonly port: number }
-  | { readonly kind: "list-models" }
-  | { readonly kind: "serve"; readonly model: string | undefined; readonly port: number; readonly noAuth: boolean }
+  | { readonly kind: "ui"; readonly model: string | undefined; readonly port: number; readonly provider?: ProviderType | undefined }
+  | { readonly kind: "list-models"; readonly provider?: ProviderType | undefined }
+  | { readonly kind: "serve"; readonly model: string | undefined; readonly port: number; readonly noAuth: boolean; readonly provider?: ProviderType | undefined }
   | {
       readonly kind: "setup";
       readonly target: "cli" | "desktop" | "all";
@@ -22,7 +23,7 @@ export type CliCommand =
       readonly kind: "reset-config";
       readonly target: "cli" | "desktop" | "all";
     }
-  | { readonly kind: "claude"; readonly model: string | undefined; readonly claudeArgs: readonly string[] };
+  | { readonly kind: "claude"; readonly model: string | undefined; readonly claudeArgs: readonly string[]; readonly provider?: ProviderType | undefined };
 
 export const USAGE = `Usage: codex2cc [options] [-- <claude arguments>]
 
@@ -47,6 +48,7 @@ Options:
   --no-auth                 Standalone gateway without a token (not recommended)
   --gateway-url, --url <u>  Base URL for setup (default: http://127.0.0.1:${DEFAULT_PORT})
   --token <secret>          API key/token for setup (or CODEX2CC_TOKEN)
+  --provider <name>         Backend provider: codex (ChatGPT) or antigravity (Google agy)
   -p, --print <prompt>      Run Claude Code non-interactively
   -c, --continue            Continue the previous Claude Code session
   --permission-mode <mode>  Claude Code permission mode
@@ -54,7 +56,7 @@ Options:
                             Pass --dangerously-skip-permissions to Claude Code
 
 Arguments after "--" are passed to Claude Code unchanged.
-Environment: CODEX2CC_TOKEN, CODEX2CC_MODEL_FABLE/OPUS/SONNET/HAIKU, CODEX2CC_TIERS_FILE.
+Environment: CODEX2CC_PROVIDER, CODEX2CC_TOKEN, CODEX2CC_MODEL_FABLE/OPUS/SONNET/HAIKU, CODEX2CC_TIERS_FILE.
 `;
 
 const OPTIONS = {
@@ -80,6 +82,7 @@ const OPTIONS = {
   "gateway-url": { type: "string" },
   url: { type: "string" },
   token: { type: "string" },
+  provider: { type: "string" },
 } as const;
 
 function parseGatewayOptions(options: readonly string[]) {
@@ -112,9 +115,16 @@ export function parseCli(argv: readonly string[]): CliCommand {
   const claudeArgs = separator < 0 ? [] : argv.slice(separator + 1);
   const model = values.model || undefined;
 
+  const rawProvider = typeof values.provider === "string" ? values.provider.trim().toLowerCase() : undefined;
+  if (rawProvider !== undefined && rawProvider !== "codex" && rawProvider !== "antigravity") {
+    throw new BridgeError(400, "invalid_arguments", `--provider must be "codex" or "antigravity", got "${values.provider}".`);
+  }
+  const envProvider = process.env.CODEX2CC_PROVIDER?.trim().toLowerCase();
+  const provider = (rawProvider ?? (envProvider === "antigravity" || envProvider === "codex" ? envProvider : undefined)) as ProviderType | undefined;
+
   if (values.help) return { kind: "help" };
-  if (values.ui) return { kind: "ui", model, port: parsePort(values.port) };
-  if (values["list-models"]) return { kind: "list-models" };
+  if (values.ui) return { kind: "ui", model, port: parsePort(values.port), ...(provider !== undefined ? { provider } : {}) };
+  if (values["list-models"]) return { kind: "list-models", ...(provider !== undefined ? { provider } : {}) };
 
   if (values["reset-config"] || values["reset-cli"] || values["reset-desktop"]) {
     const target = values["reset-config"] ? "all" : values["reset-desktop"] ? "desktop" : "cli";
@@ -130,7 +140,7 @@ export function parseCli(argv: readonly string[]): CliCommand {
     return { kind: "setup", target, gatewayUrl, token, model, effort };
   }
 
-  if (values.serve) return { kind: "serve", model, port: parsePort(values.port), noAuth: values["no-auth"] === true };
+  if (values.serve) return { kind: "serve", model, port: parsePort(values.port), noAuth: values["no-auth"] === true, ...(provider !== undefined ? { provider } : {}) };
 
   const forwarded = [...claudeArgs];
   const skipPermissions = values["dangerously-skip-permissions"] === true || values["skip-permissions"] === true;
@@ -149,7 +159,7 @@ export function parseCli(argv: readonly string[]): CliCommand {
   if (values.continue === true && !forwarded.includes("--continue") && !forwarded.includes("-c")) {
     forwarded.push("--continue");
   }
-  return { kind: "claude", model, claudeArgs: forwarded };
+  return { kind: "claude", model, claudeArgs: forwarded, ...(provider !== undefined ? { provider } : {}) };
 }
 
 /** Chooses the standalone gateway credential policy from --no-auth and CODEX2CC_TOKEN. */

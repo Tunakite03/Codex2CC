@@ -4,37 +4,67 @@ import { spawn } from "node:child_process";
 import { ChatGPTSession } from "./auth/auth.js";
 import { BridgeError } from "./bridge/bridge.js";
 import { parseCli, standalonePolicy, USAGE } from "./cli/cli.js";
-import { createGatewayServer, listenOnLoopback, type ModelInfo } from "./gateway/gateway.js";
+import { createGatewayServer, listenOnLoopback, type ModelInfo, type UpstreamSession } from "./gateway/gateway.js";
 import { getActiveLogFilePath } from "./telemetry/logger.js";
-import { tierModel } from "./models/models.js";
+import {
+  ANTIGRAVITY_DEFAULT_MODEL,
+  ANTIGRAVITY_MODELS,
+  OFFLINE_CODEX_MODELS,
+  tierModel,
+  type ProviderType,
+} from "./models/models.js";
 import { resolveTierFilePath, TierModelStore } from "./models/tier-store.js";
 import type { GuardPolicy } from "./gateway/guard.js";
 import { enableUsagePersistence, resolveUsageFilePath } from "./telemetry/usage.js";
 
+/** Session used while no ChatGPT login exists; every upstream call fails with a clear 401. */
+function unauthenticatedSession(): UpstreamSession {
+  return {
+    async accessToken() { throw new BridgeError(401, "unauthorized", "Not logged into ChatGPT. Run 'codex login'."); },
+    async refreshAfterRejection() { throw new BridgeError(401, "unauthorized", "Not logged into ChatGPT."); },
+    accountId: () => "",
+  };
+}
+
+function warnLoginUnavailable(operation: string, error: Error): void {
+  process.stderr.write(`${JSON.stringify({ level: "warn", operation, message: `ChatGPT session unavailable: ${error.message}` })}\n`);
+}
+
 async function serveStandalone(
-  session: ChatGPTSession,
+  session: UpstreamSession,
   defaultModel: string,
   availableModels: readonly ModelInfo[],
   requestedPort: number,
   policy: GuardPolicy,
+  provider: ProviderType = "codex",
 ): Promise<void> {
-  const tierStore = TierModelStore.open(resolveTierFilePath(process.env), process.env);
-  const server = createGatewayServer({ session, defaultModel, availableModels, policy, tiers: tierStore.defaults(), tierStore });
+  const tierStore = TierModelStore.open(resolveTierFilePath(process.env), process.env, provider);
+  const server = createGatewayServer({
+    session,
+    defaultModel,
+    availableModels,
+    policy,
+    tiers: tierStore.defaults(),
+    tierStore,
+    provider,
+  });
   const port = await listenOnLoopback(server, requestedPort);
   const logFile = getActiveLogFilePath();
+  const providerLabel = provider === "antigravity" ? "Google Antigravity (agy)" : "ChatGPT (Codex)";
 
   process.stdout.write(`\n🚀 Codex2CC Standalone Gateway is RUNNING!\n`);
   process.stdout.write(`   Base URL: http://127.0.0.1:${port}\n`);
   process.stdout.write(`   Web Control Panel: http://127.0.0.1:${port}/ui\n`);
+  process.stdout.write(`   Active Provider: ${providerLabel}\n`);
   if (logFile) {
     process.stdout.write(`   Log File: ${logFile}\n`);
   }
-  process.stdout.write(`   Active Codex Model: ${defaultModel}\n`);
+  process.stdout.write(`   Active Model: ${defaultModel}\n`);
   process.stdout.write(`   Available Models: ${availableModels.map((m) => m.slug).join(", ")}\n`);
   if (policy.mode === "token") {
     process.stdout.write(`   API key (send as "Authorization: Bearer" or "x-api-key"): ${policy.token}\n`);
   } else {
-    process.stdout.write(`   WARNING: authentication disabled (--no-auth). Any local process can spend your ChatGPT quota.\n`);
+    process.stdout.write(`   WARNING: authentication disabled (--no-auth). Any local process can spend your quota.\n`);
   }
   process.stdout.write(`   Compatible Clients: Cherry Studio, Chatbox, Cline, Roo Code, LibreChat, TypingMind\n`);
   process.stdout.write(`   Press Ctrl+C to stop.\n\n`);
@@ -48,13 +78,14 @@ async function serveStandalone(
 }
 
 async function serveClaudeCli(
-  session: ChatGPTSession,
+  session: UpstreamSession,
   selectedModel: string,
   availableModels: readonly ModelInfo[],
   args: readonly string[],
+  provider: ProviderType = "codex",
 ): Promise<number> {
   const secret = randomBytes(32).toString("base64url");
-  const tierStore = TierModelStore.open(resolveTierFilePath(process.env), process.env);
+  const tierStore = TierModelStore.open(resolveTierFilePath(process.env), process.env, provider);
   const tiers = tierStore.current();
   const server = createGatewayServer({
     session,
@@ -63,6 +94,7 @@ async function serveClaudeCli(
     policy: { mode: "token", token: secret },
     tiers,
     tierStore,
+    provider,
   });
   const port = await listenOnLoopback(server, 0);
 
@@ -85,9 +117,10 @@ async function serveClaudeCli(
   };
   delete environment.ANTHROPIC_API_KEY;
 
+  const providerLabel = provider === "antigravity" ? "Google Antigravity" : "ChatGPT Plus";
   // Status goes to stderr so `codex2cc -p "..."` keeps stdout clean for piping.
   process.stderr.write(`Codex2CC gateway running on http://127.0.0.1:${port}\n`);
-  process.stderr.write(`Using ChatGPT Plus model "${selectedModel}" in Claude Code CLI.\n`);
+  process.stderr.write(`Using ${providerLabel} model "${selectedModel}" in Claude Code CLI.\n`);
   process.stderr.write(`Models mapped: Opus -> ${opusModel}, Sonnet -> ${sonnetModel}, Haiku -> ${haikuModel}\n`);
 
   try {
@@ -120,23 +153,16 @@ async function main(): Promise<void> {
     try {
       session = await ChatGPTSession.open();
       models = await session.listModels();
-    } catch {
-      models = [
-        { slug: "gpt-6-astra", displayName: "ChatGPT Fable Tier (gpt-6-astra)" },
-        { slug: "gpt-6-sol", displayName: "ChatGPT Sonnet Tier (gpt-6-sol)" },
-        { slug: "gpt-6.1-sol", displayName: "ChatGPT Opus Tier (gpt-6.1-sol)" },
-        { slug: "gpt-6-luna", displayName: "ChatGPT Haiku Tier (gpt-6-luna)" },
-      ];
+    } catch (error) {
+      warnLoginUnavailable("ui_login_unavailable", error as Error);
+      models = [...OFFLINE_CODEX_MODELS];
     }
 
-    const selectedModel = command.model ?? models[0]?.slug ?? "gpt-6-sol";
+    const provider: ProviderType = command.provider ?? (process.env.CODEX2CC_PROVIDER === "antigravity" ? "antigravity" : "codex");
+    const selectedModel = command.model ?? (provider === "antigravity" ? ANTIGRAVITY_DEFAULT_MODEL : (models[0]?.slug ?? "gpt-6-sol"));
     const policy = standalonePolicy(false, process.env.CODEX2CC_TOKEN ?? configuredGatewayToken(`http://127.0.0.1:${command.port}`));
-    const tierStore = TierModelStore.open(resolveTierFilePath(process.env), process.env);
-    const fakeSession = session ?? {
-      async accessToken() { throw new BridgeError(401, "unauthorized", "Not logged into ChatGPT. Run 'codex login'."); },
-      async refreshAfterRejection() { throw new BridgeError(401, "unauthorized", "Not logged into ChatGPT."); },
-      accountId: () => "",
-    };
+    const tierStore = TierModelStore.open(resolveTierFilePath(process.env), process.env, provider);
+    const fakeSession: UpstreamSession = session ?? unauthenticatedSession();
 
     const server = createGatewayServer({
       session: fakeSession,
@@ -145,6 +171,7 @@ async function main(): Promise<void> {
       policy,
       tiers: tierStore.defaults(),
       tierStore,
+      provider,
     });
     const port = await listenOnLoopback(server, command.port);
 
@@ -200,8 +227,9 @@ async function main(): Promise<void> {
       if (!selectedModel) {
         selectedModel = models[0]?.slug;
       }
-    } catch {
+    } catch (error) {
       // ChatGPT session is optional for setup (e.g. configuring external gateway or before login)
+      warnLoginUnavailable("setup_login_unavailable", error as Error);
     }
 
     const token = command.token || process.env.CODEX2CC_TOKEN;
@@ -247,17 +275,27 @@ async function main(): Promise<void> {
     return;
   }
 
-  const session = await ChatGPTSession.open();
-  const models = await session.listModels();
+  const provider: ProviderType = command.provider ?? (process.env.CODEX2CC_PROVIDER === "antigravity" ? "antigravity" : "codex");
+  let session: ChatGPTSession | undefined;
+  let models: ModelInfo[] = [];
+
+  if (provider === "antigravity") {
+    models = [...ANTIGRAVITY_MODELS];
+  } else {
+    session = await ChatGPTSession.open();
+    models = await session.listModels();
+  }
+
+  const effectiveSession: UpstreamSession = session ?? unauthenticatedSession();
 
   if (command.kind === "list-models") {
     for (const model of models) process.stdout.write(`${model.slug}\t${model.displayName}\n`);
     return;
   }
 
-  const selectedModel = command.model ?? models[0]?.slug;
+  const selectedModel = command.model ?? (provider === "antigravity" ? ANTIGRAVITY_DEFAULT_MODEL : models[0]?.slug);
   if (!selectedModel || !models.some((m) => m.slug === selectedModel)) {
-    throw new BridgeError(400, "model_unavailable", `Selected model "${selectedModel}" is not in the ChatGPT account model catalog (available: ${models.map((m) => m.slug).join(", ")}).`);
+    throw new BridgeError(400, "model_unavailable", `Selected model "${selectedModel}" is not in the ${provider === "antigravity" ? "Antigravity" : "ChatGPT account"} model catalog (available: ${models.map((m) => m.slug).join(", ")}).`);
   }
 
   if (command.kind === "serve") {
@@ -265,11 +303,11 @@ async function main(): Promise<void> {
     const policy = command.noAuth
       ? standalonePolicy(true, undefined)
       : standalonePolicy(false, process.env.CODEX2CC_TOKEN ?? configuredGatewayToken(`http://127.0.0.1:${command.port}`));
-    await serveStandalone(session, selectedModel, models, command.port, policy);
+    await serveStandalone(effectiveSession, selectedModel, models, command.port, policy, provider);
     return;
   }
 
-  process.exitCode = await serveClaudeCli(session, selectedModel, models, command.claudeArgs);
+  process.exitCode = await serveClaudeCli(effectiveSession, selectedModel, models, command.claudeArgs, provider);
 }
 
 main().catch((error: Error) => {

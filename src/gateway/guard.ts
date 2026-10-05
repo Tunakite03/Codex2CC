@@ -61,6 +61,20 @@ export function checkHost(headers: IncomingHttpHeaders): GuardResult {
 }
 
 /**
+ * Protects the control-panel API against cross-site request forgery. The panel is served
+ * credential-free from the same origin, so a browser request is legitimate only when its `Origin`
+ * header (always present on cross-origin and on same-origin non-GET requests) names this gateway's
+ * own loopback origin. Requests without `Origin` come from non-browser tools such as curl.
+ */
+export function checkUiOrigin(headers: IncomingHttpHeaders, port: number): GuardResult {
+  const origin = headers.origin;
+  if (origin === undefined) return { ok: true };
+  const allowed: readonly string[] = [`http://127.0.0.1:${port}`, `http://localhost:${port}`, `http://[::1]:${port}`];
+  if (typeof origin === "string" && allowed.includes(origin.toLowerCase())) return { ok: true };
+  return { ok: false, status: 403, type: "permission_error", message: "Cross-origin requests to the control panel are not allowed." };
+}
+
+/**
  * Authenticates the caller. In token mode the shared secret is mandatory. In open mode
  * (explicit opt-out) any request carrying an Origin header is refused, because only
  * browsers send it and a web page must never reach the gateway without a credential.

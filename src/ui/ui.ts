@@ -12,11 +12,12 @@ import {
   type SetupTarget,
 } from "../config/config-setup.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
-import { DEFAULT_TIER_MODELS } from "../models/models.js";
-import { activeTierModels, parseTierModels } from "../models/tier-store.js";
-import { clearLogs, getActiveLogFilePath, getLogs, getLogStats, recordLog, type LogLevel } from "../telemetry/logger.js";
+import { ANTIGRAVITY_MODELS, ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, type ProviderType } from "../models/models.js";
+import { isAntigravityAvailable } from "../bridge/antigravity.js";
+import { activeTierModels, parseTierModels, EffortLevel } from "../models/tier-store.js";
+import { clearLogs, getActiveLogFilePath, getLogs, getLogStats, onLog, onLogsCleared, recordLog, type LogLevel } from "../telemetry/logger.js";
 import type { AccountUsageLimits } from "../auth/auth.js";
-import { getTokenUsageStats, resetTokenUsage } from "../telemetry/usage.js";
+import { getTokenUsageStats, onUsageUpdated, resetTokenUsage } from "../telemetry/usage.js";
 
 export function openBrowser(url: string): void {
   const plat = process.platform;
@@ -36,27 +37,57 @@ export function openBrowser(url: string): void {
 
   try {
     const child = spawn(command, args, { stdio: "ignore", detached: true });
+    child.once("error", (error: Error) => {
+      recordLog({
+        level: "warn",
+        operation: "open_browser_failed",
+        message: `Could not open the browser automatically (${error.message}); open ${url} manually`,
+        details: { command },
+      });
+    });
     child.unref();
-  } catch {
+  } catch (error) {
     // Non-fatal if browser cannot be launched
+    recordLog({
+      level: "warn",
+      operation: "open_browser_failed",
+      message: `Could not open the browser automatically (${(error as Error).message}); open ${url} manually`,
+      details: { command },
+    });
   }
 }
 
+const MAX_UI_BODY_BYTES = 1024 * 1024;
+const SETUP_TARGETS: ReadonlySet<string> = new Set(["cli", "desktop", "all"]);
+
+/** Reads a JSON object body (≤ 1 MiB). An empty body is `{}`; malformed or non-object JSON is a 400. */
 async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
+  let size = 0;
   for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > MAX_UI_BODY_BYTES) throw new BridgeError(413, "request_too_large", "Control panel request body exceeds 1 MiB.");
+    chunks.push(buffer);
   }
   const text = Buffer.concat(chunks).toString("utf8");
   if (!text.trim()) return {};
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(text);
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
+    parsed = JSON.parse(text);
   } catch {
-    return {};
+    throw new BridgeError(400, "invalid_json", "Control panel request body is not valid JSON.");
   }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new BridgeError(400, "invalid_body", "Control panel request body must be a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function parseSetupTarget(value: unknown): SetupTarget {
+  if (value === undefined || value === "") return "all";
+  if (typeof value === "string" && SETUP_TARGETS.has(value)) return value as SetupTarget;
+  throw new BridgeError(400, "invalid_target", "Setup target must be one of: cli, desktop, all.");
 }
 
 export function getStatus(options: GatewayOptions, port: number): Record<string, unknown> {
@@ -64,6 +95,13 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
   const gatewayUrl = `http://127.0.0.1:${port}`;
   const token = options.policy.mode === "token" ? options.policy.token : "";
   const currentTiers = activeTierModels(options);
+  const activeProvider: ProviderType = options.provider ?? "codex";
+  const isAntigravity = activeProvider === "antigravity";
+  const activeModels = isAntigravity
+    ? (options.antigravityModels ?? ANTIGRAVITY_MODELS)
+    : options.availableModels;
+  const defaults = options.tierStore?.defaults(activeProvider)
+    ?? (isAntigravity ? ANTIGRAVITY_TIER_MODELS : (options.tiers ?? DEFAULT_TIER_MODELS));
   // A stored config only works when it points at this gateway and carries its current token.
   const inSync = (baseUrl: string, storedToken: string): boolean =>
     baseUrl.replace(/\/+$/, "") === gatewayUrl && (options.policy.mode === "open" || storedToken === token);
@@ -110,6 +148,13 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
   }
 
   return {
+    provider: {
+      active: activeProvider,
+      available: [
+        { id: "codex", name: "ChatGPT (Codex)", available: true },
+        { id: "antigravity", name: "Google Antigravity (agy)", available: isAntigravityAvailable() },
+      ],
+    },
     gateway: {
       port,
       url: gatewayUrl,
@@ -130,9 +175,10 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
     },
     tierMapping: {
       current: currentTiers,
-      defaults: options.tierStore?.defaults() ?? options.tiers ?? DEFAULT_TIER_MODELS,
-      custom: options.tierStore?.isCustom() ?? false,
-      models: options.availableModels.map(({ slug, displayName }) => ({ slug, displayName })),
+      defaults,
+      custom: options.tierStore?.isCustom(activeProvider) ?? false,
+      models: activeModels.map(({ slug, displayName }) => ({ slug, displayName })),
+      effort: options.tierStore?.getEffort() ?? "",
     },
   };
 }
@@ -186,6 +232,69 @@ export async function handleUiRoute(
     return true;
   }
 
+  if (pathname === "/api/ui/events" && request.method === "GET") {
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+
+    response.write(": connected\n\n");
+
+    let cleanedUp = false;
+    let heartbeat: NodeJS.Timeout | undefined;
+
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = undefined;
+      }
+      unsubscribeLog();
+      unsubscribeClear();
+      unsubscribeUsage();
+    };
+
+    heartbeat = setInterval(() => {
+      try {
+        response.write(": ping\n\n");
+      } catch {
+        cleanup();
+      }
+    }, 15000);
+
+    const unsubscribeLog = onLog((entry) => {
+      try {
+        const stats = getLogStats();
+        response.write(`event: log\ndata: ${JSON.stringify({ log: entry, stats })}\n\n`);
+      } catch {
+        cleanup();
+      }
+    });
+
+    const unsubscribeClear = onLogsCleared(() => {
+      try {
+        response.write(`event: log_clear\ndata: {}\n\n`);
+      } catch {
+        cleanup();
+      }
+    });
+
+    const unsubscribeUsage = onUsageUpdated((summary) => {
+      try {
+        response.write(`event: usage\ndata: ${JSON.stringify({ ...summary, provider: options.provider ?? "codex", antigravity: { available: isAntigravityAvailable() } })}\n\n`);
+      } catch {
+        cleanup();
+      }
+    });
+
+    request.on("close", cleanup);
+    response.on("close", cleanup);
+    return true;
+  }
+
   if (pathname === "/api/ui/logs/clear" && request.method === "POST") {
     clearLogs({ clearFile: true });
     response.writeHead(200, { "Content-Type": "application/json" });
@@ -198,15 +307,28 @@ export async function handleUiRoute(
     const forceRefresh = parsedUrl.searchParams.get("refresh") === "true";
     const usage = getTokenUsageStats();
     let limits: AccountUsageLimits | null = null;
-    if (typeof options.session.getUsageLimits === "function") {
+    const currentProvider = options.provider ?? "codex";
+    if (currentProvider === "codex" && typeof options.session.getUsageLimits === "function") {
       try {
         limits = await options.session.getUsageLimits(forceRefresh);
-      } catch {
+      } catch (error) {
         limits = null;
+        recordLog({
+          level: "warn",
+          operation: "usage_limits_unavailable",
+          message: `Could not fetch ChatGPT usage limits: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
       }
     }
     response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ ...usage, limits }));
+    response.end(JSON.stringify({
+      ...usage,
+      provider: currentProvider,
+      antigravity: {
+        available: isAntigravityAvailable(),
+      },
+      limits: currentProvider === "codex" ? limits : null,
+    }));
     return true;
   }
 
@@ -234,6 +356,27 @@ export async function handleUiRoute(
     return true;
   }
 
+  if (pathname === "/api/ui/provider" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    if (body.provider !== "antigravity" && body.provider !== "codex") {
+      throw new BridgeError(400, "invalid_provider", 'Provider must be "codex" or "antigravity".');
+    }
+    const target: ProviderType = body.provider;
+    options.provider = target;
+    if (options.tierStore) {
+      options.tierStore.setProvider(target);
+    }
+    recordLog({
+      level: "info",
+      operation: "provider_switch",
+      message: `Active provider changed to "${target}"`,
+      details: { provider: target },
+    });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ ok: true, provider: target }));
+    return true;
+  }
+
   if (pathname === "/api/ui/tiers" && request.method === "POST") {
     const store = options.tierStore;
     if (!store) {
@@ -244,20 +387,34 @@ export async function handleUiRoute(
     try {
       const body = await readJsonBody(request);
       const tiers = parseTierModels(body.tiers);
-      const availableModels = new Set(options.availableModels.map((model) => model.slug));
+      const currentProvider = options.provider ?? "codex";
+      const isAnt = currentProvider === "antigravity";
+      const modelCatalog = isAnt ? (options.antigravityModels ?? ANTIGRAVITY_MODELS) : options.availableModels;
+      const availableModels = new Set(modelCatalog.map((model) => model.slug));
       const unavailable = Object.entries(tiers).find(([, model]) => !availableModels.has(model));
       if (unavailable) {
-        throw new BridgeError(400, "model_unavailable", `Tier mapping model "${unavailable[1]}" is not in the current ChatGPT account model catalog.`);
+        throw new BridgeError(400, "model_unavailable", `Tier mapping model "${unavailable[1]}" is not in the current ${isAnt ? "Antigravity" : "ChatGPT"} model catalog.`);
       }
-      store.save(tiers);
+      store.save(tiers, currentProvider);
+      if (typeof body.effort === "string") {
+        const cleanEffort = body.effort.trim();
+        if (cleanEffort === "") {
+          store.setEffort(undefined);
+        } else {
+          const parsedEffort = EffortLevel.safeParse(cleanEffort);
+          if (parsedEffort.success) {
+            store.setEffort(parsedEffort.data);
+          }
+        }
+      }
       recordLog({
         level: "info",
         operation: "tier_mapping_saved",
-        message: "Saved Claude tier to ChatGPT model mapping",
-        details: { fable: tiers.fable, opus: tiers.opus, sonnet: tiers.sonnet, haiku: tiers.haiku },
+        message: `Saved Claude tier to ${isAnt ? "Antigravity" : "ChatGPT"} model mapping`,
+        details: { provider: currentProvider, fable: tiers.fable, opus: tiers.opus, sonnet: tiers.sonnet, haiku: tiers.haiku },
       });
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, tiers: store.current(), custom: store.isCustom() }));
+      response.end(JSON.stringify({ ok: true, tiers: store.current(currentProvider), custom: store.isCustom(currentProvider), effort: store.getEffort() ?? "" }));
     } catch (error) {
       const failure = error instanceof BridgeError
         ? error
@@ -281,10 +438,15 @@ export async function handleUiRoute(
       return true;
     }
     try {
-      store.reset();
-      recordLog({ level: "info", operation: "tier_mapping_reset", message: "Reset Claude tier mapping to environment or built-in defaults" });
+      const currentProvider = options.provider ?? "codex";
+      store.reset(currentProvider);
+      recordLog({
+        level: "info",
+        operation: "tier_mapping_reset",
+        message: `Reset Claude tier mapping to ${currentProvider === "antigravity" ? "Antigravity" : "ChatGPT"} environment or built-in defaults`,
+      });
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, tiers: store.current(), custom: store.isCustom() }));
+      response.end(JSON.stringify({ ok: true, tiers: store.current(currentProvider), custom: store.isCustom(currentProvider) }));
     } catch (error) {
       const failure = new BridgeError(
         500,
@@ -300,7 +462,7 @@ export async function handleUiRoute(
 
   if (pathname === "/api/ui/setup" && request.method === "POST") {
     const body = await readJsonBody(request);
-    const target = (body.target as SetupTarget) || "all";
+    const target = parseSetupTarget(body.target);
     const gatewayUrl = typeof body.gatewayUrl === "string" ? body.gatewayUrl.trim() : `http://127.0.0.1:${port}`;
     const token = typeof body.token === "string" ? body.token.trim() : options.policy.mode === "token" ? options.policy.token : "";
     try {
@@ -311,11 +473,15 @@ export async function handleUiRoute(
       if (options.policy.mode === "token" && token !== options.policy.token) {
         throw new BridgeError(400, "gateway_token_mismatch", "Client setup token does not match the running gateway. Restart with CODEX2CC_TOKEN to change it.");
       }
+      const effort = typeof body.effort === "string" && body.effort.trim() !== ""
+        ? body.effort.trim()
+        : options.tierStore?.getEffort();
       const result = setupConfig(target, {
         gatewayUrl: cleanUrl,
         token,
         model: options.defaultModel,
         tiers: activeTierModels(options),
+        effort,
       });
       recordLog({
         level: "info",
@@ -341,7 +507,7 @@ export async function handleUiRoute(
 
   if (pathname === "/api/ui/reset" && request.method === "POST") {
     const body = await readJsonBody(request);
-    const target = (body.target as SetupTarget) || "all";
+    const target = parseSetupTarget(body.target);
     try {
       const result = resetConfig(target);
       recordLog({
@@ -523,6 +689,67 @@ export function renderDashboardHtml(): string {
       border-radius: 50%;
       background: var(--teal);
       border: 1.5px solid var(--line);
+    }
+    /* Provider Switcher */
+    .provider-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: var(--surface);
+      border: 1.5px solid var(--line);
+      border-radius: var(--radius);
+      padding: 0.3rem 0.55rem;
+      box-shadow: 2px 2px 0 var(--line);
+    }
+    .provider-label {
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--ink-soft);
+    }
+    .provider-group {
+      display: flex;
+      gap: 0.35rem;
+    }
+    .provider-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.28rem 0.65rem;
+      border-radius: 0.4rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      border: 1.5px solid var(--border);
+      background: var(--surface-soft);
+      color: var(--ink-soft);
+      transition: all 0.15s ease;
+    }
+    .provider-btn:hover {
+      background: var(--paper-deep);
+      color: var(--ink);
+      border-color: var(--line);
+    }
+    .provider-btn.active {
+      background: var(--primary);
+      border-color: var(--line);
+      color: #ffffff;
+      box-shadow: 1.5px 1.5px 0 var(--line);
+    }
+    .provider-btn .p-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      flex-shrink: 0;
+      font-size: 0.85rem;
+      line-height: 1;
+    }
+    .provider-btn .p-icon svg {
+      width: 14px;
+      height: 14px;
+      display: block;
     }
     /* Navigation Tabs */
     .nav-tabs {
@@ -1459,6 +1686,23 @@ export function renderDashboardHtml(): string {
           <p>Local gateway · Claude client setup</p>
         </div>
       </div>
+      <div class="provider-bar">
+        <span class="provider-label">Provider</span>
+        <div class="provider-group" id="provider-selector" role="radiogroup" aria-label="Active LLM Provider">
+          <button class="provider-btn active" id="btn-provider-codex" type="button" data-provider="codex" role="radio" aria-checked="true" title="Use ChatGPT Codex subscription">
+            <span class="p-icon">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
+            </span>
+            <span>ChatGPT (Codex)</span>
+          </button>
+          <button class="provider-btn" id="btn-provider-antigravity" type="button" data-provider="antigravity" role="radio" aria-checked="false" title="Use Google Antigravity (agy) session">
+            <span class="p-icon">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.04 19.32Q12 21.51 12 24q0-2.49.93-4.68.96-2.19 2.58-3.81t3.81-2.55Q21.51 12 24 12q-2.49 0-4.68-.93a12.3 12.3 0 0 1-3.81-2.58 12.3 12.3 0 0 1-2.58-3.81Q12 2.49 12 0q0 2.49-.96 4.68-.93 2.19-2.55 3.81a12.3 12.3 0 0 1-3.81 2.58Q2.49 12 0 12q2.49 0 4.68.96 2.19.93 3.81 2.55t2.55 3.81"/></svg>
+            </span>
+            <span>Antigravity (agy)</span>
+          </button>
+        </div>
+      </div>
       <div class="status-badge" id="gateway-badge">
         <span class="pulse-dot"></span>
         <span id="gateway-status-text">Checking gateway...</span>
@@ -1589,7 +1833,7 @@ export function renderDashboardHtml(): string {
           </h2>
           <span class="badge-sub" id="tier-mapping-status">Loading…</span>
         </div>
-        <p class="card-desc">Map each Claude tier to a ChatGPT backend model. Changes apply immediately upon saving.</p>
+        <p class="card-desc" id="tier-mapping-desc">Map each Claude tier to a backend model. Changes apply immediately upon saving.</p>
 
         <div class="tier-grid">
           <div class="tier-item">
@@ -1620,6 +1864,21 @@ export function renderDashboardHtml(): string {
             </div>
             <select id="tier-haiku" data-tier="haiku"></select>
           </div>
+        </div>
+
+        <div class="effort-row" style="display:flex;align-items:center;justify-content:space-between;margin-top:1.25rem;padding:0.75rem 1rem;background:var(--bg-sub,rgba(0,0,0,0.03));border:1px solid var(--border-color,#e2e8f0);border-radius:8px;">
+          <div>
+            <label for="select-effort" style="font-weight:600;font-size:0.875rem;">Thinking Level</label>
+            <p style="font-size:0.75rem;color:var(--text-muted,#64748b);margin:0.15rem 0 0 0;">Default thinking level applied to reasoning models (saved to settings.json).</p>
+          </div>
+          <select id="select-effort" style="width:auto;min-width:140px;padding:0.4rem 0.6rem;border-radius:6px;border:1px solid var(--border-color,#cbd5e1);background:var(--bg-card,#fff);color:inherit;">
+            <option value="">Default (None)</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="xhigh">X-High</option>
+            <option value="max">Max</option>
+          </select>
         </div>
 
         <div class="tier-actions">
@@ -1798,9 +2057,9 @@ export function renderDashboardHtml(): string {
             </select>
           </div>
           <div class="logs-controls">
-            <label class="auto-refresh-toggle" title="Poll every 2 seconds for live traffic">
+            <label class="auto-refresh-toggle" title="Stream live traffic events via Server-Sent Events">
               <input type="checkbox" id="check-auto-refresh" checked />
-              Live (2s)
+              Live Stream
             </label>
             <button class="btn btn-secondary btn-sm" id="btn-refresh-logs" type="button" title="Fetch latest logs">Refresh</button>
             <button class="btn btn-secondary btn-sm" id="btn-copy-logs" type="button" title="Copy visible logs">Copy</button>
@@ -1919,6 +2178,24 @@ export function renderDashboardHtml(): string {
       document.getElementById("val-gateway-url").textContent = s.gateway.url;
       document.getElementById("val-auth-mode").textContent = s.gateway.policyMode === "token" ? "Token Protected" : "Open (--no-auth)";
 
+      if (s.provider) {
+        const active = s.provider.active;
+        const btnCodex = document.getElementById("btn-provider-codex");
+        const btnAnt = document.getElementById("btn-provider-antigravity");
+        if (btnCodex && btnAnt) {
+          btnCodex.classList.toggle("active", active === "codex");
+          btnCodex.setAttribute("aria-checked", active === "codex" ? "true" : "false");
+          btnAnt.classList.toggle("active", active === "antigravity");
+          btnAnt.setAttribute("aria-checked", active === "antigravity" ? "true" : "false");
+        }
+        const descElem = document.getElementById("tier-mapping-desc");
+        if (descElem) {
+          descElem.textContent = active === "antigravity"
+            ? "Map each Claude tier to a Google Antigravity (agy) model. Changes apply immediately upon saving."
+            : "Map each Claude tier to a ChatGPT backend model. Changes apply immediately upon saving.";
+        }
+      }
+
       function applyBadge(badge, client) {
         if (client.configured && client.inSync) {
           badge.textContent = "Configured";
@@ -1940,6 +2217,30 @@ export function renderDashboardHtml(): string {
 
       updateRunCommand();
     }
+
+    async function switchProvider(provider) {
+      try {
+        const res = await fetch("/api/ui/provider", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          showToast("Switched active provider to " + (provider === "antigravity" ? "Google Antigravity (agy)" : "ChatGPT (Codex)"));
+          cachedLimits = null;
+          await fetchStatus();
+          await fetchUsage(true);
+        } else {
+          showToast("Failed to switch provider: " + (data.error || "Unknown error"), "error");
+        }
+      } catch (err) {
+        showToast("Error switching provider: " + err.message, "error");
+      }
+    }
+
+    document.getElementById("btn-provider-codex")?.addEventListener("click", () => switchProvider("codex"));
+    document.getElementById("btn-provider-antigravity")?.addEventListener("click", () => switchProvider("antigravity"));
 
     function renderTierMapping(mapping) {
       const tiers = ["fable", "opus", "sonnet", "haiku"];
@@ -1963,6 +2264,11 @@ export function renderDashboardHtml(): string {
       const status = document.getElementById("tier-mapping-status");
       status.textContent = mapping.custom ? "Saved mapping" : "Environment or built-in defaults";
       status.className = mapping.custom ? "badge-sub badge-active" : "badge-sub";
+
+      const effortSelect = document.getElementById("select-effort");
+      if (effortSelect && mapping.effort !== undefined) {
+        effortSelect.value = mapping.effort || "";
+      }
     }
 
     function updateRunCommand() {
@@ -2042,18 +2348,19 @@ export function renderDashboardHtml(): string {
         tier,
         document.getElementById("tier-" + tier).value,
       ]));
+      const effort = document.getElementById("select-effort")?.value || "";
       try {
         const res = await fetch("/api/ui/tiers", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ tiers }),
+          body: JSON.stringify({ tiers, effort }),
         });
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
-        showToast("Tier model mapping saved.");
+        showToast("Settings and model mapping saved.");
         await fetchStatus();
       } catch (err) {
-        showToast("Failed to save tier mapping: " + err.message, "error");
+        showToast("Failed to save settings: " + err.message, "error");
       }
     });
 
@@ -2092,7 +2399,7 @@ export function renderDashboardHtml(): string {
     document.getElementById("btn-reset-desktop").addEventListener("click", () => sendReset("desktop"));
 
     let logsCache = [];
-    let autoRefreshInterval = null;
+    let eventSource = null;
 
     function escapeHtml(str) {
       if (typeof str !== "string") return String(str);
@@ -2117,6 +2424,146 @@ export function renderDashboardHtml(): string {
         // Silently skip transient log poll errors
       }
     }
+
+    function matchesLogFilter(log, levelVal, searchVal) {
+      if (levelVal !== "all" && log.level !== levelVal) return false;
+      if (searchVal) {
+        const query = searchVal.toLowerCase();
+        const inMsg = (log.message || "").toLowerCase().includes(query);
+        const inOp = (log.operation || "").toLowerCase().includes(query);
+        let inDet = false;
+        if (log.details) {
+          try {
+            inDet = JSON.stringify(log.details).toLowerCase().includes(query);
+          } catch {}
+        }
+        if (!inMsg && !inOp && !inDet) return false;
+      }
+      return true;
+    }
+
+    function appendLogRow(log) {
+      const terminal = document.getElementById("log-terminal");
+      if (!terminal) return;
+
+      terminal.classList.remove("is-empty");
+      const emptyEl = terminal.querySelector(".log-empty");
+      if (emptyEl) {
+        terminal.innerHTML = "";
+      }
+
+      const isScrolledToBottom = terminal.scrollHeight - terminal.clientHeight <= terminal.scrollTop + 50;
+
+      const time = log.timestamp ? log.timestamp.split("T")[1]?.slice(0, 8) || log.timestamp : "";
+      let detailsStr = "";
+      if (log.details && Object.keys(log.details).length > 0) {
+        try {
+          detailsStr = " " + JSON.stringify(log.details);
+        } catch {}
+      }
+
+      const row = document.createElement("div");
+      row.className = "log-row";
+      row.innerHTML = '<span class="log-time">' + escapeHtml(time) + '</span>' +
+        '<span class="log-tag log-tag-' + escapeHtml(log.level) + '">' + escapeHtml(log.level) + '</span>' +
+        '<span class="log-op">[' + escapeHtml(log.operation) + ']</span>' +
+        '<span class="log-msg">' + escapeHtml(log.message) +
+        (detailsStr ? '<span class="log-details-chip">' + escapeHtml(detailsStr) + '</span>' : '') +
+        '</span>';
+
+      terminal.appendChild(row);
+
+      while (terminal.children.length > 250) {
+        terminal.removeChild(terminal.firstElementChild);
+      }
+
+      if (isScrolledToBottom) {
+        terminal.scrollTop = terminal.scrollHeight;
+      }
+    }
+
+    function handleLiveLog(entry, stats) {
+      if (!logsCache.some(l => l.id === entry.id)) {
+        logsCache.push(entry);
+        if (logsCache.length > 250) {
+          logsCache.shift();
+        }
+      }
+
+      const tabBadge = document.getElementById("tab-badge-logs");
+      if (stats) {
+        document.getElementById("badge-log-count").textContent = stats.total + " log" + (stats.total === 1 ? "" : "s");
+        if (tabBadge) tabBadge.textContent = String(stats.total);
+
+        const warnEl = document.getElementById("badge-warn-count");
+        if (stats.warnCount > 0) {
+          warnEl.style.display = "inline-flex";
+          warnEl.textContent = stats.warnCount + " warning" + (stats.warnCount === 1 ? "" : "s");
+        } else {
+          warnEl.style.display = "none";
+        }
+        const errEl = document.getElementById("badge-err-count");
+        if (stats.errorCount > 0) {
+          errEl.style.display = "inline-flex";
+          errEl.textContent = stats.errorCount + " error" + (stats.errorCount === 1 ? "" : "s");
+          if (tabBadge) tabBadge.classList.add("badge-alert");
+        } else {
+          errEl.style.display = "none";
+          if (tabBadge) tabBadge.classList.remove("badge-alert");
+        }
+      }
+
+      const levelVal = document.getElementById("select-log-level")?.value || "all";
+      const searchVal = document.getElementById("input-log-search")?.value.trim() || "";
+      if (matchesLogFilter(entry, levelVal, searchVal)) {
+        appendLogRow(entry);
+      }
+    }
+
+    function connectEventStream() {
+      if (eventSource) return;
+      if (typeof EventSource === "undefined") return;
+
+      try {
+        eventSource = new EventSource("/api/ui/events");
+
+        eventSource.addEventListener("log", (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (data && data.log) {
+              handleLiveLog(data.log, data.stats);
+            }
+          } catch {}
+        });
+
+        eventSource.addEventListener("log_clear", () => {
+          logsCache = [];
+          renderLogs([], { total: 0, infoCount: 0, warnCount: 0, errorCount: 0 });
+        });
+
+        eventSource.addEventListener("usage", (e) => {
+          try {
+            const summary = JSON.parse(e.data);
+            if (summary) {
+              renderUsage(summary);
+            }
+          } catch {}
+        });
+      } catch (err) {
+        // Silently ignore EventSource setup error
+      }
+    }
+
+    function disconnectEventStream() {
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+    }
+
+    window.addEventListener("beforeunload", () => {
+      disconnectEventStream();
+    });
 
     function renderLogs(logs, stats, logFile) {
       const terminal = document.getElementById("log-terminal");
@@ -2222,17 +2669,9 @@ export function renderDashboardHtml(): string {
       const autoRefreshCheck = document.getElementById("check-auto-refresh");
       function updateAutoRefresh() {
         if (autoRefreshCheck.checked) {
-          if (!autoRefreshInterval) {
-            autoRefreshInterval = setInterval(() => {
-              fetchLogs();
-              fetchUsage();
-            }, 2000);
-          }
+          connectEventStream();
         } else {
-          if (autoRefreshInterval) {
-            clearInterval(autoRefreshInterval);
-            autoRefreshInterval = null;
-          }
+          disconnectEventStream();
         }
       }
       autoRefreshCheck.addEventListener("change", updateAutoRefresh);
@@ -2321,6 +2760,8 @@ export function renderDashboardHtml(): string {
       }
     }
 
+    let cachedLimits = null;
+
     function renderUsage(data) {
       if (!data) return;
       document.getElementById("val-total-tokens").textContent = fmt(data.grandTotalTokens);
@@ -2329,30 +2770,105 @@ export function renderDashboardHtml(): string {
       document.getElementById("val-output-tokens").textContent = fmt(data.totalOutputTokens);
       document.getElementById("val-cached-tokens").textContent = fmt(data.totalCachedTokens);
 
-      const limits = data.limits;
+      const isAnt = (data.provider === "antigravity") || (!data.provider && currentStatus?.provider?.active === "antigravity");
       const planBadge = document.getElementById("quota-plan-badge");
       const statusText = document.getElementById("quota-status-text");
 
-      if (limits) {
+      if (isAnt) {
         if (planBadge) {
-          const planStr = limits.planType ? (limits.planType.charAt(0).toUpperCase() + limits.planType.slice(1)) + " plan" : "Active";
-          planBadge.textContent = planStr;
+          planBadge.textContent = "Google Antigravity";
+          planBadge.className = "quota-plan-badge badge-active";
         }
         if (statusText) {
-          if (limits.limitReached) {
-            statusText.innerHTML = '<span style="color:var(--coral-dark);font-weight:700;">Rate limit reached</span>';
-          } else {
-            statusText.textContent = limits.allowed ? "Allowed — Quota active" : "Usage paused";
-          }
+          statusText.innerHTML = data.antigravity?.available !== false
+            ? '<span style="color:var(--primary);font-weight:600;">Connected · agy on PATH (Google Antigravity Session)</span>'
+            : '<span style="color:var(--coral-dark);font-weight:600;">agy binary not detected on PATH</span>';
         }
-        renderQuotaWindow("5h", limits.primaryWindow);
-        renderQuotaWindow("weekly", limits.secondaryWindow);
+        const name5h = document.querySelector("#card-quota-5h .quota-window-name");
+        const sub5h = document.querySelector("#card-quota-5h .quota-window-sub");
+        const rem5h = document.getElementById("val-5h-remaining");
+        const label5h = document.querySelector("#card-quota-5h .quota-remaining-label");
+        const bar5h = document.getElementById("bar-5h");
+        const used5h = document.getElementById("val-5h-used");
+        const reset5h = document.getElementById("val-5h-reset");
+
+        if (name5h) name5h.textContent = "CLI Session (agy)";
+        if (sub5h) sub5h.textContent = "Local Subprocess Bridge";
+        if (rem5h) {
+          rem5h.textContent = data.antigravity?.available !== false ? "Active" : "Unavailable";
+          rem5h.style.color = data.antigravity?.available !== false ? "var(--primary)" : "var(--coral-dark)";
+        }
+        if (label5h) label5h.textContent = "status";
+        if (bar5h) {
+          bar5h.style.width = data.antigravity?.available !== false ? "100%" : "0%";
+          bar5h.style.backgroundColor = data.antigravity?.available !== false ? "var(--primary)" : "var(--coral)";
+        }
+        if (used5h) used5h.textContent = data.antigravity?.available !== false ? "Process ready" : "Not found";
+        if (reset5h) reset5h.textContent = "Auto-managed";
+
+        const nameWk = document.querySelector("#card-quota-weekly .quota-window-name");
+        const subWk = document.querySelector("#card-quota-weekly .quota-window-sub");
+        const remWk = document.getElementById("val-weekly-remaining");
+        const labelWk = document.querySelector("#card-quota-weekly .quota-remaining-label");
+        const barWk = document.getElementById("bar-weekly");
+        const usedWk = document.getElementById("val-weekly-used");
+        const resetWk = document.getElementById("val-weekly-reset");
+
+        if (nameWk) nameWk.textContent = "Quota Channel";
+        if (subWk) subWk.textContent = "Google Antigravity Subscription";
+        if (remWk) {
+          remWk.textContent = "Direct";
+          remWk.style.color = "var(--primary)";
+        }
+        if (labelWk) labelWk.textContent = "unmetered by gateway";
+        if (barWk) {
+          barWk.style.width = "100%";
+          barWk.style.backgroundColor = "var(--primary)";
+        }
+        if (usedWk) usedWk.textContent = "Bypasses ChatGPT limits";
+        if (resetWk) resetWk.textContent = "Google Account";
       } else {
-        if (statusText) {
-          statusText.textContent = "Rate limits not available in current session";
+        const name5h = document.querySelector("#card-quota-5h .quota-window-name");
+        const sub5h = document.querySelector("#card-quota-5h .quota-window-sub");
+        const label5h = document.querySelector("#card-quota-5h .quota-remaining-label");
+        if (name5h) name5h.textContent = "5-hour window";
+        if (sub5h) sub5h.textContent = "Rolling session quota";
+        if (label5h) label5h.textContent = "remaining";
+
+        const nameWk = document.querySelector("#card-quota-weekly .quota-window-name");
+        const subWk = document.querySelector("#card-quota-weekly .quota-window-sub");
+        const labelWk = document.querySelector("#card-quota-weekly .quota-remaining-label");
+        if (nameWk) nameWk.textContent = "Weekly allowance";
+        if (subWk) subWk.textContent = "7-day capacity limit";
+        if (labelWk) labelWk.textContent = "remaining";
+
+        if (data.limits !== undefined) {
+          cachedLimits = data.limits;
         }
-        renderQuotaWindow("5h", null);
-        renderQuotaWindow("weekly", null);
+        const limits = cachedLimits;
+
+        if (limits) {
+          if (planBadge) {
+            const planStr = limits.planType ? (limits.planType.charAt(0).toUpperCase() + limits.planType.slice(1)) + " plan" : "Active";
+            planBadge.textContent = planStr;
+            planBadge.className = "quota-plan-badge";
+          }
+          if (statusText) {
+            if (limits.limitReached) {
+              statusText.innerHTML = '<span style="color:var(--coral-dark);font-weight:700;">Rate limit reached</span>';
+            } else {
+              statusText.textContent = limits.allowed ? "Allowed — Quota active" : "Usage paused";
+            }
+          }
+          renderQuotaWindow("5h", limits.primaryWindow);
+          renderQuotaWindow("weekly", limits.secondaryWindow);
+        } else {
+          if (statusText) {
+            statusText.textContent = "Rate limits not available in current session";
+          }
+          renderQuotaWindow("5h", null);
+          renderQuotaWindow("weekly", null);
+        }
       }
 
       const tabBadge = document.getElementById("tab-badge-tokens");
@@ -2376,8 +2892,13 @@ export function renderDashboardHtml(): string {
           ? ((m.totalTokens / data.grandTotalTokens) * 100).toFixed(1) + "%"
           : "0.0%";
 
+        const isAntModel = m.model.startsWith("claude-") || m.model.startsWith("gemini-") || m.model.startsWith("gpt-oss-");
+        const providerBadge = isAntModel
+          ? '<span class="badge-sub" style="margin-left:0.5rem;font-size:0.68rem;padding:0.12rem 0.45rem;border-radius:4px;background:rgba(36,123,121,0.15);color:var(--primary);font-weight:600;">Antigravity</span>'
+          : '<span class="badge-sub" style="margin-left:0.5rem;font-size:0.68rem;padding:0.12rem 0.45rem;border-radius:4px;background:rgba(217,119,6,0.15);color:#d97706;font-weight:600;">ChatGPT</span>';
+
         html += '<tr>' +
-          '<td><span class="model-tag">' + escapeHtml(m.model) + '</span></td>' +
+          '<td><span class="model-tag">' + escapeHtml(m.model) + '</span>' + providerBadge + '</td>' +
           '<td class="num-col">' + fmt(m.requests) + '</td>' +
           '<td class="num-col">' + fmt(m.inputTokens) + '</td>' +
           '<td class="num-col">' + fmt(m.outputTokens) + '</td>' +

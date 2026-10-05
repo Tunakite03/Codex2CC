@@ -7,14 +7,17 @@ import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import test from "node:test";
 import type { GatewayOptions } from "../gateway/gateway.js";
-import { DEFAULT_TIER_MODELS } from "../models/models.js";
+import { DEFAULT_TIER_MODELS, ANTIGRAVITY_TIER_MODELS, type TierModels } from "../models/models.js";
 import { TierModelStore } from "../models/tier-store.js";
+import { clearLogs, recordLog } from "../telemetry/logger.js";
+import { recordTokenUsage } from "../telemetry/usage.js";
 import { getStatus, handleUiRoute, renderDashboardHtml } from "./ui.js";
 
 function createMockResponse(): { response: ServerResponse; getOutput: () => { statusCode: number; headers: Record<string, string>; body: string } } {
   let statusCode = 200;
   let headers: Record<string, string> = {};
   const chunks: Buffer[] = [];
+  const listeners: Record<string, ((...args: unknown[]) => void)[]> = {};
 
   const response = {
     writeHead(code: number, h?: Record<string, string>) {
@@ -22,9 +25,24 @@ function createMockResponse(): { response: ServerResponse; getOutput: () => { st
       if (h) headers = { ...headers, ...h };
       return this;
     },
+    write(data?: string | Buffer) {
+      if (data) chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
+      return true;
+    },
     end(data?: string | Buffer) {
       if (data) chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
       return this;
+    },
+    on(event: string, listener: (...args: unknown[]) => void) {
+      listeners[event] = listeners[event] || [];
+      listeners[event].push(listener);
+      return this;
+    },
+    emit(event: string, ...args: unknown[]) {
+      for (const fn of listeners[event] || []) {
+        fn(...args);
+      }
+      return true;
     },
   } as unknown as ServerResponse;
 
@@ -359,4 +377,158 @@ test("renderDashboardHtml includes 5-hour and weekly usage remaining components"
   assert.ok(html.includes('id="bar-5h"'), "5h progress bar present");
   assert.ok(html.includes('id="bar-weekly"'), "weekly progress bar present");
 });
+
+test("handleUiRoute streams real-time SSE events for logs and usage", async () => {
+  const { response, getOutput } = createMockResponse();
+  const req = createMockRequest("GET", "/api/ui/events");
+  const handled = await handleUiRoute(mockOptions, req, response, "/api/ui/events", 3456);
+  assert.equal(handled, true);
+
+  const out = getOutput();
+  assert.equal(out.statusCode, 200);
+  assert.equal(out.headers["Content-Type"], "text/event-stream");
+  assert.ok(out.body.includes(": connected\n\n"));
+
+  // Trigger a log event
+  recordLog({ level: "info", operation: "sse_test", message: "SSE log message" });
+  const logOut = getOutput().body;
+  assert.ok(logOut.includes("event: log\ndata: {"));
+  assert.ok(logOut.includes("SSE log message"));
+
+  // Trigger a usage event
+  recordTokenUsage({ model: "gpt-6-sol", inputTokens: 42, outputTokens: 12 });
+  const usageOut = getOutput().body;
+  assert.ok(usageOut.includes("event: usage\ndata: {"));
+  assert.ok(usageOut.includes("totalRequests"));
+
+  // Trigger a log clear event
+  clearLogs();
+  const clearOut = getOutput().body;
+  assert.ok(clearOut.includes("event: log_clear\ndata: {}\n\n"));
+
+  // Simulate client disconnect to verify cleanup doesn't error
+  (req as unknown as { emit: (ev: string) => void }).emit("close");
+});
+
+type StatusResponse = {
+  provider: { active: string };
+  tierMapping: { current: TierModels; custom: boolean; defaults: TierModels; models: { slug: string; displayName: string }[] };
+};
+
+test("switching provider updates tier mapping and saves per-provider independently", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex2cc-tier-provider-"));
+  const filePath = join(directory, "tier-models.json");
+  const tierStore = TierModelStore.open(filePath, {});
+  const options: GatewayOptions = { ...mockOptions, tierStore };
+
+  try {
+    // 1. Initial status is codex with DEFAULT_TIER_MODELS
+    const initialStatus = getStatus(options, 3456) as unknown as StatusResponse;
+    assert.equal(initialStatus.provider.active, "codex");
+    assert.deepEqual(initialStatus.tierMapping.current, DEFAULT_TIER_MODELS);
+
+    // 2. Switch provider to antigravity via /api/ui/provider
+    const switchRes = createMockResponse();
+    await handleUiRoute(
+      options,
+      createMockRequest("POST", "/api/ui/provider", { provider: "antigravity" }),
+      switchRes.response,
+      "/api/ui/provider",
+      3456,
+    );
+    assert.equal(switchRes.getOutput().statusCode, 200);
+
+    // 3. Status now reflects antigravity mapping
+    const antStatus = getStatus(options, 3456) as unknown as StatusResponse;
+    assert.equal(antStatus.provider.active, "antigravity");
+    assert.deepEqual(antStatus.tierMapping.current, ANTIGRAVITY_TIER_MODELS);
+    assert.equal(antStatus.tierMapping.custom, false);
+
+    // 4. Save custom antigravity mapping
+    const customAntTiers = {
+      fable: "claude-sonnet-4-6",
+      opus: "claude-opus-4-6-thinking",
+      sonnet: "gemini-3.1-pro-high",
+      haiku: "gemini-3.8-flash-high",
+    };
+    const saveAntRes = createMockResponse();
+    await handleUiRoute(
+      options,
+      createMockRequest("POST", "/api/ui/tiers", { tiers: customAntTiers }),
+      saveAntRes.response,
+      "/api/ui/tiers",
+      3456,
+    );
+    assert.equal(saveAntRes.getOutput().statusCode, 200);
+    assert.deepEqual(tierStore.current("antigravity"), customAntTiers);
+    assert.equal(tierStore.isCustom("antigravity"), true);
+
+    // 5. Switch back to codex and verify codex tiers remained DEFAULT_TIER_MODELS and uncustomized
+    const switchBackRes = createMockResponse();
+    await handleUiRoute(
+      options,
+      createMockRequest("POST", "/api/ui/provider", { provider: "codex" }),
+      switchBackRes.response,
+      "/api/ui/provider",
+      3456,
+    );
+    assert.equal(switchBackRes.getOutput().statusCode, 200);
+    const codexStatus = getStatus(options, 3456) as unknown as StatusResponse;
+    assert.equal(codexStatus.provider.active, "codex");
+    assert.deepEqual(codexStatus.tierMapping.current, DEFAULT_TIER_MODELS);
+    assert.equal(codexStatus.tierMapping.custom, false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("unified settings.json persists provider, effort, and per-provider model mappings together", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex2cc-unified-settings-"));
+  const filePath = join(directory, "settings.json");
+  const store = TierModelStore.open(filePath, {});
+  const options: GatewayOptions = { ...mockOptions, tierStore: store };
+
+  try {
+    // Save settings with custom effort and mappings
+    const tiers = {
+      fable: "gpt-6-sol",
+      opus: "gpt-6.1-sol",
+      sonnet: "gpt-6.1-sol",
+      haiku: "gpt-6-sol",
+    };
+    const res = createMockResponse();
+    await handleUiRoute(
+      options,
+      createMockRequest("POST", "/api/ui/tiers", { tiers, effort: "high" }),
+      res.response,
+      "/api/ui/tiers",
+      3456,
+    );
+    assert.equal(res.getOutput().statusCode, 200);
+
+    // Verify stored JSON has unified schema
+    const savedJson = JSON.parse(readFileSync(filePath, "utf8")) as {
+      version: number;
+      provider?: string;
+      effort?: string;
+      mappings?: { codex?: typeof tiers; antigravity?: typeof tiers };
+    };
+    assert.equal(savedJson.version, 1);
+    assert.equal(savedJson.effort, "high");
+    assert.equal(store.getEffort(), "high");
+
+    // Verify status returns effort
+    const status = getStatus(options, 3456) as unknown as StatusResponse & { tierMapping: { effort: string } };
+    assert.equal(status.tierMapping.effort, "high");
+
+    // Verify a fresh store instance reloads the saved effort and mappings from settings.json
+    const reloaded = TierModelStore.open(filePath, {});
+    assert.equal(reloaded.getEffort(), "high");
+    assert.deepEqual(reloaded.current("codex"), tiers);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+
 

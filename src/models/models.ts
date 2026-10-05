@@ -1,3 +1,5 @@
+export type ProviderType = "codex" | "antigravity";
+
 export type Tier = "fable" | "opus" | "sonnet" | "haiku";
 export type TierModels = Readonly<Record<Tier, string>>;
 
@@ -7,6 +9,47 @@ export const DEFAULT_TIER_MODELS: TierModels = {
   sonnet: "gpt-6-sol",
   haiku: "gpt-6-luna",
 };
+
+export const ANTIGRAVITY_TIER_MODELS: TierModels = {
+  fable: "gemini-3.8-flash-high",
+  opus: "claude-opus-4-6-thinking",
+  sonnet: "claude-sonnet-4-6",
+  haiku: "gemini-3.8-flash-low",
+};
+
+export const ANTIGRAVITY_DEFAULT_MODEL = "claude-sonnet-4-6";
+
+export type ModelCatalogItem = {
+  readonly slug: string;
+  readonly displayName: string;
+  readonly contextWindow?: number;
+};
+
+/** Mirrors the output of `agy models`; keep in sync when Antigravity adds or retires models. */
+export const ANTIGRAVITY_MODELS: readonly ModelCatalogItem[] = [
+  { slug: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6 (Thinking)", contextWindow: 200_000 },
+  { slug: "claude-opus-4-6-thinking", displayName: "Claude Opus 4.6 (Thinking)", contextWindow: 200_000 },
+  { slug: "gemini-3.8-flash-high", displayName: "Gemini 3.8 Flash (High)", contextWindow: 1_000_000 },
+  { slug: "gemini-3.8-flash-medium", displayName: "Gemini 3.8 Flash (Medium)", contextWindow: 1_000_000 },
+  { slug: "gemini-3.8-flash-low", displayName: "Gemini 3.8 Flash (Low)", contextWindow: 1_000_000 },
+  { slug: "gemini-3.7-flash-high", displayName: "Gemini 3.7 Flash (High)", contextWindow: 1_000_000 },
+  { slug: "gemini-3.7-flash-medium", displayName: "Gemini 3.7 Flash (Medium)", contextWindow: 1_000_000 },
+  { slug: "gemini-3.7-flash-low", displayName: "Gemini 3.7 Flash (Low)", contextWindow: 1_000_000 },
+  { slug: "gemini-3.6-flash-high", displayName: "Gemini 3.6 Flash (High)", contextWindow: 1_000_000 },
+  { slug: "gemini-3.6-flash-medium", displayName: "Gemini 3.6 Flash (Medium)", contextWindow: 1_000_000 },
+  { slug: "gemini-3.6-flash-low", displayName: "Gemini 3.6 Flash (Low)", contextWindow: 1_000_000 },
+  { slug: "gemini-3.1-pro-high", displayName: "Gemini 3.1 Pro (High)", contextWindow: 2_000_000 },
+  { slug: "gemini-3.1-pro-low", displayName: "Gemini 3.1 Pro (Low)", contextWindow: 2_000_000 },
+  { slug: "gpt-oss-120b-medium", displayName: "GPT-OSS 120B (Medium)", contextWindow: 128_000 },
+];
+
+/** Catalog shown while no ChatGPT session exists, so the control panel can still render tier mappings. */
+export const OFFLINE_CODEX_MODELS: readonly ModelCatalogItem[] = [
+  { slug: "gpt-6-astra", displayName: "ChatGPT Fable Tier (gpt-6-astra)" },
+  { slug: "gpt-6-sol", displayName: "ChatGPT Sonnet Tier (gpt-6-sol)" },
+  { slug: "gpt-6.1-sol", displayName: "ChatGPT Opus Tier (gpt-6.1-sol)" },
+  { slug: "gpt-6-luna", displayName: "ChatGPT Haiku Tier (gpt-6-luna)" },
+];
 
 export const CLAUDE_GATEWAY_MODELS = [
   { id: "claude-sonnet-5-5", tier: "sonnet" },

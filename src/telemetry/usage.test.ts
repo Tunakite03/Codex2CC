@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { enableUsagePersistence, getTokenUsageStats, recordTokenUsage, resetTokenUsage } from "./usage.js";
+import { enableUsagePersistence, getTokenUsageStats, onUsageUpdated, recordTokenUsage, resetTokenUsage } from "./usage.js";
 
 test("usage tracker aggregates token usage by model and overall statistics", () => {
   resetTokenUsage();
@@ -112,4 +112,23 @@ test("usage tracker persists counters across restarts and quarantines corrupt fi
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("onUsageUpdated notifies subscribers on token recording and resets", () => {
+  resetTokenUsage();
+  const totals: number[] = [];
+
+  const unsubscribe = onUsageUpdated((summary) => {
+    totals.push(summary.grandTotalTokens);
+  });
+
+  recordTokenUsage({ model: "gpt-6-sol", inputTokens: 50, outputTokens: 20 });
+  recordTokenUsage({ model: "gpt-6-sol", inputTokens: 10, outputTokens: 5 });
+  resetTokenUsage();
+
+  assert.deepEqual(totals, [70, 85, 0]);
+
+  unsubscribe();
+  recordTokenUsage({ model: "gpt-6-sol", inputTokens: 100, outputTokens: 50 });
+  assert.deepEqual(totals, [70, 85, 0]);
 });

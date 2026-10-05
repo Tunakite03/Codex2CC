@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import { resolveProjectRoot } from "./logger.js";
+import { resolveDataDir } from "./logger.js";
 
 export type ModelUsage = {
   readonly model: string;
@@ -32,6 +32,28 @@ type ModelUsageState = {
 
 const usageStore = new Map<string, ModelUsageState>();
 
+export type UsageSubscriber = (summary: TokenUsageSummary) => void;
+const usageSubscribers = new Set<UsageSubscriber>();
+
+export function onUsageUpdated(subscriber: UsageSubscriber): () => void {
+  usageSubscribers.add(subscriber);
+  return () => {
+    usageSubscribers.delete(subscriber);
+  };
+}
+
+function notifyUsageSubscribers(): void {
+  if (usageSubscribers.size === 0) return;
+  const summary = getTokenUsageStats();
+  for (const subscriber of usageSubscribers) {
+    try {
+      subscriber(summary);
+    } catch {
+      // Ignore subscriber failures to maintain usage tracker resilience
+    }
+  }
+}
+
 const persistedUsageSchema = z.object({
   version: z.literal(1),
   models: z.record(
@@ -49,12 +71,12 @@ const persistedUsageSchema = z.object({
 let usageFilePath: string | null = null;
 
 /**
- * Resolves the usage persistence file (CODEX2CC_USAGE_FILE, else <project>/logs/usage.json).
+ * Resolves the usage persistence file (CODEX2CC_USAGE_FILE, else <data dir>/logs/usage.json).
  */
 export function resolveUsageFilePath(env: NodeJS.ProcessEnv = process.env): string {
   const custom = env.CODEX2CC_USAGE_FILE?.trim();
   if (custom && custom.length > 0) return resolve(custom);
-  return join(resolveProjectRoot(), "logs", "usage.json");
+  return join(resolveDataDir(env), "logs", "usage.json");
 }
 
 function writeWarning(operation: string, message: string, path: string): void {
@@ -127,6 +149,7 @@ export function recordTokenUsage(params: {
     });
   }
   saveUsage();
+  notifyUsageSubscribers();
 }
 
 /**
@@ -178,4 +201,5 @@ export function getTokenUsageStats(): TokenUsageSummary {
 export function resetTokenUsage(): void {
   usageStore.clear();
   saveUsage();
+  notifyUsageSubscribers();
 }

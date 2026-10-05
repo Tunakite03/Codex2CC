@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, truncateSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export type LogLevel = "info" | "warn" | "error";
@@ -33,6 +34,26 @@ const MAX_LOG_ENTRIES = 500;
 let nextLogId = 1;
 const logStore: LogEntry[] = [];
 
+export type LogSubscriber = (entry: LogEntry) => void;
+export type LogClearSubscriber = () => void;
+
+const logSubscribers = new Set<LogSubscriber>();
+const logClearSubscribers = new Set<LogClearSubscriber>();
+
+export function onLog(subscriber: LogSubscriber): () => void {
+  logSubscribers.add(subscriber);
+  return () => {
+    logSubscribers.delete(subscriber);
+  };
+}
+
+export function onLogsCleared(subscriber: LogClearSubscriber): () => void {
+  logClearSubscribers.add(subscriber);
+  return () => {
+    logClearSubscribers.delete(subscriber);
+  };
+}
+
 /**
  * Resolves the root directory of the Codex2CC project workspace.
  */
@@ -48,14 +69,27 @@ export function resolveProjectRoot(): string {
 }
 
 /**
- * Determines the target log file path in the project (or from CODEX2CC_LOG_FILE env).
+ * Directory that holds the `logs/` folder (log, settings and usage files). Precedence:
+ * CODEX2CC_HOME, then `~/.codex2cc` when running from an installed package (inside a
+ * `node_modules` directory), else the project root of a source checkout.
+ */
+export function resolveDataDir(env: NodeJS.ProcessEnv = process.env): string {
+  const custom = env.CODEX2CC_HOME?.trim();
+  if (custom && custom.length > 0) return resolve(custom);
+  const root = resolveProjectRoot();
+  if (root.split(sep).includes("node_modules")) return join(homedir(), ".codex2cc");
+  return root;
+}
+
+/**
+ * Determines the target log file path (CODEX2CC_LOG_FILE, else `<data dir>/logs/codex2cc.log`).
  */
 export function resolveLogFilePath(env: NodeJS.ProcessEnv = process.env): string {
   const custom = env.CODEX2CC_LOG_FILE?.trim();
   if (custom && custom.length > 0) {
     return resolve(custom);
   }
-  return join(resolveProjectRoot(), "logs", "codex2cc.log");
+  return join(resolveDataDir(env), "logs", "codex2cc.log");
 }
 
 let customLogFilePath: string | null | undefined = undefined;
@@ -125,6 +159,14 @@ export function recordLog(entry: {
   }
 
   appendLogToFile(item);
+
+  for (const subscriber of logSubscribers) {
+    try {
+      subscriber(item);
+    } catch {
+      // Ignore subscriber failures to maintain logger resilience
+    }
+  }
 
   return item;
 }
@@ -202,6 +244,14 @@ export function clearLogs(options?: { readonly clearFile?: boolean }): void {
       } catch {
         // Non-fatal if truncate fails
       }
+    }
+  }
+
+  for (const subscriber of logClearSubscribers) {
+    try {
+      subscriber();
+    } catch {
+      // Ignore subscriber failures
     }
   }
 }
