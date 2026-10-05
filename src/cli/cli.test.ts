@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BridgeError } from "./bridge.js";
+import { BridgeError } from "../bridge/bridge.js";
 import { DEFAULT_PORT, parseCli, standalonePolicy } from "./cli.js";
 
 test("parseCli gives --help precedence, then --ui, then --list-models, then --serve", () => {

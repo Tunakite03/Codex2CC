@@ -10,13 +10,14 @@ import {
   toOpenAIRequest,
   unsupportedBlockTypes,
   unsupportedToolNames,
-} from "./bridge.js";
+} from "../bridge/bridge.js";
 import { checkClient, checkHost, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
-import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, resolveModel, type TierModels } from "./models.js";
-import { activeTierModels, type TierModelStore } from "./tier-store.js";
-import { handleUiRoute } from "./ui.js";
-import { recordLog } from "./logger.js";
-import { recordTokenUsage } from "./usage.js";
+import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, resolveModel, type TierModels } from "../models/models.js";
+import { activeTierModels, type TierModelStore } from "../models/tier-store.js";
+import { handleUiRoute } from "../ui/ui.js";
+import type { AccountUsageLimits } from "../auth/auth.js";
+import { recordLog } from "../telemetry/logger.js";
+import { recordTokenUsage } from "../telemetry/usage.js";
 
 export const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 
@@ -32,6 +33,7 @@ export type UpstreamSession = {
   /** Returns a token other than `rejected`, refreshing the session when upstream answered 401. */
   refreshAfterRejection(rejected: string): Promise<string>;
   accountId(): string;
+  getUsageLimits?(forceRefresh?: boolean): Promise<AccountUsageLimits | null>;
 };
 
 export type GatewayOptions = {

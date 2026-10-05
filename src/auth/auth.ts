@@ -3,7 +3,7 @@ import { chmod, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { BridgeError } from "./bridge.js";
+import { BridgeError } from "../bridge/bridge.js";
 
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_CLIENT_VERSION = "0.159.0";
@@ -52,6 +52,40 @@ const ModelsApiResponse = z.object({
     context_window: z.number().int().positive().optional(),
   })),
 });
+
+export type UsageWindowLimit = {
+  readonly usedPercent: number;
+  readonly remainingPercent: number;
+  readonly limitWindowSeconds: number;
+  readonly resetAfterSeconds: number;
+  readonly resetAt: number;
+};
+
+export type AccountUsageLimits = {
+  readonly planType: string;
+  readonly allowed: boolean;
+  readonly limitReached: boolean;
+  readonly primaryWindow: UsageWindowLimit | null;
+  readonly secondaryWindow: UsageWindowLimit | null;
+  readonly lastUpdated: string;
+};
+
+const WhamUsageWindowSchema = z.object({
+  used_percent: z.number(),
+  limit_window_seconds: z.number().int().nonnegative().optional(),
+  reset_after_seconds: z.number().int().nonnegative().optional(),
+  reset_at: z.number().int().nonnegative().optional(),
+}).passthrough();
+
+const WhamUsageResponseSchema = z.object({
+  plan_type: z.string().optional(),
+  rate_limit: z.object({
+    allowed: z.boolean().optional(),
+    limit_reached: z.boolean().optional(),
+    primary_window: WhamUsageWindowSchema.nullable().optional(),
+    secondary_window: WhamUsageWindowSchema.nullable().optional(),
+  }).passthrough().optional(),
+}).passthrough();
 
 type Tokens = { access_token: string; refresh_token: string; id_token: string; account_id?: string | undefined };
 type AuthDocument = { readonly document: Record<string, unknown>; readonly tokens: Tokens };
@@ -183,6 +217,7 @@ export class ChatGPTSession {
   private pendingRefresh: Promise<string> | undefined;
   private readonly seenRefreshTokens = new Set<string>();
   private lastRefreshAt: number | undefined;
+  private cachedLimits: { limits: AccountUsageLimits; fetchedAt: number } | null = null;
 
   private constructor(
     private readonly options: SessionOptions,
@@ -371,5 +406,65 @@ export class ChatGPTSession {
       { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol" },
       { slug: "gpt-6-luna", displayName: "GPT-6 Luna" },
     ];
+  }
+
+  async getUsageLimits(forceRefresh = false): Promise<AccountUsageLimits | null> {
+    const now = Date.now();
+    if (!forceRefresh && this.cachedLimits && now - this.cachedLimits.fetchedAt < 15_000) {
+      return this.cachedLimits.limits;
+    }
+
+    try {
+      const response = await fetchRetry(
+        `${this.options.backendOrigin}/wham/usage`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${await this.accessToken()}`,
+            "ChatGPT-Account-Id": this.accountIdValue,
+            "User-Agent": `codex-cli/${CODEX_CLIENT_VERSION}`,
+            Accept: "application/json",
+          },
+        },
+        "account usage quota discovery",
+      );
+
+      if (response.ok) {
+        const json = await response.json();
+        const parsed = WhamUsageResponseSchema.safeParse(json);
+        if (parsed.success && parsed.data.rate_limit) {
+          const rl = parsed.data.rate_limit;
+          const mapWindow = (win?: z.infer<typeof WhamUsageWindowSchema> | null): UsageWindowLimit | null => {
+            if (!win || typeof win.used_percent !== "number" || Number.isNaN(win.used_percent)) return null;
+            const used = Math.max(0, Math.min(100, Math.round(win.used_percent)));
+            const resetAfter = win.reset_after_seconds ?? 0;
+            const resetAt = win.reset_at ?? Math.floor((now + resetAfter * 1000) / 1000);
+            return {
+              usedPercent: used,
+              remainingPercent: Math.max(0, 100 - used),
+              limitWindowSeconds: win.limit_window_seconds ?? 0,
+              resetAfterSeconds: resetAfter,
+              resetAt,
+            };
+          };
+
+          const limits: AccountUsageLimits = {
+            planType: parsed.data.plan_type ?? "standard",
+            allowed: rl.allowed ?? true,
+            limitReached: rl.limit_reached ?? false,
+            primaryWindow: mapWindow(rl.primary_window),
+            secondaryWindow: mapWindow(rl.secondary_window),
+            lastUpdated: new Date().toISOString(),
+          };
+
+          this.cachedLimits = { limits, fetchedAt: now };
+          return limits;
+        }
+      }
+    } catch (error) {
+      warn("account_usage_limits", { message: error instanceof Error ? error.message : String(error) });
+    }
+
+    return this.cachedLimits?.limits ?? null;
   }
 }

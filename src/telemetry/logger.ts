@@ -37,8 +37,14 @@ const logStore: LogEntry[] = [];
  * Resolves the root directory of the Codex2CC project workspace.
  */
 export function resolveProjectRoot(): string {
-  const currentDir = dirname(fileURLToPath(import.meta.url));
-  return resolve(currentDir, "..");
+  let dir = dirname(fileURLToPath(import.meta.url));
+  while (dir !== dirname(dir)) {
+    if (existsSync(join(dir, "package.json"))) {
+      return dir;
+    }
+    dir = dirname(dir);
+  }
+  return process.cwd();
 }
 
 /**

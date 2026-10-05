@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { ChatGPTSession } from "./auth.js";
-import { BridgeError } from "./bridge.js";
-import { parseCli, standalonePolicy, USAGE } from "./cli.js";
-import { createGatewayServer, listenOnLoopback, type ModelInfo } from "./gateway.js";
-import { getActiveLogFilePath } from "./logger.js";
-import { tierModel } from "./models.js";
-import { resolveTierFilePath, TierModelStore } from "./tier-store.js";
-import type { GuardPolicy } from "./guard.js";
-import { enableUsagePersistence, resolveUsageFilePath } from "./usage.js";
+import { ChatGPTSession } from "./auth/auth.js";
+import { BridgeError } from "./bridge/bridge.js";
+import { parseCli, standalonePolicy, USAGE } from "./cli/cli.js";
+import { createGatewayServer, listenOnLoopback, type ModelInfo } from "./gateway/gateway.js";
+import { getActiveLogFilePath } from "./telemetry/logger.js";
+import { tierModel } from "./models/models.js";
+import { resolveTierFilePath, TierModelStore } from "./models/tier-store.js";
+import type { GuardPolicy } from "./gateway/guard.js";
+import { enableUsagePersistence, resolveUsageFilePath } from "./telemetry/usage.js";
 
 async function serveStandalone(
   session: ChatGPTSession,
@@ -112,8 +112,8 @@ async function main(): Promise<void> {
   enableUsagePersistence(resolveUsageFilePath());
 
   if (command.kind === "ui") {
-    const { openBrowser } = await import("./ui.js");
-    const { configuredGatewayToken } = await import("./config-setup.js");
+    const { openBrowser } = await import("./ui/ui.js");
+    const { configuredGatewayToken } = await import("./config/config-setup.js");
     let session: ChatGPTSession | undefined;
     let models: ModelInfo[] = [];
 
@@ -174,7 +174,7 @@ async function main(): Promise<void> {
   }
 
   if (command.kind === "reset-config") {
-    const { resetConfig } = await import("./config-setup.js");
+    const { resetConfig } = await import("./config/config-setup.js");
     const result = resetConfig(command.target);
     process.stdout.write(`\n🧹 Codex2CC Configuration Reset Complete!\n`);
     if (result.cliReset) process.stdout.write(`   ✓ Claude Code CLI config cleaned (~/.claude/settings.json, ~/.claude.json)\n`);
@@ -188,7 +188,7 @@ async function main(): Promise<void> {
   }
 
   if (command.kind === "setup") {
-    const { setupConfig } = await import("./config-setup.js");
+    const { setupConfig } = await import("./config/config-setup.js");
     const tiers = TierModelStore.open(resolveTierFilePath(process.env), process.env).current();
     let availableModels: string[] | undefined;
     let selectedModel = command.model;
@@ -261,7 +261,7 @@ async function main(): Promise<void> {
   }
 
   if (command.kind === "serve") {
-    const { configuredGatewayToken } = await import("./config-setup.js");
+    const { configuredGatewayToken } = await import("./config/config-setup.js");
     const policy = command.noAuth
       ? standalonePolicy(true, undefined)
       : standalonePolicy(false, process.env.CODEX2CC_TOKEN ?? configuredGatewayToken(`http://127.0.0.1:${command.port}`));

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { BridgeError } from "./bridge.js";
+import { BridgeError } from "../bridge/bridge.js";
 import {
   CODEX2CC_DESKTOP_CONFIG_ID,
   configuredGatewayToken,

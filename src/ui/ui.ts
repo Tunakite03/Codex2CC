@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
-import { BridgeError } from "./bridge.js";
+import { BridgeError } from "../bridge/bridge.js";
 import {
   CODEX2CC_DESKTOP_CONFIG_ID,
   resetConfig,
@@ -10,12 +10,13 @@ import {
   setupConfig,
   validateGatewayUrl,
   type SetupTarget,
-} from "./config-setup.js";
-import type { GatewayOptions } from "./gateway.js";
-import { DEFAULT_TIER_MODELS } from "./models.js";
-import { activeTierModels, parseTierModels } from "./tier-store.js";
-import { clearLogs, getActiveLogFilePath, getLogs, getLogStats, recordLog, type LogLevel } from "./logger.js";
-import { getTokenUsageStats, resetTokenUsage } from "./usage.js";
+} from "../config/config-setup.js";
+import type { GatewayOptions } from "../gateway/gateway.js";
+import { DEFAULT_TIER_MODELS } from "../models/models.js";
+import { activeTierModels, parseTierModels } from "../models/tier-store.js";
+import { clearLogs, getActiveLogFilePath, getLogs, getLogStats, recordLog, type LogLevel } from "../telemetry/logger.js";
+import type { AccountUsageLimits } from "../auth/auth.js";
+import { getTokenUsageStats, resetTokenUsage } from "../telemetry/usage.js";
 
 export function openBrowser(url: string): void {
   const plat = process.platform;
@@ -193,9 +194,19 @@ export async function handleUiRoute(
   }
 
   if (pathname === "/api/ui/usage" && request.method === "GET") {
+    const parsedUrl = new URL(request.url ?? "/api/ui/usage", `http://127.0.0.1:${port}`);
+    const forceRefresh = parsedUrl.searchParams.get("refresh") === "true";
     const usage = getTokenUsageStats();
+    let limits: AccountUsageLimits | null = null;
+    if (typeof options.session.getUsageLimits === "function") {
+      try {
+        limits = await options.session.getUsageLimits(forceRefresh);
+      } catch {
+        limits = null;
+      }
+    }
     response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(JSON.stringify(usage));
+    response.end(JSON.stringify({ ...usage, limits }));
     return true;
   }
 
@@ -933,6 +944,150 @@ export function renderDashboardHtml(): string {
       border-top: 1px solid var(--border-subtle);
     }
 
+    /* Account Quota & Usage Remaining (5h & Weekly) */
+    .quota-limits-section {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      background: var(--surface-soft);
+      border: 1.5px solid var(--line);
+      border-radius: 0.75rem 0.65rem 0.8rem 0.7rem;
+      padding: 0.85rem 1rem;
+    }
+    .quota-limits-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      border-bottom: 1px solid var(--line-soft);
+      padding-bottom: 0.5rem;
+    }
+    .quota-header-left {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+    .quota-section-title {
+      font-family: var(--font-display);
+      font-size: 0.875rem;
+      font-weight: 700;
+      color: var(--ink);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .quota-plan-badge {
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      font-weight: 700;
+      background: #fff8df;
+      color: var(--ink);
+      border: 1.5px solid var(--line);
+      border-radius: 9999px;
+      padding: 0.15rem 0.55rem;
+      text-transform: capitalize;
+    }
+    .quota-status-text {
+      font-size: 0.75rem;
+      color: var(--muted-foreground);
+    }
+    .quota-limits-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 0.85rem;
+    }
+    @media (max-width: 640px) {
+      .quota-limits-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    .quota-card {
+      background: var(--card);
+      border: 1.5px solid var(--line);
+      border-radius: 0.65rem 0.55rem 0.7rem 0.6rem;
+      padding: 0.75rem 0.9rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      box-shadow: 2px 2px 0 var(--paper-deep);
+    }
+    .quota-card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 0.5rem;
+    }
+    .quota-card-title-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.1rem;
+    }
+    .quota-window-name {
+      font-family: var(--font-display);
+      font-size: 0.875rem;
+      font-weight: 700;
+      color: var(--foreground);
+    }
+    .quota-window-type {
+      font-size: 0.7rem;
+      color: var(--muted-foreground);
+    }
+    .quota-percent-group {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+    }
+    .quota-remaining-val {
+      font-family: var(--font-mono);
+      font-size: 1.25rem;
+      font-weight: 800;
+      line-height: 1.1;
+      color: var(--primary);
+    }
+    .quota-remaining-label {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted-foreground);
+      font-weight: 600;
+    }
+    .quota-bar-track {
+      width: 100%;
+      height: 0.55rem;
+      background: var(--paper-deep);
+      border: 1px solid var(--line-soft);
+      border-radius: 9999px;
+      overflow: hidden;
+    }
+    .quota-bar-fill {
+      height: 100%;
+      border-radius: 9999px;
+      transition: width 0.35s ease, background-color 0.35s ease;
+      background-color: var(--primary);
+    }
+    .quota-card-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.75rem;
+      color: var(--muted-foreground);
+      border-top: 1px dashed var(--border-subtle);
+      padding-top: 0.4rem;
+    }
+    .quota-card-meta strong {
+      font-family: var(--font-mono);
+      color: var(--foreground);
+      font-weight: 600;
+    }
+    .quota-meta-item {
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+    .quota-meta-right {
+      justify-content: flex-end;
+    }
+
     /* Usage Stats Strip */
     .usage-metrics {
       display: grid;
@@ -1483,11 +1638,82 @@ export function renderDashboardHtml(): string {
         <div class="card-header">
           <h2 class="card-title" id="usage-title">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
-            Token usage
+            Token usage & quota limits
           </h2>
           <div class="logs-controls">
-            <button class="btn btn-secondary btn-sm" id="btn-refresh-usage" type="button" title="Refresh token usage">Refresh</button>
+            <button class="btn btn-secondary btn-sm" id="btn-refresh-usage" type="button" title="Refresh token usage & limits">Refresh</button>
             <button class="btn btn-secondary btn-sm" id="btn-reset-usage" type="button" title="Reset token usage counters">Reset counters</button>
+          </div>
+        </div>
+
+        <!-- Account Quota & Remaining Limits (5h & Weekly) -->
+        <div class="quota-limits-section" id="quota-limits-section">
+          <div class="quota-limits-header">
+            <div class="quota-header-left">
+              <span class="quota-section-title">Usage remaining</span>
+              <span class="quota-plan-badge" id="quota-plan-badge">Account limits</span>
+            </div>
+            <span class="quota-status-text" id="quota-status-text">Synchronized with ChatGPT account</span>
+          </div>
+
+          <div class="quota-limits-grid">
+            <!-- 5-Hour Window -->
+            <div class="quota-card" id="card-quota-5h">
+              <div class="quota-card-top">
+                <div class="quota-card-title-group">
+                  <span class="quota-window-name">5-hour window</span>
+                  <span class="quota-window-sub">Rolling session quota</span>
+                </div>
+                <div class="quota-percent-group">
+                  <span class="quota-remaining-val" id="val-5h-remaining">--%</span>
+                  <span class="quota-remaining-label">remaining</span>
+                </div>
+              </div>
+
+              <div class="quota-bar-track">
+                <div class="quota-bar-fill" id="bar-5h" style="width: 0%;"></div>
+              </div>
+
+              <div class="quota-card-meta">
+                <div class="quota-meta-item">
+                  <span class="quota-meta-label">Used:</span>
+                  <strong id="val-5h-used">--%</strong>
+                </div>
+                <div class="quota-meta-item quota-meta-right">
+                  <span class="quota-meta-label">Resets in:</span>
+                  <strong id="val-5h-reset">--</strong>
+                </div>
+              </div>
+            </div>
+
+            <!-- Weekly Allowance -->
+            <div class="quota-card" id="card-quota-weekly">
+              <div class="quota-card-top">
+                <div class="quota-card-title-group">
+                  <span class="quota-window-name">Weekly allowance</span>
+                  <span class="quota-window-sub">7-day capacity limit</span>
+                </div>
+                <div class="quota-percent-group">
+                  <span class="quota-remaining-val" id="val-weekly-remaining">--%</span>
+                  <span class="quota-remaining-label">remaining</span>
+                </div>
+              </div>
+
+              <div class="quota-bar-track">
+                <div class="quota-bar-fill" id="bar-weekly" style="width: 0%;"></div>
+              </div>
+
+              <div class="quota-card-meta">
+                <div class="quota-meta-item">
+                  <span class="quota-meta-label">Used:</span>
+                  <strong id="val-weekly-used">--%</strong>
+                </div>
+                <div class="quota-meta-item quota-meta-right">
+                  <span class="quota-meta-label">Resets in:</span>
+                  <strong id="val-weekly-reset">--</strong>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1658,6 +1884,9 @@ export function renderDashboardHtml(): string {
           localStorage.setItem("codex2cc_tab", tabId);
           history.replaceState(null, "", "#" + tabId.replace("tab-", ""));
         } catch {}
+        if (tabId === "tab-usage") {
+          fetchUsage();
+        }
       }
 
       tabs.forEach(tab => {
@@ -2015,9 +2244,75 @@ export function renderDashboardHtml(): string {
       return (Number(n) || 0).toLocaleString();
     }
 
-    async function fetchUsage() {
+    function formatDuration(seconds) {
+      if (typeof seconds !== "number" || isNaN(seconds) || seconds < 0) return "--";
+      if (seconds < 60) return seconds + "s";
+      const mins = Math.floor(seconds / 60);
+      if (mins < 60) return mins + "m";
+      const hours = Math.floor(mins / 60);
+      const remMins = mins % 60;
+      if (hours < 24) return hours + "h " + (remMins > 0 ? remMins + "m" : "");
+      const days = Math.floor(hours / 24);
+      const remHours = hours % 24;
+      return days + "d " + (remHours > 0 ? remHours + "h" : "");
+    }
+
+    function renderQuotaWindow(prefix, win) {
+      const remEl = document.getElementById("val-" + prefix + "-remaining");
+      const usedEl = document.getElementById("val-" + prefix + "-used");
+      const resetEl = document.getElementById("val-" + prefix + "-reset");
+      const barEl = document.getElementById("bar-" + prefix);
+
+      if (!win) {
+        if (remEl) { remEl.textContent = "--%"; remEl.style.color = "var(--muted-foreground)"; }
+        if (usedEl) usedEl.textContent = "--%";
+        if (resetEl) { resetEl.textContent = "--"; resetEl.removeAttribute("title"); }
+        if (barEl) barEl.style.width = "0%";
+        return;
+      }
+
+      const rem = Math.max(0, Math.min(100, Math.round(win.remainingPercent !== undefined ? win.remainingPercent : (100 - win.usedPercent))));
+      const used = Math.max(0, Math.min(100, Math.round(win.usedPercent)));
+
+      if (remEl) {
+        remEl.textContent = rem + "%";
+        if (rem <= 15) {
+          remEl.style.color = "var(--coral-dark)";
+        } else if (rem <= 35) {
+          remEl.style.color = "#b45309";
+        } else {
+          remEl.style.color = "var(--primary)";
+        }
+      }
+
+      if (usedEl) usedEl.textContent = used + "%";
+
+      if (resetEl) {
+        resetEl.textContent = formatDuration(win.resetAfterSeconds);
+        if (win.resetAt) {
+          try {
+            const date = new Date(win.resetAt * 1000);
+            resetEl.title = "Resets at " + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + " on " + date.toLocaleDateString();
+          } catch {}
+        }
+      }
+
+      if (barEl) {
+        barEl.style.width = rem + "%";
+        if (rem <= 15) {
+          barEl.style.backgroundColor = "var(--coral)";
+        } else if (rem <= 35) {
+          barEl.style.backgroundColor = "#f59e0b";
+        } else {
+          barEl.style.backgroundColor = "var(--primary)";
+        }
+      }
+    }
+
+    async function fetchUsage(refresh = false) {
       try {
-        const res = await fetch("/api/ui/usage");
+        const url = refresh ? "/api/ui/usage?refresh=true" : "/api/ui/usage";
+        const res = await fetch(url);
         if (!res.ok) return;
         const data = await res.json();
         renderUsage(data);
@@ -2033,6 +2328,32 @@ export function renderDashboardHtml(): string {
       document.getElementById("val-input-tokens").textContent = fmt(data.totalInputTokens);
       document.getElementById("val-output-tokens").textContent = fmt(data.totalOutputTokens);
       document.getElementById("val-cached-tokens").textContent = fmt(data.totalCachedTokens);
+
+      const limits = data.limits;
+      const planBadge = document.getElementById("quota-plan-badge");
+      const statusText = document.getElementById("quota-status-text");
+
+      if (limits) {
+        if (planBadge) {
+          const planStr = limits.planType ? (limits.planType.charAt(0).toUpperCase() + limits.planType.slice(1)) + " plan" : "Active";
+          planBadge.textContent = planStr;
+        }
+        if (statusText) {
+          if (limits.limitReached) {
+            statusText.innerHTML = '<span style="color:var(--coral-dark);font-weight:700;">Rate limit reached</span>';
+          } else {
+            statusText.textContent = limits.allowed ? "Allowed — Quota active" : "Usage paused";
+          }
+        }
+        renderQuotaWindow("5h", limits.primaryWindow);
+        renderQuotaWindow("weekly", limits.secondaryWindow);
+      } else {
+        if (statusText) {
+          statusText.textContent = "Rate limits not available in current session";
+        }
+        renderQuotaWindow("5h", null);
+        renderQuotaWindow("weekly", null);
+      }
 
       const tabBadge = document.getElementById("tab-badge-tokens");
       if (tabBadge) {
@@ -2076,7 +2397,7 @@ export function renderDashboardHtml(): string {
     }
 
     function setupUsageControls() {
-      document.getElementById("btn-refresh-usage").addEventListener("click", () => fetchUsage());
+      document.getElementById("btn-refresh-usage").addEventListener("click", () => fetchUsage(true));
       document.getElementById("btn-reset-usage").addEventListener("click", async () => {
         if (!confirm("Reset all token usage counters to zero?")) return;
         try {

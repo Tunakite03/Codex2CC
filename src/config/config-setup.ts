@@ -3,9 +3,9 @@ import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import { BridgeError } from "./bridge.js";
-import { MIN_TOKEN_LENGTH } from "./guard.js";
-import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, type TierModels } from "./models.js";
+import { BridgeError } from "../bridge/bridge.js";
+import { MIN_TOKEN_LENGTH } from "../gateway/guard.js";
+import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, type TierModels } from "../models/models.js";
 
 export const CODEX2CC_DESKTOP_CONFIG_ID = "c0d3e2cc-0000-4000-8000-000000000001";
 export const DEFAULT_CONFIG_NAME = "Codex2CC Gateway";

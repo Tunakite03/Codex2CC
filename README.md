@@ -58,6 +58,7 @@ The Control Panel provides:
 - **Claude Tier Model Mapping**: Assigns a ChatGPT account model to each Claude tier (Fable, Opus, Sonnet, and Haiku). Gateway routing updates immediately; mappings persist to `logs/tier-models.json` and apply to future starts. Re-apply client configuration and reload Claude Code sessions to update their saved tier aliases. The dashboard can restore environment-variable or built-in defaults.
 - **Token Usage Summary Table (Bảng Tổng Hợp Token Đã Dùng)**:
   - Tracks total tokens used across models and sessions in real time.
+  - **Account Quota & Usage Remaining (Hạn Mức Còn Lại)**: Real-time visual progress gauges for the **5-Hour Rolling Window** and **Weekly Allowance**, showing percentage remaining, percentage used, reset countdown timer, and reset timestamps.
   - KPI summary metrics: **Total Tokens (Grand Total)**, **Prompt Tokens (Input)**, **Completion Tokens (Output)**, and **Cached Tokens (Read)**.
   - Per-model breakdown with request count, token categories, and usage share percentage (`%`).
   - Dedicated **Refresh** and **Reset Counter** controls.

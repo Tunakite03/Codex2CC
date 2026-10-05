@@ -3,8 +3,8 @@ import { createServer, request as httpRequest, type IncomingHttpHeaders, type In
 import { connect } from "node:net";
 import test from "node:test";
 import { createGatewayServer, listenOnLoopback, type GatewayOptions } from "./gateway.js";
-import { getLogs } from "./logger.js";
-import { getTokenUsageStats, resetTokenUsage } from "./usage.js";
+import { getLogs } from "../telemetry/logger.js";
+import { getTokenUsageStats, resetTokenUsage } from "../telemetry/usage.js";
 
 const TOKEN = "test-token-0123456789";
 const AUTH = { Authorization: `Bearer ${TOKEN}` };

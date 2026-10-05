@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
-import { BridgeError } from "./bridge.js";
-import { MIN_TOKEN_LENGTH, type GuardPolicy } from "./guard.js";
+import { BridgeError } from "../bridge/bridge.js";
+import { MIN_TOKEN_LENGTH, type GuardPolicy } from "../gateway/guard.js";
 
 export const DEFAULT_PORT = 3456;
 

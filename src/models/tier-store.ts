@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import { BridgeError } from "./bridge.js";
-import type { GatewayOptions } from "./gateway.js";
-import { resolveProjectRoot } from "./logger.js";
+import { BridgeError } from "../bridge/bridge.js";
+import type { GatewayOptions } from "../gateway/gateway.js";
+import { resolveProjectRoot } from "../telemetry/logger.js";
 import { DEFAULT_TIER_MODELS, loadTierModels, type TierModels } from "./models.js";
 
 const ModelSlug = z

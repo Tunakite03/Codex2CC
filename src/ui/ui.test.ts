@@ -6,9 +6,9 @@ import { spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import test from "node:test";
-import type { GatewayOptions } from "./gateway.js";
-import { DEFAULT_TIER_MODELS } from "./models.js";
-import { TierModelStore } from "./tier-store.js";
+import type { GatewayOptions } from "../gateway/gateway.js";
+import { DEFAULT_TIER_MODELS } from "../models/models.js";
+import { TierModelStore } from "../models/tier-store.js";
 import { getStatus, handleUiRoute, renderDashboardHtml } from "./ui.js";
 
 function createMockResponse(): { response: ServerResponse; getOutput: () => { statusCode: number; headers: Record<string, string>; body: string } } {
@@ -300,4 +300,63 @@ test("handleUiRoute provides token usage retrieval and reset endpoints", async (
     const data = JSON.parse(out.body);
     assert.equal(data.ok, true);
   }
+
+  // Query usage with account limits (5h & weekly)
+  {
+    let receivedRefreshArg: boolean | undefined;
+    const optionsWithLimits: GatewayOptions = {
+      ...mockOptions,
+      session: {
+        ...mockOptions.session,
+        async getUsageLimits(forceRefresh?: boolean) {
+          receivedRefreshArg = forceRefresh;
+          return {
+            planType: "plus",
+            allowed: true,
+            limitReached: false,
+            primaryWindow: {
+              usedPercent: 45,
+              remainingPercent: 55,
+              limitWindowSeconds: 18000,
+              resetAfterSeconds: 12000,
+              resetAt: 1791189847,
+            },
+            secondaryWindow: {
+              usedPercent: 30,
+              remainingPercent: 70,
+              limitWindowSeconds: 604800,
+              resetAfterSeconds: 420000,
+              resetAt: 1791617223,
+            },
+            lastUpdated: "2026-10-05T00:00:00.000Z",
+          };
+        },
+      },
+    };
+
+    const { response, getOutput } = createMockResponse();
+    const req = createMockRequest("GET", "/api/ui/usage?refresh=true");
+    const handled = await handleUiRoute(optionsWithLimits, req, response, "/api/ui/usage", 3456);
+    assert.equal(handled, true);
+    const out = getOutput();
+    assert.equal(out.statusCode, 200);
+    const data = JSON.parse(out.body);
+    assert.equal(receivedRefreshArg, true);
+    assert.ok(data.limits !== null);
+    assert.equal(data.limits.planType, "plus");
+    assert.equal(data.limits.primaryWindow.remainingPercent, 55);
+    assert.equal(data.limits.secondaryWindow.remainingPercent, 70);
+  }
 });
+
+test("renderDashboardHtml includes 5-hour and weekly usage remaining components", () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="quota-limits-section"'), "quota limits section present");
+  assert.ok(html.includes('id="card-quota-5h"'), "5h quota card present");
+  assert.ok(html.includes('id="card-quota-weekly"'), "weekly quota card present");
+  assert.ok(html.includes('id="val-5h-remaining"'), "5h remaining value placeholder present");
+  assert.ok(html.includes('id="val-weekly-remaining"'), "weekly remaining value placeholder present");
+  assert.ok(html.includes('id="bar-5h"'), "5h progress bar present");
+  assert.ok(html.includes('id="bar-weekly"'), "weekly progress bar present");
+});
+

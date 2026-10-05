@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ChatGPTSession, type SessionOptions } from "./auth.js";
-import { BridgeError } from "./bridge.js";
+import { BridgeError } from "../bridge/bridge.js";
 
 const HOUR_MS = 3_600_000;
 
@@ -31,6 +31,7 @@ type FakeServer = {
   refreshBodies: URLSearchParams[];
   onRefresh: (handler: (response: ServerResponse) => Promise<void> | void) => void;
   onModels: (handler: (response: ServerResponse) => void) => void;
+  onUsage: (handler: (response: ServerResponse) => void) => void;
   close: () => Promise<void>;
 };
 
@@ -38,6 +39,7 @@ async function startFakeServer(): Promise<FakeServer> {
   const refreshBodies: URLSearchParams[] = [];
   let refreshHandler: (response: ServerResponse) => Promise<void> | void = (response) => { response.writeHead(500).end(); };
   let modelsHandler: (response: ServerResponse) => void = (response) => { response.writeHead(500).end(); };
+  let usageHandler: (response: ServerResponse) => void = (response) => { response.writeHead(500).end(); };
   const server: Server = createServer((request: IncomingMessage, response: ServerResponse) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -47,6 +49,8 @@ async function startFakeServer(): Promise<FakeServer> {
         void Promise.resolve(refreshHandler(response));
       } else if (request.method === "GET" && request.url?.startsWith("/backend/codex/models")) {
         modelsHandler(response);
+      } else if (request.method === "GET" && request.url?.startsWith("/backend/wham/usage")) {
+        usageHandler(response);
       } else {
         response.writeHead(404).end();
       }
@@ -59,6 +63,7 @@ async function startFakeServer(): Promise<FakeServer> {
     refreshBodies,
     onRefresh: (handler) => { refreshHandler = handler; },
     onModels: (handler) => { modelsHandler = handler; },
+    onUsage: (handler) => { usageHandler = handler; },
     close: async () => {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -316,3 +321,55 @@ test("an unreadable auth file does not stop a refresh that the in-memory token c
     assert.equal(fake.refreshBodies[0]!.get("refresh_token"), "r1");
   });
 });
+
+test("ChatGPTSession retrieves and parses 5h and weekly usage limits", async () => {
+  const token = jwt(Date.now() + HOUR_MS);
+  let callCount = 0;
+  await withFixture({ access: token, refresh: "r1" }, async ({ options, fake }) => {
+    fake.onUsage((response) => {
+      callCount++;
+      json(response, 200, {
+        plan_type: "plus",
+        rate_limit: {
+          allowed: true,
+          limit_reached: false,
+          primary_window: {
+            used_percent: 42,
+            limit_window_seconds: 18000,
+            reset_after_seconds: 14000,
+            reset_at: 1791189847,
+          },
+          secondary_window: {
+            used_percent: 60,
+            limit_window_seconds: 604800,
+            reset_after_seconds: 400000,
+            reset_at: 1791617223,
+          },
+        },
+      });
+    });
+
+    const session = await ChatGPTSession.open(options);
+    const limits = await session.getUsageLimits();
+    assert.ok(limits !== null);
+    assert.equal(limits.planType, "plus");
+    assert.equal(limits.allowed, true);
+    assert.equal(limits.limitReached, false);
+    assert.equal(limits.primaryWindow?.usedPercent, 42);
+    assert.equal(limits.primaryWindow?.remainingPercent, 58);
+    assert.equal(limits.secondaryWindow?.usedPercent, 60);
+    assert.equal(limits.secondaryWindow?.remainingPercent, 40);
+    assert.equal(callCount, 1);
+
+    // Cached within 15 seconds
+    const cached = await session.getUsageLimits();
+    assert.equal(callCount, 1);
+    assert.deepEqual(cached, limits);
+
+    // Force refresh bypasses cache
+    const refreshed = await session.getUsageLimits(true);
+    assert.equal(callCount, 2);
+    assert.ok(refreshed !== null);
+  });
+});
+
