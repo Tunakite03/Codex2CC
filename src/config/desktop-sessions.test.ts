@@ -395,7 +395,8 @@ test("an ambiguous scope reaches setup/reset callers as a failed sync, not a cra
     const report = desktopSyncReport(syncDesktopSessionsWhenClosed(TO_GATEWAY_PROFILE, paths, "not_running", NOW));
     assert.equal(report.status, "failed");
     assert.equal(report.level, "error");
-    assert.match(report.messages[0] ?? "", /CODEX2CC_GATEWAY_SESSION_SCOPE/);
+    assert.match(report.headline, /CODEX2CC_GATEWAY_SESSION_SCOPE/);
+    assert.deepEqual(report.messages, [], "the error is the headline, not repeated as a detail");
     assert.equal(existsSync(paths.manifestDir), false, "nothing was written");
   } finally {
     cleanup();
@@ -424,9 +425,9 @@ test("an ambiguous scope error lists each scope's session count and last activit
 
 test("desktopSyncReport tells clients when history was left hidden", () => {
   assert.deepEqual(desktopSyncReport({ status: "skipped", desktop: "running" }).level, "warning");
-  assert.deepEqual(desktopSyncReport({ status: "failed", error: "boom", entries: [], manifestPath: undefined }), { status: "failed", level: "error", messages: ["boom"] });
+  assert.deepEqual(desktopSyncReport({ status: "failed", error: "boom", entries: [], manifestPath: undefined }), { status: "failed", level: "error", headline: "boom", messages: [] });
   const applied = desktopSyncReport({ status: "applied", sync: { plans: [], entries: [], manifestPath: undefined } });
-  assert.deepEqual(applied, { status: "applied", level: "success", messages: [] });
+  assert.deepEqual(applied, { status: "applied", level: "success", headline: "No sessions needed copying.", messages: [] });
 });
 
 test("unsupported platforms stay unknown and the explicit command refuses unless Desktop is closed", () => {
@@ -651,10 +652,13 @@ test("sync reports warn when a destination scope or source transcripts are missi
     const noScope = desktopSyncReport(runDesktopSessionSync(TO_GATEWAY_PROFILE, paths, NOW));
     assert.equal(noScope.level, "warning");
     assert.match(noScope.messages.join(" "), /then quit it and rerun/);
+    assert.match(noScope.headline, /^No sessions needed copying\. 1 account\(s\) have no session list yet/);
     scopeDir(paths.profiles.thirdParty, "gw", "org");
     const noTranscript = desktopSyncReport(runDesktopSessionSync(TO_GATEWAY_PROFILE, paths, NOW));
     assert.equal(noTranscript.level, "warning");
     assert.match(noTranscript.messages.join(" "), /1 without transcript/);
+    assert.doesNotMatch(noTranscript.messages.join(" "), /0 unreadable|0 deleted there/, "zero counts are left out");
+    assert.match(noTranscript.headline, /1 session\(s\) cannot be copied/);
   } finally { cleanup(); }
 });
 
@@ -704,7 +708,7 @@ test("the all-accounts sync refreshes its earlier copies from the newest origina
     for (const desktop of ["running", "unknown"] as const) {
       const report = desktopSyncReport(syncAllAccountsWhenClosed(paths, desktop, NOW), "click Sync all sessions again.");
       assert.equal(report.status, "skipped");
-      assert.match(report.messages[0] ?? "", /click Sync all sessions again\.$/);
+      assert.match(report.headline, /Quit it, then click Sync all sessions again\.$/);
     }
     assert.deepEqual(sessionFiles(work), []);
     assert.equal(runAllAccountsSessionSync(paths, NOW).status, "applied");
