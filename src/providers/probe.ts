@@ -8,6 +8,12 @@ import { openApiInference } from "./http.js";
 const PROBE_TIMEOUT_MS = 30_000;
 const PROBE_MAX_TOKENS = 64;
 const PROBE_REPLY_CHARS = 200;
+// Claude Code always sends tools, which changes routing (e.g. OpenRouter require_parameters) and request validation.
+const PROBE_TOOL = {
+  name: "codex2cc_probe_noop",
+  description: "Connection test placeholder. Never call this tool.",
+  input_schema: { type: "object", properties: {}, additionalProperties: false },
+} as const;
 
 /** Translates an Anthropic request into the body the model's adapter protocol expects. */
 export function toApiRequestBody(inbound: MessageRequest, provider: ApiProvider, model: ApiModel, effort: EffortLevel | undefined): object {
@@ -33,8 +39,8 @@ export type ProviderProbeResult = {
 };
 
 /**
- * Sends one tiny message through the same translation and HTTP path as `/v1/messages`, so a
- * success proves the key, endpoint, model slug and stream parser all work together.
+ * Sends one tiny message with a tool through the same translation and HTTP path as `/v1/messages`,
+ * so a success proves the key, endpoint, model slug, tool support and stream parser all work together.
  */
 export async function probeApiProvider(
   provider: ApiProvider,
@@ -53,6 +59,7 @@ export async function probeApiProvider(
     max_tokens: model.maxOutputTokens === undefined ? PROBE_MAX_TOKENS : Math.min(PROBE_MAX_TOKENS, model.maxOutputTokens),
     stream: true,
     thinking: { type: "disabled" },
+    tools: [PROBE_TOOL],
     messages: [{ role: "user", content: "Reply with the single word OK." }],
   });
   const startTime = Date.now();

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import {
   AnthropicStream,
@@ -504,27 +505,42 @@ async function routeToApi(
   const estimatedTokens = estimateCodexInputTokens(toOpenAIRequest(inbound, model.slug));
   if (resolution.fellBack) recordLog({ level: "warn", operation: "model_fallback", message: "Requested model is not configured; using provider default", details: { provider, requested: inbound.model, model: model.slug } });
   try {
-    const upstream = await openApiInference({ provider, protocol: model.protocol, url: endpoint, apiKey, body: outgoing, signal: clientGone });
-    const read = (accept: (event: OpenAIEvent) => void): Promise<void> => readApiStream(upstream.body!, accept, provider, model);
     let usage: AnthropicUsage | undefined;
-    if (inbound.stream) {
-      response.statusCode = 200;
-      response.setHeader("Content-Type", "text/event-stream");
-      response.setHeader("Cache-Control", "no-cache");
-      response.setHeader("Connection", "keep-alive");
-      const encoder = new AnthropicStream(response, model.slug, estimatedTokens);
-      const keepAlive = setInterval(() => encoder.keepAlive(), options.keepAliveMs);
-      try { await read((event) => encoder.accept(event)); }
-      finally { clearInterval(keepAlive); }
-      encoder.assertCompleted();
-      usage = encoder.getUsage();
-      response.end();
-    } else {
-      const accumulator = new MessageAccumulator(model.slug);
-      await read((event) => accumulator.accept(event));
-      accumulator.assertCompleted();
-      usage = accumulator.getUsage();
-      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(accumulator.buildMessage()));
+    for (let attempt = 1; ; attempt++) {
+      clientGone.throwIfAborted();
+      // HTTP failures retain their own retry policy; only stream overloads reach this catch.
+      const upstream = await openApiInference({ provider, protocol: model.protocol, url: endpoint, apiKey, body: outgoing, signal: clientGone });
+      const read = (accept: (event: OpenAIEvent) => void): Promise<void> => readApiStream(upstream.body!, accept, provider, model);
+      try {
+        if (inbound.stream) {
+          response.statusCode = 200;
+          response.setHeader("Content-Type", "text/event-stream");
+          response.setHeader("Cache-Control", "no-cache");
+          response.setHeader("Connection", "keep-alive");
+          const encoder = new AnthropicStream(response, model.slug, estimatedTokens);
+          const keepAlive = setInterval(() => encoder.keepAlive(), options.keepAliveMs);
+          try { await read((event) => encoder.accept(event)); }
+          finally { clearInterval(keepAlive); }
+          encoder.assertCompleted();
+          usage = encoder.getUsage();
+          response.end();
+        } else {
+          const accumulator = new MessageAccumulator(model.slug);
+          await read((event) => accumulator.accept(event));
+          accumulator.assertCompleted();
+          usage = accumulator.getUsage();
+          response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(accumulator.buildMessage()));
+        }
+        break;
+      } catch (error) {
+        // headersSent includes message_start and keep-alive pings, not just text deltas.
+        // Buffered attempts can be discarded safely; each retry creates a fresh accumulator.
+        if (provider !== "openrouter" || attempt >= 3 || clientGone.aborted || response.headersSent
+          || !(error instanceof BridgeError) || ![502, 503].includes(error.status)
+          || !/resource[ _]?exhausted|overload(?:ed)?|worker.*request limit reached/i.test(error.message)) throw error;
+        recordLog({ level: "warn", operation: "provider_stream_retry", message: "Retrying OpenRouter stream overload before client response", details: { provider, model: model.slug, attempt, status: error.status } });
+        await delay(300 * attempt, undefined, { signal: clientGone });
+      }
     }
     const inputTokens = usage?.input_tokens ?? estimatedTokens;
     const outputTokens = usage?.output_tokens ?? 0;

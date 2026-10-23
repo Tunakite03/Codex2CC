@@ -89,7 +89,8 @@ export function desktopProcessState(platformName: string = platform(), probe: Pr
   try {
     const result = platformName === "win32"
       ? probe("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_PROCESS_QUERY], options)
-      : probe("pgrep", ["-x", "Claude"], options);
+      // `-a`: BSD pgrep skips its own ancestors, and codex2cc often runs inside Desktop's Code tab.
+      : probe("pgrep", ["-a", "-x", "Claude"], options);
     if (result.error) return "unknown";
     if (platformName === "darwin") {
       return result.status === 0 ? "running" : result.status === 1 ? "not_running" : "unknown";
@@ -188,19 +189,24 @@ function transcriptIds(projectsDir: string): ReadonlySet<string> {
 }
 
 export type PlannedCopy = { readonly sessionId: string; readonly source: string; readonly destination: string };
+export type PlannedRemoval = { readonly sessionId: string; readonly destination: string };
 
 export type DirectionPlan = {
   readonly from: SyncSource;
   readonly to: DesktopProfile;
+  /** The `<account>/<org>` list a mirror sync copies; absent when sessions are pooled from every list. */
+  readonly sourceScopeId?: string;
   /** Set when nothing can be copied in this direction. */
   readonly blocked?: "no_source_sessions" | "no_destination_scope";
-  /** The explicitly selected destination scope, or its sole existing scope. */
+  /** The destination `<account>/<org>` directory; each scope of the destination profile gets its own plan. */
   readonly destinationScope?: string;
-  /** Its `<account>/<org>` id, set by the all-accounts sync, which plans one scope at a time. */
+  /** Its `<account>/<org>` id. */
   readonly destinationScopeId?: string;
   readonly copies: readonly PlannedCopy[];
-  /** Copies codex2cc made earlier whose original has newer activity; they are replaced by the original. */
+  /** Entries already present whose newest version in a source has newer activity; they are replaced by it. */
   readonly refreshes: readonly PlannedCopy[];
+  /** Entries a mirror sync removes because the newest list does not have them; each is backed up first. */
+  readonly removals: readonly PlannedRemoval[];
   readonly skipped: {
     readonly alreadyPresent: number;
     readonly deletedInDestination: number;
@@ -209,49 +215,16 @@ export type DirectionPlan = {
   };
 };
 
-export type SyncEntry = {
-  readonly action: "added" | "refreshed";
-  readonly sessionId: string;
-  readonly source: string;
-  readonly destination: string;
-  /** Pre-refresh contents; absent for added entries and manifests written before backups existed. */
-  readonly backupPath?: string;
-};
-
-const SyncManifest = z.object({
-  createdAt: z.string(),
-  entries: z.array(z.object({
-    action: z.enum(["added", "refreshed"]),
-    sessionId: z.string().min(1),
-    source: z.string().min(1),
-    destination: z.string().min(1),
-    backupPath: z.string().min(1).optional(),
-  })),
-});
-
-/**
- * Copies codex2cc made, keyed by destination path, read from every manifest it wrote. Only these may ever
- * be replaced: an entry Desktop created itself is never written to.
- */
-function ownedCopies(manifestDir: string): ReadonlyMap<string, string> {
-  const owned = new Map<string, string>();
-  if (!existsSync(manifestDir)) return owned;
-  for (const name of readdirSync(manifestDir).filter((file) => file.endsWith(".json")).sort()) {
-    const file = join(manifestDir, name);
-    let parsed: z.ZodSafeParseResult<z.infer<typeof SyncManifest>>;
-    try {
-      parsed = SyncManifest.safeParse(JSON.parse(readFileSync(file, "utf8")));
-    } catch (error) {
-      if (!(error instanceof SyntaxError)) throw error;
-      throw new BridgeError(500, "invalid_sync_manifest", `Desktop session sync manifest ${file} is not valid JSON; fix or remove it.`);
-    }
-    if (!parsed.success) {
-      throw new BridgeError(500, "invalid_sync_manifest", `Desktop session sync manifest ${file} does not match the expected format; fix or remove it.`);
-    }
-    for (const entry of parsed.data.entries) owned.set(entry.destination, entry.source);
+export type SyncEntry =
+  | {
+    readonly action: "added" | "refreshed";
+    readonly sessionId: string;
+    readonly source: string;
+    readonly destination: string;
+    /** Pre-refresh contents; absent for added entries. */
+    readonly backupPath?: string;
   }
-  return owned;
-}
+  | { readonly action: "removed"; readonly sessionId: string; readonly destination: string; readonly backupPath: string };
 
 const SCOPE_ENV: Readonly<Record<DesktopProfile, string>> = {
   claude: "CODEX2CC_CLAUDE_SESSION_SCOPE",
@@ -259,43 +232,45 @@ const SCOPE_ENV: Readonly<Record<DesktopProfile, string>> = {
 };
 const ScopeId = z.string().regex(/^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/);
 
-/** Facts that help a person recognize their own account/org; they never pick one on their behalf. */
-function describeScope(scope: ScopeListing): string {
-  if (scope.sessions.length === 0) return `${scope.id} (no sessions)`;
-  const lastActivity = new Date(Math.max(...scope.sessions.map((session) => session.lastActivityAt)));
-  return `${scope.id} (${scope.sessions.length} session(s), last active ${lastActivity.toISOString().slice(0, 16).replace("T", " ")} UTC)`;
-}
-
-/** No timestamp can identify the signed-in account; require a selection when more than one exists. */
-function selectScope(scopes: readonly ScopeListing[], paths: DesktopSessionPaths, profile: DesktopProfile): ScopeListing | undefined {
+/**
+ * The explicitly selected scope, or every scope: no file identifies the account Desktop will sign in
+ * with next, so an unselected profile is synced as a whole rather than guessed.
+ */
+function selectScopes(scopes: readonly ScopeListing[], paths: DesktopSessionPaths, profile: DesktopProfile): readonly ScopeListing[] {
   const id = (scope: ScopeListing): string => scope.id;
   const selected = paths.selectedScopes?.[profile];
-  if (selected !== undefined) {
-    if (!ScopeId.safeParse(selected).success) {
-      throw new BridgeError(400, "invalid_desktop_scope", `${SCOPE_ENV[profile]} must be an existing <account>/<org> scope, without path traversal.`);
-    }
-    const target = scopes.find((scope) => id(scope) === selected);
-    if (target === undefined) {
-      throw new BridgeError(400, "invalid_desktop_scope", `${SCOPE_ENV[profile]} names an unknown scope. Available scopes: ${scopes.map(id).join(", ") || "none"}.`);
-    }
-    return target;
+  if (selected === undefined) return scopes;
+  if (!ScopeId.safeParse(selected).success) {
+    throw new BridgeError(400, "invalid_desktop_scope", `${SCOPE_ENV[profile]} must be an existing <account>/<org> scope, without path traversal.`);
   }
-  if (scopes.length > 1) {
-    throw new BridgeError(409, "ambiguous_desktop_scope", `Desktop session sync requires an explicit account/org. Set ${SCOPE_ENV[profile]} to one of: ${scopes.map(describeScope).join(", ")}. Then rerun codex2cc --sync-desktop-sessions --dry-run. To sync every account instead, use the control panel's Sync all sessions button or codex2cc --sync-desktop-sessions --all-accounts.`);
+  const target = scopes.find((scope) => id(scope) === selected);
+  if (target === undefined) {
+    throw new BridgeError(400, "invalid_desktop_scope", `${SCOPE_ENV[profile]} names an unknown scope. Available scopes: ${scopes.map(id).join(", ") || "none"}.`);
   }
-  return scopes[0];
+  return [target];
 }
 
-function planRefreshes(
-  sourceScopes: readonly ScopeListing[],
-  destinationScopes: readonly ScopeListing[],
-  owned: ReadonlyMap<string, string>,
-): PlannedCopy[] {
-  const sources = new Map(sourceScopes.flatMap((scope) => scope.sessions).map((session) => [session.file, session]));
-  return destinationScopes.flatMap((scope) => scope.sessions).flatMap((copy): PlannedCopy[] => {
-    const original = sources.get(owned.get(copy.file) ?? "");
-    if (original === undefined || original.sessionId !== copy.sessionId || original.lastActivityAt <= copy.lastActivityAt) return [];
-    return [{ sessionId: copy.sessionId, source: original.file, destination: copy.file }];
+/** One entry per session: the one with the latest activity, wherever it lives. */
+function newestBySession(sessions: readonly ScopeSession[]): ScopeSession[] {
+  const newest = new Map<string, ScopeSession>();
+  for (const session of sessions) {
+    const known = newest.get(session.sessionId);
+    if (known === undefined || session.lastActivityAt > known.lastActivityAt) newest.set(session.sessionId, session);
+  }
+  return [...newest.values()];
+}
+
+/**
+ * The entries of `target` that a source holds a newer version of, whichever profile last updated it.
+ * Identical contents are skipped, so a file-time fallback cannot make two equal entries trade places.
+ */
+function planRefreshes(sources: readonly ScopeSession[], target: ScopeListing): PlannedCopy[] {
+  const newest = new Map(sources.map((session) => [session.sessionId, session]));
+  return target.sessions.flatMap((entry): PlannedCopy[] => {
+    const source = newest.get(entry.sessionId);
+    if (source === undefined || source.file === entry.file || source.lastActivityAt <= entry.lastActivityAt) return [];
+    if (readFileSync(source.file).equals(readFileSync(entry.file))) return [];
+    return [{ sessionId: entry.sessionId, source: source.file, destination: entry.file }];
   });
 }
 
@@ -303,25 +278,31 @@ function planDirection(
   direction: SyncDirection,
   paths: DesktopSessionPaths,
   transcripts: ReadonlySet<string>,
-  owned: ReadonlyMap<string, string>,
-): DirectionPlan {
+): DirectionPlan[] {
   const allSourceScopes = listProfileScopes(paths, direction.from);
-  const selected = paths.selectedScopes?.[direction.from];
-  if (selected !== undefined) selectScope(allSourceScopes, paths, direction.from);
-  const sourceScopes = selected === undefined ? allSourceScopes : allSourceScopes.filter((scope) => scope.id === selected);
+  // Validates the selection; filtering by id keeps the same scope's legacy profile location too.
+  const selectedIds = new Set(selectScopes(allSourceScopes, paths, direction.from).map((scope) => scope.id));
+  const sourceScopes = allSourceScopes.filter((scope) => selectedIds.has(scope.id));
   const allDestinationScopes = listProfileScopes(paths, direction.to);
   const primaryDestinationScopes = allDestinationScopes.filter((scope) => scope.profileDir === paths.profiles[direction.to]);
   const destinationScopes = primaryDestinationScopes.length > 0 ? primaryDestinationScopes : allDestinationScopes;
   const invalid = sourceScopes.reduce((sum, scope) => sum + scope.invalid, 0);
-  const sources = sourceScopes.flatMap((scope) => scope.sessions);
-  if (sources.length === 0) return blockedPlan(direction, "no_source_sessions", invalid);
-  const target = selectScope(destinationScopes, paths, direction.to);
-  if (target === undefined) return blockedPlan(direction, "no_destination_scope", invalid);
-  return { ...planIntoScope(target, sources, transcripts, invalid), ...direction, refreshes: planRefreshes(sourceScopes, [target], owned) };
+  const sources = newestBySession(sourceScopes.flatMap((scope) => scope.sessions));
+  if (sources.length === 0) return [blockedPlan(direction, "no_source_sessions", invalid)];
+  const targets = selectScopes(destinationScopes, paths, direction.to);
+  if (targets.length === 0) return [blockedPlan(direction, "no_destination_scope", invalid)];
+  // Unreadable source entries are counted on the first line only, so the lines add up to the total.
+  return targets.map((target, index) => ({
+    ...planIntoScope(target, sources, transcripts, index === 0 ? invalid : 0),
+    ...direction,
+    destinationScopeId: target.id,
+    refreshes: planRefreshes(sources, target),
+    removals: [],
+  }));
 }
 
 function blockedPlan(route: { readonly from: SyncSource; readonly to: DesktopProfile }, blocked: NonNullable<DirectionPlan["blocked"]>, invalid: number): DirectionPlan {
-  return { ...route, blocked, copies: [], refreshes: [], skipped: { alreadyPresent: 0, deletedInDestination: 0, missingTranscript: 0, invalid } };
+  return { ...route, blocked, copies: [], refreshes: [], removals: [], skipped: { alreadyPresent: 0, deletedInDestination: 0, missingTranscript: 0, invalid } };
 }
 
 /** The sources missing from `target` that can be added: not deleted there and with a local transcript. */
@@ -353,11 +334,13 @@ function planIntoScope(
   return { destinationScope: target.dir, copies, skipped };
 }
 
-/** Read-only: which session entries each direction would add or refresh. */
+/**
+ * Read-only: which session entries each direction would add or refresh. A session present in both
+ * profiles takes the version with the latest activity, so a two-way sync converges on the newest one.
+ */
 export function planDesktopSessionSync(directions: readonly SyncDirection[], paths: DesktopSessionPaths): DirectionPlan[] {
   const transcripts = transcriptIds(paths.projectsDir);
-  const owned = ownedCopies(paths.manifestDir);
-  return directions.map((direction) => planDirection(direction, paths, transcripts, owned));
+  return directions.flatMap((direction) => planDirection(direction, paths, transcripts));
 }
 
 /**
@@ -368,15 +351,8 @@ export function planDesktopSessionSync(directions: readonly SyncDirection[], pat
  */
 export function planAllAccountsSessionSync(paths: DesktopSessionPaths): DirectionPlan[] {
   const transcripts = transcriptIds(paths.projectsDir);
-  const owned = ownedCopies(paths.manifestDir);
   const listings = PROFILES.map((profile) => ({ profile, scopes: listProfileScopes(paths, profile) }));
-  const allScopes = listings.flatMap(({ scopes }) => scopes);
-  const pool = new Map<string, ScopeSession>();
-  for (const session of allScopes.flatMap((scope) => scope.sessions)) {
-    const known = pool.get(session.sessionId);
-    if (known === undefined || session.lastActivityAt > known.lastActivityAt) pool.set(session.sessionId, session);
-  }
-  const sources = [...pool.values()];
+  const sources = newestBySession(listings.flatMap(({ scopes }) => scopes.flatMap((scope) => scope.sessions)));
   return listings.flatMap(({ profile, scopes }): DirectionPlan[] => {
     const route = { from: "all", to: profile } as const;
     // Each scope reports its own unreadable entries, so the lines add up to the total.
@@ -390,7 +366,64 @@ export function planAllAccountsSessionSync(paths: DesktopSessionPaths): Directio
       ...route,
       ...planIntoScope(target, sources, transcripts, target.invalid),
       destinationScopeId: target.id,
-      refreshes: planRefreshes(allScopes, [target], owned),
+      refreshes: planRefreshes(sources, target),
+      removals: [],
+    }));
+  });
+}
+
+/** {@link planAllAccountsSessionSync} without refreshes: only sessions a list lacks are added, nothing is replaced. */
+export function planAddMissingSessionSync(paths: DesktopSessionPaths): DirectionPlan[] {
+  return planAllAccountsSessionSync(paths).map((plan) => ({ ...plan, refreshes: [] }));
+}
+
+/**
+ * The list holding the most recent activity of any session. After a mirror every list shares that
+ * activity, so a tie goes to the fuller list: one that could not take a tombstoned or transcript-less
+ * session must never become the source and remove it everywhere else. Full ties keep the first listed.
+ */
+function newestScope(scopes: readonly ScopeListing[]): ScopeListing | undefined {
+  let newest: { readonly scope: ScopeListing; readonly at: number } | undefined;
+  for (const scope of scopes) {
+    if (scope.sessions.length === 0) continue;
+    const at = Math.max(...scope.sessions.map((session) => session.lastActivityAt));
+    if (newest === undefined || at > newest.at || (at === newest.at && scope.sessions.length > newest.scope.sessions.length)) newest = { scope, at };
+  }
+  return newest?.scope;
+}
+
+/**
+ * Read-only: every other account/org list becomes a copy of the most recently active one. Its entries are
+ * added or overwrite theirs, even a newer version; entries it lacks are removed (sessions sharing a
+ * transcript with one of its entries are kept). Tombstones still block re-adding a deleted session, and
+ * transcripts in `~/.claude/projects` are never touched, so a removed entry only leaves Desktop's list.
+ */
+export function planMirrorNewestSessionSync(paths: DesktopSessionPaths): DirectionPlan[] {
+  const transcripts = transcriptIds(paths.projectsDir);
+  const listings = PROFILES.map((profile) => ({ profile, scopes: listProfileScopes(paths, profile) }));
+  const source = newestScope(listings.flatMap(({ scopes }) => scopes));
+  return listings.flatMap(({ profile, scopes }): DirectionPlan[] => {
+    const invalid = scopes.reduce((sum, scope) => sum + scope.invalid, 0);
+    if (source === undefined) return [blockedPlan({ from: "all", to: profile }, "no_source_sessions", invalid)];
+    const from = listings.find((listing) => listing.scopes.includes(source))!.profile;
+    const route = { from, to: profile, sourceScopeId: source.id } as const;
+    const primary = scopes.filter((scope) => scope.profileDir === paths.profiles[profile]);
+    const candidates = primary.length > 0 ? primary : scopes;
+    if (candidates.length === 0) return [blockedPlan(route, "no_destination_scope", invalid)];
+    const keptIds = new Set(source.sessions.map((session) => session.sessionId));
+    const keptTranscripts = new Set(source.sessions.map((session) => session.cliSessionId));
+    return candidates.filter((target) => target.dir !== source.dir).map((target) => ({
+      ...route,
+      ...planIntoScope(target, source.sessions, transcripts, target.invalid),
+      destinationScopeId: target.id,
+      refreshes: target.sessions.flatMap((entry): PlannedCopy[] => {
+        const original = source.sessions.find((session) => session.sessionId === entry.sessionId);
+        if (original === undefined || readFileSync(original.file).equals(readFileSync(entry.file))) return [];
+        return [{ sessionId: entry.sessionId, source: original.file, destination: entry.file }];
+      }),
+      removals: target.sessions
+        .filter((entry) => !keptIds.has(entry.sessionId) && !keptTranscripts.has(entry.cliSessionId))
+        .map((entry) => ({ sessionId: entry.sessionId, destination: entry.file })),
     }));
   });
 }
@@ -425,10 +458,19 @@ function replaceCopy(copy: PlannedCopy, backupPath: string): void {
   }
 }
 
+/** Saves the entry and a recovery receipt, then deletes it; a vanished entry fails loudly. */
+function removeEntry(removal: PlannedRemoval, backupPath: string): void {
+  mkdirSync(dirname(backupPath), { recursive: true, mode: 0o700 });
+  copyFileSync(removal.destination, backupPath, constants.COPYFILE_EXCL);
+  writeFileSync(`${backupPath}.json`, JSON.stringify({ ...removal, backupPath }, null, 2), { flag: "wx", mode: 0o600 });
+  rmSync(removal.destination);
+}
+
 /**
  * Adds the planned entries without ever replacing a file (a destination that appeared since planning
- * fails the copy) and refreshes the planned codex2cc copies. Every change is recorded in a manifest, also
- * when the run stops part-way; a failure to write the manifest never hides the copy failure before it.
+ * fails the copy), then refreshes and removes the planned entries, backing each one up first. Every change
+ * is recorded in a manifest, also when the run stops part-way; a failure to write the manifest never hides
+ * the copy failure before it.
  */
 export function applyDesktopSessionSync(plans: readonly DirectionPlan[], manifestDir: string, now: Date): AppliedSync {
   const runId = `${now.toISOString().replace(/[:.]/g, "-")}-${randomUUID()}`;
@@ -436,16 +478,17 @@ export function applyDesktopSessionSync(plans: readonly DirectionPlan[], manifes
   const planned = plans.flatMap((plan) => [
     ...plan.copies.map((copy) => ({ action: "added" as const, ...copy })),
     ...plan.refreshes.map((copy) => ({ action: "refreshed" as const, ...copy })),
+    ...plan.removals.map((removal) => ({ action: "removed" as const, ...removal })),
   ]);
   const entries: SyncEntry[] = [];
   let copyFailure: unknown;
   for (const [index, entry] of planned.entries()) {
-    const change: SyncEntry = entry.action === "refreshed"
-      ? { ...entry, backupPath: join(manifestDir, "backups", runId, `${index}-${basename(entry.destination)}.bak`) }
-      : entry;
+    const backupPath = join(manifestDir, "backups", runId, `${index}-${basename(entry.destination)}.bak`);
+    const change: SyncEntry = entry.action === "added" ? entry : { ...entry, backupPath };
     try {
-      if (change.action === "added") copyFileSync(change.source, change.destination, constants.COPYFILE_EXCL);
-      else replaceCopy(change, change.backupPath!);
+      if (entry.action === "added") copyFileSync(entry.source, entry.destination, constants.COPYFILE_EXCL);
+      else if (entry.action === "refreshed") replaceCopy(entry, backupPath);
+      else removeEntry(entry, backupPath);
     } catch (error) {
       copyFailure = error;
       break;
@@ -526,6 +569,12 @@ export function syncAllAccountsWhenClosed(paths: DesktopSessionPaths, desktop: D
   return runAllAccountsSessionSync(paths, now);
 }
 
+/** {@link syncDesktopSessionsWhenClosed} for any planner, such as the control panel's chosen sync mode. */
+export function syncPlanWhenClosed(plan: () => readonly DirectionPlan[], manifestDir: string, desktop: DesktopProcessState, now: Date): DesktopSyncOutcome {
+  if (desktop !== "not_running") return { status: "skipped", desktop };
+  return runPlannedSync(plan, manifestDir, now);
+}
+
 const PROFILE_LABEL: Readonly<Record<SyncSource, string>> = { claude: "Claude (claude.ai)", thirdParty: "Claude-3p (gateway)", all: "All accounts" };
 
 /** Account/org ids are UUID pairs; their first groups are enough to tell a person's scopes apart. */
@@ -533,19 +582,27 @@ function shortScopeId(id: string): string {
   return id.split("/").map((part) => part.split("-")[0]).join("/");
 }
 
-export type PlanTense = { readonly add: string; readonly refresh: string };
-export const DRY_RUN_TENSE: PlanTense = { add: "would copy", refresh: "would refresh" };
-export const APPLIED_TENSE: PlanTense = { add: "copied", refresh: "refreshed" };
+export type PlanTense = { readonly add: string; readonly refresh: string; readonly remove: string };
+export const DRY_RUN_TENSE: PlanTense = { add: "would copy", refresh: "would refresh", remove: "would remove" };
+export const APPLIED_TENSE: PlanTense = { add: "copied", refresh: "refreshed", remove: "removed" };
+
+/** The list a mirror sync copies, e.g. `Claude-3p (gateway) [bddbea87/00000000]`; undefined for pooled plans. */
+export function describeMirrorSource(plans: readonly DirectionPlan[]): string | undefined {
+  const plan = plans.find((candidate) => candidate.sourceScopeId !== undefined);
+  return plan === undefined ? undefined : `${PROFILE_LABEL[plan.from]} [${shortScopeId(plan.sourceScopeId!)}]`;
+}
 
 /** Human-readable lines for a plan, in the tense of a dry run or of an applied sync. */
 export function describePlans(plans: readonly DirectionPlan[], tense: PlanTense): string[] {
   return plans.map((plan) => {
     const scope = plan.destinationScopeId === undefined ? "" : ` [${shortScopeId(plan.destinationScopeId)}]`;
-    const route = `${PROFILE_LABEL[plan.from]} -> ${PROFILE_LABEL[plan.to]}${scope}`;
+    const source = plan.sourceScopeId === undefined ? "" : ` [${shortScopeId(plan.sourceScopeId)}]`;
+    const route = `${PROFILE_LABEL[plan.from]}${source} -> ${PROFILE_LABEL[plan.to]}${scope}`;
     if (plan.blocked === "no_source_sessions") return `${route}: no sessions to copy.`;
     if (plan.blocked === "no_destination_scope") return `${route}: skipped, open Claude Desktop once in that mode so it creates its session list, then quit it and rerun: codex2cc --sync-desktop-sessions`;
     const { alreadyPresent, deletedInDestination, missingTranscript, invalid } = plan.skipped;
-    const refreshed = plan.refreshes.length === 0 ? "" : `, ${tense.refresh} ${plan.refreshes.length} earlier cop(ies)`;
+    const refreshed = plan.refreshes.length === 0 ? "" : `, ${tense.refresh} ${plan.refreshes.length} older session(s)`;
+    const removed = plan.removals.length === 0 ? "" : `, ${tense.remove} ${plan.removals.length} session(s)`;
     const skipped = [
       [alreadyPresent, "already present"],
       [deletedInDestination, "deleted there"],
@@ -554,7 +611,7 @@ export function describePlans(plans: readonly DirectionPlan[], tense: PlanTense)
     ] as const;
     const skippedParts = skipped.filter(([count]) => count > 0).map(([count, reason]) => `${count} ${reason}`);
     const skippedText = skippedParts.length === 0 ? "" : `; skipped ${skippedParts.join(", ")}`;
-    return `${route}: ${tense.add} ${plan.copies.length} session(s)${refreshed}${skippedText}.`;
+    return `${route}: ${tense.add} ${plan.copies.length} session(s)${refreshed}${removed}${skippedText}.`;
   });
 }
 
@@ -562,11 +619,17 @@ export function describePlans(plans: readonly DirectionPlan[], tense: PlanTense)
 export function summarizePlans(plans: readonly DirectionPlan[], tense: PlanTense): string {
   const copies = plans.reduce((sum, plan) => sum + plan.copies.length, 0);
   const refreshes = plans.reduce((sum, plan) => sum + plan.refreshes.length, 0);
-  const accounts = plans.filter((plan) => plan.copies.length + plan.refreshes.length > 0).length;
+  const removals = plans.reduce((sum, plan) => sum + plan.removals.length, 0);
+  const accounts = plans.filter((plan) => plan.copies.length + plan.refreshes.length + plan.removals.length > 0).length;
   const verb = tense.add.charAt(0).toUpperCase() + tense.add.slice(1);
-  const moved = copies + refreshes === 0
+  const others = [
+    ...(refreshes === 0 ? [] : [`${tense.refresh} ${refreshes}`]),
+    ...(removals === 0 ? [] : [`${tense.remove} ${removals}`]),
+  ];
+  const tail = others.length === 0 ? "" : others.length === 1 ? ` and ${others[0]}` : `, ${others[0]} and ${others[1]}`;
+  const moved = copies + refreshes + removals === 0
     ? "No sessions needed copying."
-    : `${verb} ${copies} session(s)${refreshes === 0 ? "" : ` and ${tense.refresh} ${refreshes}`} across ${accounts} account(s).`;
+    : `${verb} ${copies} session(s)${tail} across ${accounts} account(s).`;
   const noScope = plans.filter((plan) => plan.blocked === "no_destination_scope").length;
   const unreadable = plans.reduce((sum, plan) => sum + plan.skipped.missingTranscript + plan.skipped.invalid, 0);
   const issues = [

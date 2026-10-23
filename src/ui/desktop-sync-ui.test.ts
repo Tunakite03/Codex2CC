@@ -146,63 +146,133 @@ test("persistent sync feedback sits after every tab panel so reset warnings rema
   assert.equal(html.match(/id="desktop-sync-report"/g)?.length, 1);
 });
 
-// The Sync all sessions button previews first, asks before copying, and lets the server skip while Desktop is open.
-function syncButton(preview: Record<string, unknown>, report: DesktopSyncReport, confirmed = true) {
+// The Sync all sessions button previews both modes in a dialog, sends the chosen one, and lets the server skip while Desktop is open.
+function syncButton(preview: Record<string, unknown>, report: DesktopSyncReport) {
   const script = renderDashboardHtml().match(/<script>([\s\S]*?)<\/script>/i)?.[1] ?? "";
   const cut = (start: string, end: string) => script.slice(script.indexOf(start), script.indexOf(end, script.indexOf(start)));
   const code = cut("function showConfigurationResult(", "/* Tab Controller */")
     + cut("/* Every Desktop account gets every session", 'document.getElementById("btn-apply").addEventListener');
-  let click: (() => Promise<void>) | undefined;
+  const listeners = new Map<string, (event?: { preventDefault: () => void }) => unknown>();
+  const element = (id: string, fields: Record<string, unknown> = {}) => ({
+    ...fields,
+    addEventListener: (event: string, callback: () => unknown) => listeners.set(`${id}:${event}`, callback),
+  });
+  const dialog = {
+    ...element("session-sync-dialog"),
+    open: false,
+    showModal() { dialog.open = true; },
+    close() { dialog.open = false; },
+  };
+  const elements: Record<string, Record<string, unknown>> = {
+    "btn-sync-sessions": element("btn-sync-sessions"),
+    "session-sync-dialog": dialog,
+    "session-sync-mode-add_only": element("session-sync-mode-add_only", { checked: true }),
+    "session-sync-mode-mirror_newest": element("session-sync-mode-mirror_newest", { checked: false }),
+    "session-sync-summary-add_only": { textContent: "" },
+    "session-sync-summary-mirror_newest": { textContent: "" },
+    "session-sync-source": { textContent: "" },
+    "session-sync-desktop": { hidden: true },
+    "session-sync-error": { hidden: true, textContent: "" },
+    "btn-cancel-session-sync": element("btn-cancel-session-sync"),
+    "btn-confirm-session-sync": element("btn-confirm-session-sync", { disabled: false, className: "", textContent: "" }),
+  };
   const sync = syncNotice();
   const calls: string[] = [];
-  const prompts: string[] = [];
+  const bodies: unknown[] = [];
   const toasts: Array<{ message: string; type: string }> = [];
   runInNewContext(code, {
-    document: { getElementById: (id: string) => sync.part(id) ?? (id === "btn-sync-sessions"
-      ? { addEventListener: (_event: string, callback: () => Promise<void>) => { click = callback; } }
-      : assert.fail(`unexpected element ${id}`)) },
+    document: { getElementById: (id: string) => sync.part(id) ?? elements[id] ?? assert.fail(`unexpected element ${id}`) },
     showToast: (message: string, type = "success") => toasts.push({ message, type }),
-    confirm: (message: string) => { prompts.push(message); return confirmed; },
-    fetch: async (url: string, init?: { method?: string }) => {
+    fetch: async (url: string, init?: { method?: string; body?: string }) => {
       calls.push(`${init?.method ?? "GET"} ${url}`);
+      if (init?.body !== undefined) bodies.push(JSON.parse(init.body));
       return { json: async () => url.endsWith("/plan") ? { ok: true, ...preview } : { ok: true, desktopSessionSync: report } };
     },
   });
-  return { ...sync, calls, prompts, toasts, click: async () => { assert.ok(click, "missing Sync all sessions handler"); await click(); } };
+  const fire = async (key: string) => { const callback = listeners.get(key); assert.ok(callback, `missing handler ${key}`); await callback({ preventDefault: () => {} }); };
+  const choose = async (mode: "add_only" | "mirror_newest") => {
+    elements["session-sync-mode-add_only"]!.checked = mode === "add_only";
+    elements["session-sync-mode-mirror_newest"]!.checked = mode === "mirror_newest";
+    await fire(`session-sync-mode-${mode}:change`);
+  };
+  return {
+    ...sync, calls, bodies, toasts, dialog, elements, choose,
+    click: () => fire("btn-sync-sessions:click"),
+    confirm: () => fire("btn-confirm-session-sync:click"),
+    cancel: () => fire("btn-cancel-session-sync:click"),
+  };
 }
 
-const pendingPreview = { desktop: "not_running", changes: 2, level: "success", headline: "Would copy 2 session(s) across 1 account(s).", messages: ["All accounts -> Claude (claude.ai) [a/b]: would copy 2 session(s)."] };
+const modePreview = (changes: number, headline: string) => ({ changes, level: "success", headline, messages: [`A -> B: ${headline}`] });
+const pendingPreview = {
+  desktop: "not_running",
+  modes: {
+    add_only: modePreview(2, "Would copy 2 session(s) across 1 account(s)."),
+    mirror_newest: { ...modePreview(3, "Would copy 1 session(s) and would remove 2 across 1 account(s)."), source: "Claude-3p (gateway) [gw/org]" },
+  },
+};
+const copied: DesktopSyncReport = { status: "applied", level: "success", headline: "Copied 2 session(s) across 1 account(s).", messages: ["A -> B: copied 2 session(s)."] };
 
-test("Sync all sessions confirms the previewed changes before copying them", async () => {
-  const ui = syncButton(pendingPreview, { status: "applied", level: "success", headline: "Copied 2 session(s) across 1 account(s).", messages: ["A -> B: copied 2 session(s)."] });
+test("Sync all sessions previews both modes and sends add only by default", async () => {
+  const ui = syncButton(pendingPreview, copied);
   await ui.click();
+  assert.deepEqual(ui.calls, ["GET /api/ui/desktop-sessions/plan"]);
+  assert.equal(ui.dialog.open, true);
+  assert.equal(ui.elements["session-sync-summary-add_only"]!.textContent, "Would copy 2 session(s) across 1 account(s).");
+  assert.equal(ui.elements["session-sync-summary-mirror_newest"]!.textContent, "Would copy 1 session(s) and would remove 2 across 1 account(s).");
+  assert.equal(ui.elements["session-sync-source"]!.textContent, " (Claude-3p (gateway) [gw/org])");
+  assert.equal(ui.elements["session-sync-desktop"]!.hidden, true);
+  assert.equal(ui.elements["btn-confirm-session-sync"]!.className, "btn btn-primary");
+  await ui.confirm();
   assert.deepEqual(ui.calls, ["GET /api/ui/desktop-sessions/plan", "POST /api/ui/desktop-sessions/sync"]);
-  assert.ok(ui.prompts[0]?.endsWith("\n\nWould copy 2 session(s) across 1 account(s)."), "the confirmation states the change in one line");
+  assert.deepEqual(ui.bodies, [{ mode: "add_only" }]);
+  assert.equal(ui.dialog.open, false);
   assert.equal(ui.headline.textContent, "Copied 2 session(s) across 1 account(s).");
   assert.deepEqual(ui.toasts, [{ message: "Session sync completed.", type: "success" }]);
-  assert.equal(ui.notice.className, "desktop-sync-report success");
 });
 
-test("Sync all sessions copies nothing when the confirmation is declined", async () => {
-  const ui = syncButton(pendingPreview, { status: "applied", level: "success", headline: "", messages: [] }, false);
+test("Choosing to mirror the newest list marks the action destructive and sends that mode", async () => {
+  const ui = syncButton(pendingPreview, copied);
   await ui.click();
+  await ui.choose("mirror_newest");
+  assert.equal(ui.elements["btn-confirm-session-sync"]!.className, "btn btn-danger");
+  await ui.confirm();
+  assert.deepEqual(ui.bodies, [{ mode: "mirror_newest" }]);
+});
+
+test("Cancelling the dialog syncs nothing", async () => {
+  const ui = syncButton(pendingPreview, copied);
+  await ui.click();
+  await ui.cancel();
+  assert.equal(ui.dialog.open, false);
   assert.deepEqual(ui.calls, ["GET /api/ui/desktop-sessions/plan"]);
   assert.equal(ui.notice.hidden, true);
 });
 
-test("Sync all sessions skips the confirmation while Desktop is open and shows the server's skip report", async () => {
+test("A mode with nothing to change cannot run", async () => {
+  const ui = syncButton({ ...pendingPreview, modes: { ...pendingPreview.modes, add_only: modePreview(0, "No sessions needed copying.") } }, copied);
+  await ui.click();
+  assert.equal(ui.elements["btn-confirm-session-sync"]!.disabled, true);
+  await ui.choose("mirror_newest");
+  assert.equal(ui.elements["btn-confirm-session-sync"]!.disabled, false);
+});
+
+test("Sync all sessions warns while Desktop is open and shows the server's skip report", async () => {
   const ui = syncButton({ ...pendingPreview, desktop: "running" }, { status: "skipped", level: "warning", headline: "Claude Desktop is running. Quit it, then click Sync all sessions again. 2 session(s) waiting to copy.", messages: ["A -> B: would copy 2 session(s)."] });
   await ui.click();
-  assert.deepEqual(ui.prompts, []);
+  assert.equal(ui.elements["session-sync-desktop"]!.hidden, false);
+  await ui.confirm();
   assert.deepEqual(ui.calls, ["GET /api/ui/desktop-sessions/plan", "POST /api/ui/desktop-sessions/sync"]);
   assert.equal(ui.notice.className, "desktop-sync-report warning");
   assert.equal(ui.title.textContent, "Session sync skipped.");
   assert.match(ui.headline.textContent, /2 session\(s\) waiting to copy\.$/);
 });
 
-test("Sync all sessions reports an already complete sync without writing", async () => {
-  const ui = syncButton({ ...pendingPreview, changes: 0, headline: "No sessions needed copying.", messages: ["A -> B: would copy 0 session(s)."] }, { status: "applied", level: "success", headline: "", messages: [] });
+test("Sync all sessions reports an already complete sync without opening the dialog", async () => {
+  const none = modePreview(0, "No sessions needed copying.");
+  const ui = syncButton({ desktop: "not_running", modes: { add_only: none, mirror_newest: { ...none, source: null } } }, copied);
   await ui.click();
   assert.deepEqual(ui.calls, ["GET /api/ui/desktop-sessions/plan"]);
+  assert.equal(ui.dialog.open, false);
   assert.equal(ui.headline.textContent, "No sessions needed copying.");
 });
