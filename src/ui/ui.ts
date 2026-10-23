@@ -5,6 +5,8 @@ import { randomBytes } from "node:crypto";
 import { BridgeError } from "../bridge/bridge.js";
 import {
   CODEX2CC_DESKTOP_CONFIG_ID,
+  desktopInferenceModels,
+  refreshDesktopModelLabels,
   resetConfig,
   resolveDefaultPaths,
   setupConfig,
@@ -12,8 +14,18 @@ import {
   type SetupTarget,
 } from "../config/config-setup.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
-import { ANTIGRAVITY_MODELS, ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, type ProviderType } from "../models/models.js";
+import { ANTIGRAVITY_MODELS, ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, routedModels, smallestContextWindow, type ProviderType } from "../models/models.js";
 import { isAntigravityAvailable } from "../bridge/antigravity.js";
+import {
+  desktopProcessState,
+  desktopSyncReport,
+  resolveDesktopSessionPaths,
+  syncDesktopSessionsWhenClosed,
+  TO_CLAUDE_PROFILE,
+  TO_GATEWAY_PROFILE,
+  type DesktopSyncReport,
+  type SyncDirection,
+} from "../config/desktop-sessions.js";
 import { activeTierModels, parseTierModels, EffortLevel } from "../models/tier-store.js";
 import { clearLogs, getActiveLogFilePath, getLogs, getLogStats, onLog, onLogsCleared, recordLog, type LogLevel } from "../telemetry/logger.js";
 import type { AccountUsageLimits } from "../auth/auth.js";
@@ -139,7 +151,8 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
         if (existsSync(configFile)) {
           const cfg = JSON.parse(readFileSync(configFile, "utf8"));
           desktopBaseUrl = String(cfg?.inferenceGatewayBaseUrl || "");
-          desktopInSync = inSync(desktopBaseUrl, String(cfg?.inferenceGatewayApiKey ?? ""));
+          desktopInSync = inSync(desktopBaseUrl, String(cfg?.inferenceGatewayApiKey ?? ""))
+            && JSON.stringify(cfg?.inferenceModels) === JSON.stringify(desktopInferenceModels(currentTiers));
         }
       }
     } catch {
@@ -181,6 +194,46 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
       effort: options.tierStore?.getEffort() ?? "",
     },
   };
+}
+
+/**
+ * Rewrites Claude Desktop's picker labels to the active tier mapping when Desktop uses this gateway.
+ * Runs after the mapping is persisted, so a failure says the mapping itself was kept.
+ */
+function refreshDesktopLabels(options: GatewayOptions): boolean {
+  let files: readonly string[];
+  try {
+    files = refreshDesktopModelLabels(activeTierModels(options));
+  } catch (error) {
+    throw new BridgeError(
+      500,
+      "desktop_labels_refresh_failed",
+      `Tier mapping saved, but Claude Desktop model labels were not updated: ${error instanceof Error ? error.message : "unknown error"}`,
+    );
+  }
+  if (files.length > 0) {
+    recordLog({
+      level: "info",
+      operation: "desktop_labels_refreshed",
+      message: "Updated Claude Desktop model picker labels to the active tier mapping; restart Claude Desktop to see them",
+      details: { provider: options.provider ?? "codex" },
+    });
+  }
+  return files.length > 0;
+}
+
+/** Syncs Desktop session lists after a profile switch and reports it in the activity log. */
+function syncDesktopSessionsAfterSwitch(directions: readonly SyncDirection[]): DesktopSyncReport {
+  const outcome = syncDesktopSessionsWhenClosed(directions, resolveDesktopSessionPaths(), desktopProcessState(), new Date());
+  const report = desktopSyncReport(outcome);
+  const changes = outcome.status === "applied" ? outcome.sync.entries.length : outcome.status === "failed" ? outcome.entries.length : 0;
+  recordLog({
+    level: report.level === "success" ? "info" : report.level === "warning" ? "warn" : "error",
+    operation: "desktop_session_sync",
+    message: report.messages.join(" "),
+    details: { status: outcome.status, changes },
+  });
+  return report;
 }
 
 export async function handleUiRoute(
@@ -372,8 +425,9 @@ export async function handleUiRoute(
       message: `Active provider changed to "${target}"`,
       details: { provider: target },
     });
+    const desktopLabelsUpdated = refreshDesktopLabels(options);
     response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ ok: true, provider: target }));
+    response.end(JSON.stringify({ ok: true, provider: target, desktopLabelsUpdated }));
     return true;
   }
 
@@ -413,8 +467,9 @@ export async function handleUiRoute(
         message: `Saved Claude tier to ${isAnt ? "Antigravity" : "ChatGPT"} model mapping`,
         details: { provider: currentProvider, fable: tiers.fable, opus: tiers.opus, sonnet: tiers.sonnet, haiku: tiers.haiku },
       });
+      const desktopLabelsUpdated = refreshDesktopLabels(options);
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, tiers: store.current(currentProvider), custom: store.isCustom(currentProvider), effort: store.getEffort() ?? "" }));
+      response.end(JSON.stringify({ ok: true, tiers: store.current(currentProvider), custom: store.isCustom(currentProvider), effort: store.getEffort() ?? "", desktopLabelsUpdated }));
     } catch (error) {
       const failure = error instanceof BridgeError
         ? error
@@ -445,14 +500,13 @@ export async function handleUiRoute(
         operation: "tier_mapping_reset",
         message: `Reset Claude tier mapping to ${currentProvider === "antigravity" ? "Antigravity" : "ChatGPT"} environment or built-in defaults`,
       });
+      const desktopLabelsUpdated = refreshDesktopLabels(options);
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, tiers: store.current(currentProvider), custom: store.isCustom(currentProvider) }));
+      response.end(JSON.stringify({ ok: true, tiers: store.current(currentProvider), custom: store.isCustom(currentProvider), desktopLabelsUpdated }));
     } catch (error) {
-      const failure = new BridgeError(
-        500,
-        "tier_mapping_reset_failed",
-        `Could not reset the tier mapping: ${error instanceof Error ? error.message : "unknown error"}.`,
-      );
+      const failure = error instanceof BridgeError
+        ? error
+        : new BridgeError(500, "tier_mapping_reset_failed", `Could not reset the tier mapping: ${error instanceof Error ? error.message : "unknown error"}.`);
       recordLog({ level: "error", operation: "tier_mapping_reset_failed", message: failure.message });
       response.writeHead(failure.status, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ ok: false, error: failure.message }));
@@ -476,12 +530,15 @@ export async function handleUiRoute(
       const effort = typeof body.effort === "string" && body.effort.trim() !== ""
         ? body.effort.trim()
         : options.tierStore?.getEffort();
+      const tiers = activeTierModels(options);
+      const catalog = (options.provider ?? "codex") === "antigravity" ? (options.antigravityModels ?? ANTIGRAVITY_MODELS) : options.availableModels;
       const result = setupConfig(target, {
         gatewayUrl: cleanUrl,
         token,
         model: options.defaultModel,
-        tiers: activeTierModels(options),
+        tiers,
         effort,
+        maxContextTokens: smallestContextWindow(catalog, routedModels(tiers, options.defaultModel)),
       });
       recordLog({
         level: "info",
@@ -489,8 +546,9 @@ export async function handleUiRoute(
         message: `Client configuration applied for "${target}" (gateway: ${gatewayUrl})`,
         details: { target, gatewayUrl },
       });
+      const desktopSessionSync = result.desktopConfigured ? syncDesktopSessionsAfterSwitch(TO_GATEWAY_PROFILE) : null;
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, result }));
+      response.end(JSON.stringify({ ok: true, result, desktopSessionSync }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       recordLog({
@@ -516,8 +574,9 @@ export async function handleUiRoute(
         message: `Client configuration reset for target "${target}"`,
         details: { target },
       });
+      const desktopSessionSync = result.desktopReset ? syncDesktopSessionsAfterSwitch(TO_CLAUDE_PROFILE) : null;
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, result }));
+      response.end(JSON.stringify({ ok: true, result, desktopSessionSync }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       recordLog({
@@ -602,7 +661,6 @@ export function renderDashboardHtml(): string {
       background: var(--background);
       color: var(--foreground);
       min-height: 100vh;
-      padding: clamp(0.75rem, 2.4vw, 1.75rem);
       line-height: 1.55;
       overflow-x: hidden;
     }
@@ -623,6 +681,40 @@ export function renderDashboardHtml(): string {
       flex-direction: column;
       gap: 0.9rem;
     }
+
+    /* App shell: sidebar navigation and main content */
+    .app-layout { display: flex; min-height: 100vh; }
+    .sidebar {
+      width: 250px;
+      flex-shrink: 0;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      padding: 1rem 0.875rem;
+      background: var(--surface);
+      border-right: 1.5px solid var(--line);
+      overflow-y: auto;
+      z-index: 40;
+    }
+    .sidebar-footer { margin-top: auto; padding-top: 1rem; border-top: 1.5px solid var(--line-soft); }
+    .main-wrapper { flex: 1; min-width: 0; padding: clamp(0.75rem, 2.4vw, 1.75rem); }
+    .mobile-bar { display: none; margin-bottom: 0.75rem; }
+    .mobile-toggle-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 2.25rem;
+      height: 2.25rem;
+      padding: 0;
+      border: 1.5px solid var(--line);
+      border-radius: 0.55rem;
+      background: var(--surface);
+      color: var(--ink);
+    }
+    .sidebar-backdrop { display: none; }
 
     /* Header */
     header {
@@ -695,11 +787,11 @@ export function renderDashboardHtml(): string {
       display: flex;
       align-items: center;
       gap: 0.5rem;
-      background: var(--surface);
-      border: 1.5px solid var(--line);
+      flex-wrap: wrap;
+      background: var(--surface-soft);
+      border: 1px solid var(--line-soft);
       border-radius: var(--radius);
-      padding: 0.3rem 0.55rem;
-      box-shadow: 2px 2px 0 var(--line);
+      padding: 0.35rem 0.65rem;
     }
     .provider-label {
       font-size: 0.72rem;
@@ -751,31 +843,59 @@ export function renderDashboardHtml(): string {
       height: 14px;
       display: block;
     }
+    .btn-provider-submit {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      padding: 0.28rem 0.65rem;
+      border-radius: 0.4rem;
+      font-size: 0.75rem;
+      font-weight: 700;
+      border: 1.5px solid var(--border);
+      background: var(--surface-soft);
+      color: var(--ink-faint);
+      box-shadow: 1.5px 1.5px 0 var(--border);
+      transition: all 0.15s ease;
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+    .btn-provider-submit.pending {
+      opacity: 1;
+      cursor: pointer;
+      background: var(--coral);
+      border-color: var(--line);
+      color: #ffffff;
+      box-shadow: 1.5px 1.5px 0 var(--line);
+    }
+    .btn-provider-submit.pending:hover {
+      background: var(--coral-dark);
+      transform: translate(-1px, -1px);
+      box-shadow: 2.5px 2.5px 0 var(--line);
+    }
+    .btn-provider-submit.pending:active {
+      transform: translate(1px, 1px);
+      box-shadow: 1px 1px 0 var(--line);
+    }
     /* Navigation Tabs */
     .nav-tabs {
       display: flex;
-      align-items: center;
-      gap: 0.15rem;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0.3rem;
       background: transparent;
       border: 0;
-      border-bottom: 1.5px solid var(--line);
-      border-radius: 0;
       padding: 0;
       box-shadow: none;
-      overflow-x: auto;
-      scrollbar-width: none;
     }
     .nav-tabs::-webkit-scrollbar { display: none; }
     .nav-tab {
-      display: inline-flex;
+      display: flex;
       align-items: center;
-      gap: 0.5rem;
-      padding: 0.6rem 0.85rem 0.55rem;
-      border-bottom: 3px solid transparent;
-      border-left: 0;
-      border-right: 0;
-      border-top: 0;
-      border-radius: 0.45rem 0.45rem 0 0;
+      gap: 0.6rem;
+      padding: 0.6rem 0.75rem;
+      border: 0;
+      border-left: 3px solid transparent;
+      border-radius: 0.45rem;
       flex: 0 0 auto;
       font-family: var(--font-display);
       font-size: 0.8125rem;
@@ -792,9 +912,10 @@ export function renderDashboardHtml(): string {
     .nav-tab.active {
       color: var(--coral-dark);
       background: #fff8df;
-      border-bottom-color: var(--coral);
+      border-left-color: var(--coral);
     }
     .tab-badge {
+      margin-left: auto;
       font-family: var(--font-mono);
       font-size: 0.6875rem;
       padding: 0.1rem 0.4rem;
@@ -856,16 +977,27 @@ export function renderDashboardHtml(): string {
       color: var(--muted-foreground);
     }
 
+    .card-section-divider {
+      height: 1.5px;
+      background: var(--border-subtle);
+      border: none;
+      margin: 0.25rem 0;
+    }
+    .setup-section {
+      display: flex;
+      flex-direction: column;
+      gap: 0.9rem;
+    }
+
     /* Gateway Compact Bar */
     .gateway-bar {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 0.85rem;
-      background: var(--card);
-      border: 1.5px solid var(--line);
-      border-radius: 1rem 0.85rem 1.1rem 0.9rem;
-      padding: 0.9rem 1.15rem;
-      box-shadow: var(--card-shadow);
+      background: var(--surface-soft);
+      border: 1px solid var(--line-soft);
+      border-radius: 0.7rem 0.6rem 0.75rem 0.6rem;
+      padding: 0.85rem 1rem;
     }
     .gateway-field {
       display: flex;
@@ -1643,6 +1775,27 @@ export function renderDashboardHtml(): string {
     }
 
     /* Responsive */
+    @media (max-width: 960px) {
+      .sidebar {
+        position: fixed;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        height: auto;
+        transform: translateX(-100%);
+        transition: transform 0.25s ease;
+        box-shadow: 4px 0 0 var(--paper-deep);
+      }
+      .sidebar.open { transform: translateX(0); }
+      .mobile-bar { display: flex; }
+      .sidebar-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 35;
+        background: rgba(23, 32, 29, 0.4);
+      }
+      .sidebar-backdrop.active { display: block; }
+    }
     @media (max-width: 768px) {
       header { align-items: flex-start; flex-direction: column; }
       .gateway-bar { grid-template-columns: 1fr; }
@@ -1657,7 +1810,7 @@ export function renderDashboardHtml(): string {
       .logs-controls { flex-wrap: wrap; }
     }
     @media (max-width: 480px) {
-      body { padding: 0.75rem; }
+      .main-wrapper { padding: 0.75rem; }
       header { gap: 0.75rem; }
       .brand-text h1 { font-size: 1.05rem; }
       .status-badge { font-size: 0.7rem; }
@@ -1676,8 +1829,8 @@ export function renderDashboardHtml(): string {
   </style>
 </head>
 <body>
-  <div class="container">
-    <!-- Header -->
+  <div class="app-layout">
+    <aside class="sidebar" id="app-sidebar">
     <header>
       <div class="brand">
         <div class="brand-icon">CC</div>
@@ -1686,38 +1839,13 @@ export function renderDashboardHtml(): string {
           <p>Local gateway · Claude client setup</p>
         </div>
       </div>
-      <div class="provider-bar">
-        <span class="provider-label">Provider</span>
-        <div class="provider-group" id="provider-selector" role="radiogroup" aria-label="Active LLM Provider">
-          <button class="provider-btn active" id="btn-provider-codex" type="button" data-provider="codex" role="radio" aria-checked="true" title="Use ChatGPT Codex subscription">
-            <span class="p-icon">
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
-            </span>
-            <span>ChatGPT (Codex)</span>
-          </button>
-          <button class="provider-btn" id="btn-provider-antigravity" type="button" data-provider="antigravity" role="radio" aria-checked="false" title="Use Google Antigravity (agy) session">
-            <span class="p-icon">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.04 19.32Q12 21.51 12 24q0-2.49.93-4.68.96-2.19 2.58-3.81t3.81-2.55Q21.51 12 24 12q-2.49 0-4.68-.93a12.3 12.3 0 0 1-3.81-2.58 12.3 12.3 0 0 1-2.58-3.81Q12 2.49 12 0q0 2.49-.96 4.68-.93 2.19-2.55 3.81a12.3 12.3 0 0 1-3.81 2.58Q2.49 12 0 12q2.49 0 4.68.96 2.19.93 3.81 2.55t2.55 3.81"/></svg>
-            </span>
-            <span>Antigravity (agy)</span>
-          </button>
-        </div>
-      </div>
-      <div class="status-badge" id="gateway-badge">
-        <span class="pulse-dot"></span>
-        <span id="gateway-status-text">Checking gateway...</span>
-      </div>
     </header>
 
     <!-- Navigation Tabs -->
     <nav class="nav-tabs" role="tablist" aria-label="Control Panel Sections">
       <button class="nav-tab active" data-tab="tab-setup" role="tab" aria-selected="true" id="tab-btn-setup" type="button">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-        <span>Overview & Clients</span>
-      </button>
-      <button class="nav-tab" data-tab="tab-routing" role="tab" aria-selected="false" id="tab-btn-routing" type="button">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg>
-        <span>Model Routing</span>
+        <span>Setup</span>
       </button>
       <button class="nav-tab" data-tab="tab-usage" role="tab" aria-selected="false" id="tab-btn-usage" type="button">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
@@ -1735,157 +1863,203 @@ export function renderDashboardHtml(): string {
       </button>
     </nav>
 
-    <!-- Tab 1: Overview & Clients -->
-    <div class="tab-pane active" id="tab-setup" role="tabpanel">
-      <!-- Gateway Credentials Bar -->
-      <div class="gateway-bar">
-        <div class="gateway-field">
-          <div class="gateway-label-row">
-            <span class="gateway-label">Gateway Endpoint</span>
-            <span class="badge-sub badge-active" id="val-auth-mode">Token Protected</span>
-          </div>
-          <div class="input-group">
-            <input type="text" id="input-url" placeholder="http://127.0.0.1:3456" readonly />
-            <span id="val-gateway-url" style="display:none">--</span>
-            <button class="btn btn-secondary btn-sm" id="btn-copy-url" type="button" title="Copy Gateway URL">Copy</button>
-          </div>
-        </div>
-        <div class="gateway-field">
-          <div class="gateway-label-row">
-            <span class="gateway-label">Auth Token</span>
-            <button class="btn-link" id="btn-toggle-token" type="button">Show</button>
-          </div>
-          <div class="input-group">
-            <input type="password" id="input-token" autocomplete="off" placeholder="No token required" readonly />
-            <button class="btn btn-secondary btn-sm" id="btn-copy-token" type="button" title="Copy token">Copy</button>
-          </div>
-        </div>
+
+    <div class="sidebar-footer">
+      <div class="status-badge" id="gateway-badge">
+        <span class="pulse-dot"></span>
+        <span id="gateway-status-text">Checking gateway...</span>
       </div>
+    </div>
+    </aside>
+    <div class="sidebar-backdrop" id="sidebar-backdrop" aria-hidden="true"></div>
 
-      <!-- Clients Configuration Card -->
-      <section class="card" aria-labelledby="configuration-title">
-        <div class="card-header">
-          <h2 class="card-title" id="configuration-title">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-            Claude Clients Connection
-          </h2>
-          <span class="card-desc">Sync settings for Claude Code CLI and Desktop app</span>
-        </div>
-
-        <div class="clients-grid">
-          <!-- Claude Code CLI Card -->
-          <div class="client-card">
-            <div class="client-card-header">
-              <div class="client-title">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-                Claude Code CLI
-              </div>
-              <span class="badge-sub" id="badge-cli">Checking...</span>
-            </div>
-            <div class="client-path" id="val-cli-path">~/.claude/settings.json</div>
-            <div class="client-actions">
-              <button class="btn btn-secondary btn-sm" id="btn-quick-cli" type="button">Sync CLI</button>
-            </div>
+    <main class="main-wrapper">
+      <div class="mobile-bar">
+        <button class="mobile-toggle-btn" id="btn-toggle-sidebar" type="button" aria-label="Toggle navigation menu">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+      </div>
+    <div class="container">
+    <!-- Setup: provider, gateway endpoint, Claude clients and model map -->
+    <div class="tab-pane active" id="tab-setup" role="tabpanel">
+      <section class="card" aria-label="Setup and configuration">
+        <!-- Top row: Provider switcher -->
+        <div class="provider-bar">
+          <span class="provider-label">Provider</span>
+          <div class="provider-group" id="provider-selector" role="radiogroup" aria-label="Active LLM Provider">
+            <button class="provider-btn active" id="btn-provider-codex" type="button" data-provider="codex" role="radio" aria-checked="true" title="Use ChatGPT Codex subscription">
+              <span class="p-icon">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
+              </span>
+              <span>ChatGPT (Codex)</span>
+            </button>
+            <button class="provider-btn" id="btn-provider-antigravity" type="button" data-provider="antigravity" role="radio" aria-checked="false" title="Use Google Antigravity (agy) session">
+              <span class="p-icon">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+              </span>
+              <span>Antigravity (agy)</span>
+            </button>
           </div>
-
-          <!-- Claude Desktop Card -->
-          <div class="client-card">
-            <div class="client-card-header">
-              <div class="client-title">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-                Claude Desktop
-              </div>
-              <span class="badge-sub" id="badge-desktop">Checking...</span>
-            </div>
-            <div class="client-path">Claude-3p/configLibrary</div>
-            <div class="client-actions">
-              <button class="btn btn-secondary btn-sm" id="btn-quick-desktop" type="button">Sync Desktop</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="setup-toolbar">
-          <div class="setup-target-group">
-            <label for="select-target">Apply target:</label>
-            <select id="select-target">
-              <option value="all">Both clients (Recommended)</option>
-              <option value="cli">Claude Code CLI only (~/.claude/settings.json)</option>
-              <option value="desktop">Claude Desktop only</option>
-            </select>
-          </div>
-          <button class="btn btn-primary" id="btn-apply" type="button">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-            Apply configuration
+          <button class="btn btn-primary btn-provider-submit" id="btn-provider-submit" type="button" disabled title="Click to apply and switch provider">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            <span>Submit</span>
           </button>
         </div>
 
-        <p class="instruction-card"><strong>Next:</strong> Restart Claude Desktop and choose “Continue with Gateway” (not claude.ai). Reload your terminal or editor before running <code>claude</code>.</p>
-      </section>
-    </div>
+        <p class="instruction-card" id="provider-hint" hidden>Antigravity needs the <code>agy</code> CLI. Put agy on the gateway's PATH, or set <code>CODEX2CC_AGY_BIN</code> to its full path, then restart the gateway.</p>
 
-    <!-- Tab 2: Model Routing -->
-    <div class="tab-pane" id="tab-routing" role="tabpanel">
-      <section class="card" aria-labelledby="tier-mapping-title">
-        <div class="card-header">
-          <h2 class="card-title" id="tier-mapping-title">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg>
-            Model routing
-          </h2>
-          <span class="badge-sub" id="tier-mapping-status">Loading…</span>
-        </div>
-        <p class="card-desc" id="tier-mapping-desc">Map each Claude tier to a backend model. Changes apply immediately upon saving.</p>
-
-        <div class="tier-grid">
-          <div class="tier-item">
-            <div class="tier-label-row">
-              <label for="tier-fable" class="tier-name">Fable</label>
-              <span class="tier-hint">Preview</span>
+        <!-- Gateway Credentials Bar -->
+        <div class="gateway-bar">
+          <div class="gateway-field">
+            <div class="gateway-label-row">
+              <span class="gateway-label">Gateway Endpoint</span>
+              <span class="badge-sub badge-active" id="val-auth-mode">Token Protected</span>
             </div>
-            <select id="tier-fable" data-tier="fable"></select>
+            <div class="input-group">
+              <input type="text" id="input-url" placeholder="http://127.0.0.1:3456" readonly />
+              <span id="val-gateway-url" style="display:none">--</span>
+              <button class="btn btn-secondary btn-sm" id="btn-copy-url" type="button" title="Copy Gateway URL">Copy</button>
+            </div>
           </div>
-          <div class="tier-item">
-            <div class="tier-label-row">
-              <label for="tier-opus" class="tier-name">Opus</label>
-              <span class="tier-hint">Reasoning</span>
+          <div class="gateway-field">
+            <div class="gateway-label-row">
+              <span class="gateway-label">Auth Token</span>
+              <button class="btn-link" id="btn-toggle-token" type="button">Show</button>
             </div>
-            <select id="tier-opus" data-tier="opus"></select>
-          </div>
-          <div class="tier-item">
-            <div class="tier-label-row">
-              <label for="tier-sonnet" class="tier-name">Sonnet</label>
-              <span class="tier-hint">Coding / Daily</span>
+            <div class="input-group">
+              <input type="password" id="input-token" autocomplete="off" placeholder="No token required" readonly />
+              <button class="btn btn-secondary btn-sm" id="btn-copy-token" type="button" title="Copy token">Copy</button>
             </div>
-            <select id="tier-sonnet" data-tier="sonnet"></select>
-          </div>
-          <div class="tier-item">
-            <div class="tier-label-row">
-              <label for="tier-haiku" class="tier-name">Haiku</label>
-              <span class="tier-hint">Fast / Light</span>
-            </div>
-            <select id="tier-haiku" data-tier="haiku"></select>
           </div>
         </div>
 
-        <div class="effort-row" style="display:flex;align-items:center;justify-content:space-between;margin-top:1.25rem;padding:0.75rem 1rem;background:var(--bg-sub,rgba(0,0,0,0.03));border:1px solid var(--border-color,#e2e8f0);border-radius:8px;">
-          <div>
-            <label for="select-effort" style="font-weight:600;font-size:0.875rem;">Thinking Level</label>
-            <p style="font-size:0.75rem;color:var(--text-muted,#64748b);margin:0.15rem 0 0 0;">Default thinking level applied to reasoning models (saved to settings.json).</p>
+        <div class="card-section-divider"></div>
+
+        <!-- Clients Configuration Section -->
+        <div class="setup-section" aria-labelledby="configuration-title">
+          <div class="card-header">
+            <h2 class="card-title" id="configuration-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+              Claude Clients Connection
+            </h2>
+            <span class="card-desc">Sync settings for Claude Code CLI and Desktop app</span>
           </div>
-          <select id="select-effort" style="width:auto;min-width:140px;padding:0.4rem 0.6rem;border-radius:6px;border:1px solid var(--border-color,#cbd5e1);background:var(--bg-card,#fff);color:inherit;">
-            <option value="">Default (None)</option>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High</option>
-            <option value="xhigh">X-High</option>
-            <option value="max">Max</option>
-          </select>
+
+          <div class="clients-grid">
+            <!-- Claude Code CLI Card -->
+            <div class="client-card">
+              <div class="client-card-header">
+                <div class="client-title">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                  Claude Code CLI
+                </div>
+                <span class="badge-sub" id="badge-cli">Checking...</span>
+              </div>
+              <div class="client-path" id="val-cli-path">~/.claude/settings.json</div>
+              <div class="client-actions">
+                <button class="btn btn-secondary btn-sm" id="btn-quick-cli" type="button">Sync CLI</button>
+              </div>
+            </div>
+
+            <!-- Claude Desktop Card -->
+            <div class="client-card">
+              <div class="client-card-header">
+                <div class="client-title">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                  Claude Desktop
+                </div>
+                <span class="badge-sub" id="badge-desktop">Checking...</span>
+              </div>
+              <div class="client-path">Claude-3p/configLibrary</div>
+              <div class="client-actions">
+                <button class="btn btn-secondary btn-sm" id="btn-quick-desktop" type="button">Sync Desktop</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="setup-toolbar">
+            <div class="setup-target-group">
+              <label for="select-target">Apply target:</label>
+              <select id="select-target">
+                <option value="all">Both clients (Recommended)</option>
+                <option value="cli">Claude Code CLI only (~/.claude/settings.json)</option>
+                <option value="desktop">Claude Desktop only</option>
+              </select>
+            </div>
+            <button class="btn btn-primary" id="btn-apply" type="button">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+              Apply configuration
+            </button>
+          </div>
+
+          <p class="instruction-card"><strong>Next:</strong> Restart Claude Desktop and choose “Continue with Gateway” (not claude.ai). Reload your terminal or editor before running <code>claude</code>.</p>
         </div>
 
-        <div class="tier-actions">
-          <span class="supporting-text">Re-apply client setup and reload Claude Code to refresh saved model aliases.</span>
-          <div style="display:flex;gap:0.5rem;">
-            <button class="btn btn-secondary btn-sm" id="btn-reset-tier-mapping" type="button">Use defaults</button>
-            <button class="btn btn-primary btn-sm" id="btn-save-tier-mapping" type="button">Save mapping</button>
+        <div class="card-section-divider"></div>
+
+        <!-- Model Routing Section -->
+        <div class="setup-section" aria-labelledby="tier-mapping-title">
+          <div class="card-header">
+            <h2 class="card-title" id="tier-mapping-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+              Model routing
+            </h2>
+            <span class="badge-sub" id="tier-mapping-status">Loading…</span>
+          </div>
+          <p class="card-desc" id="tier-mapping-desc">Map each Claude tier to a backend model. Changes apply immediately upon saving.</p>
+
+          <div class="tier-grid">
+            <div class="tier-item">
+              <div class="tier-label-row">
+                <label for="tier-fable" class="tier-name">Fable</label>
+                <span class="tier-hint">Preview</span>
+              </div>
+              <select id="tier-fable" data-tier="fable"></select>
+            </div>
+            <div class="tier-item">
+              <div class="tier-label-row">
+                <label for="tier-opus" class="tier-name">Opus</label>
+                <span class="tier-hint">Reasoning</span>
+              </div>
+              <select id="tier-opus" data-tier="opus"></select>
+            </div>
+            <div class="tier-item">
+              <div class="tier-label-row">
+                <label for="tier-sonnet" class="tier-name">Sonnet</label>
+                <span class="tier-hint">Coding / Daily</span>
+              </div>
+              <select id="tier-sonnet" data-tier="sonnet"></select>
+            </div>
+            <div class="tier-item">
+              <div class="tier-label-row">
+                <label for="tier-haiku" class="tier-name">Haiku</label>
+                <span class="tier-hint">Fast / Light</span>
+              </div>
+              <select id="tier-haiku" data-tier="haiku"></select>
+            </div>
+          </div>
+
+          <div class="effort-row" style="display:flex;align-items:center;justify-content:space-between;padding:0.75rem 1rem;background:var(--surface-soft);border:1px solid var(--line-soft);border-radius:0.6rem;">
+            <div>
+              <label for="select-effort" style="font-weight:600;font-size:0.875rem;">Thinking Level</label>
+              <p style="font-size:0.75rem;color:var(--muted-foreground);margin:0.15rem 0 0 0;">Default thinking level applied to reasoning models (saved to settings.json).</p>
+            </div>
+            <select id="select-effort" style="width:auto;min-width:140px;padding:0.4rem 0.6rem;border-radius:0.45rem;border:1.5px solid var(--input);background:var(--surface);color:inherit;">
+              <option value="">Default (None)</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="xhigh">X-High</option>
+              <option value="max">Max</option>
+            </select>
+          </div>
+
+          <div class="tier-actions">
+            <span class="supporting-text">Re-apply client setup and reload Claude Code to refresh saved model aliases.</span>
+            <div style="display:flex;gap:0.5rem;">
+              <button class="btn btn-secondary btn-sm" id="btn-reset-tier-mapping" type="button">Use defaults</button>
+              <button class="btn btn-primary btn-sm" id="btn-save-tier-mapping" type="button">Save mapping</button>
+            </div>
           </div>
         </div>
       </section>
@@ -2111,6 +2285,8 @@ export function renderDashboardHtml(): string {
         </div>
       </details>
     </div>
+    </div>
+    </main>
   </div>
 
   <div id="toast" role="status" aria-live="polite"></div>
@@ -2126,6 +2302,18 @@ export function renderDashboardHtml(): string {
     }
 
     /* Tab Controller */
+    const appSidebar = document.getElementById("app-sidebar");
+    const sidebarBackdrop = document.getElementById("sidebar-backdrop");
+
+    function toggleSidebar(forceState) {
+      const isOpen = forceState !== undefined ? forceState : !appSidebar.classList.contains("open");
+      appSidebar.classList.toggle("open", isOpen);
+      sidebarBackdrop.classList.toggle("active", isOpen);
+    }
+
+    document.getElementById("btn-toggle-sidebar").addEventListener("click", () => toggleSidebar());
+    sidebarBackdrop.addEventListener("click", () => toggleSidebar(false));
+
     function setupTabs() {
       const tabs = document.querySelectorAll(".nav-tab");
       const panes = document.querySelectorAll(".tab-pane");
@@ -2149,7 +2337,10 @@ export function renderDashboardHtml(): string {
       }
 
       tabs.forEach(tab => {
-        tab.addEventListener("click", () => activateTab(tab.dataset.tab));
+        tab.addEventListener("click", () => {
+          activateTab(tab.dataset.tab);
+          toggleSidebar(false);
+        });
       });
 
       const hash = window.location.hash.replace("#", "");
@@ -2174,23 +2365,63 @@ export function renderDashboardHtml(): string {
       }
     }
 
+    let currentActiveProvider = "codex";
+    let selectedProvider = "codex";
+    let isProviderSwitching = false;
+
+    function updateProviderControls(availableList) {
+      const btnCodex = document.getElementById("btn-provider-codex");
+      const btnAnt = document.getElementById("btn-provider-antigravity");
+      const btnSubmit = document.getElementById("btn-provider-submit");
+      if (!btnCodex || !btnAnt) return;
+
+      if (Array.isArray(availableList)) {
+        const antigravityReady = availableList.some((p) => p.id === "antigravity" && p.available);
+        btnAnt.disabled = !antigravityReady && currentActiveProvider !== "antigravity";
+        btnAnt.title = antigravityReady ? "Use Google Antigravity (agy) session" : "agy binary not found on PATH";
+        document.getElementById("provider-hint").hidden = antigravityReady;
+      }
+
+      btnCodex.classList.toggle("active", selectedProvider === "codex");
+      btnCodex.setAttribute("aria-checked", selectedProvider === "codex" ? "true" : "false");
+      btnAnt.classList.toggle("active", selectedProvider === "antigravity");
+      btnAnt.setAttribute("aria-checked", selectedProvider === "antigravity" ? "true" : "false");
+
+      const isPending = selectedProvider !== currentActiveProvider;
+      if (btnSubmit) {
+        btnSubmit.disabled = isProviderSwitching || !isPending;
+        btnSubmit.classList.toggle("pending", isPending && !isProviderSwitching);
+        if (isPending) {
+          btnSubmit.title = "Click to apply and switch to " + (selectedProvider === "antigravity" ? "Google Antigravity" : "ChatGPT Codex");
+        } else {
+          btnSubmit.title = "Active provider already selected";
+        }
+      }
+    }
+
+    function selectProvider(target) {
+      if (isProviderSwitching) return;
+      if (target !== "codex" && target !== "antigravity") return;
+      const btn = document.getElementById(target === "codex" ? "btn-provider-codex" : "btn-provider-antigravity");
+      if (btn?.disabled) return;
+      selectedProvider = target;
+      updateProviderControls();
+    }
+
     function renderStatus(s) {
       document.getElementById("val-gateway-url").textContent = s.gateway.url;
       document.getElementById("val-auth-mode").textContent = s.gateway.policyMode === "token" ? "Token Protected" : "Open (--no-auth)";
 
       if (s.provider) {
-        const active = s.provider.active;
-        const btnCodex = document.getElementById("btn-provider-codex");
-        const btnAnt = document.getElementById("btn-provider-antigravity");
-        if (btnCodex && btnAnt) {
-          btnCodex.classList.toggle("active", active === "codex");
-          btnCodex.setAttribute("aria-checked", active === "codex" ? "true" : "false");
-          btnAnt.classList.toggle("active", active === "antigravity");
-          btnAnt.setAttribute("aria-checked", active === "antigravity" ? "true" : "false");
+        const previousActiveProvider = currentActiveProvider;
+        currentActiveProvider = s.provider.active;
+        if (!isProviderSwitching) {
+          selectedProvider = selectedProvider === previousActiveProvider ? currentActiveProvider : selectedProvider;
         }
+        updateProviderControls(s.provider.available);
         const descElem = document.getElementById("tier-mapping-desc");
         if (descElem) {
-          descElem.textContent = active === "antigravity"
+          descElem.textContent = currentActiveProvider === "antigravity"
             ? "Map each Claude tier to a Google Antigravity (agy) model. Changes apply immediately upon saving."
             : "Map each Claude tier to a ChatGPT backend model. Changes apply immediately upon saving.";
         }
@@ -2239,8 +2470,38 @@ export function renderDashboardHtml(): string {
       }
     }
 
-    document.getElementById("btn-provider-codex")?.addEventListener("click", () => switchProvider("codex"));
-    document.getElementById("btn-provider-antigravity")?.addEventListener("click", () => switchProvider("antigravity"));
+    document.getElementById("btn-provider-codex")?.addEventListener("click", () => selectProvider("codex"));
+    document.getElementById("btn-provider-antigravity")?.addEventListener("click", () => selectProvider("antigravity"));
+
+    document.getElementById("btn-provider-submit")?.addEventListener("click", async () => {
+      if (selectedProvider === currentActiveProvider || isProviderSwitching) return;
+      if (hasUnsavedTierChanges()) {
+        if (!confirm("You have unsaved model routing edits for the current provider. Switch anyway?")) return;
+      }
+      const btnSubmit = document.getElementById("btn-provider-submit");
+      isProviderSwitching = true;
+      if (btnSubmit) {
+        btnSubmit.disabled = true;
+        btnSubmit.textContent = "Switching…";
+      }
+      try {
+        await switchProvider(selectedProvider);
+      } finally {
+        isProviderSwitching = false;
+        if (btnSubmit) {
+          btnSubmit.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> <span>Submit</span>';
+        }
+        updateProviderControls();
+      }
+    });
+
+    /* True when the model map holds selections that differ from the mapping saved on the server. */
+    function hasUnsavedTierChanges() {
+      const saved = currentStatus?.tierMapping;
+      if (!saved) return false;
+      const tiersChanged = ["fable", "opus", "sonnet", "haiku"].some((tier) => document.getElementById("tier-" + tier).value !== saved.current[tier]);
+      return tiersChanged || document.getElementById("select-effort").value !== (saved.effort || "");
+    }
 
     function renderTierMapping(mapping) {
       const tiers = ["fable", "opus", "sonnet", "haiku"];
@@ -2781,7 +3042,7 @@ export function renderDashboardHtml(): string {
         }
         if (statusText) {
           statusText.innerHTML = data.antigravity?.available !== false
-            ? '<span style="color:var(--primary);font-weight:600;">Connected · agy on PATH (Google Antigravity Session)</span>'
+            ? '<span style="color:var(--primary);font-weight:600;">Connected · agy on PATH</span>'
             : '<span style="color:var(--coral-dark);font-weight:600;">agy binary not detected on PATH</span>';
         }
         const name5h = document.querySelector("#card-quota-5h .quota-window-name");

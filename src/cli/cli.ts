@@ -23,6 +23,7 @@ export type CliCommand =
       readonly kind: "reset-config";
       readonly target: "cli" | "desktop" | "all";
     }
+  | { readonly kind: "sync-desktop-sessions"; readonly dryRun: boolean }
   | { readonly kind: "claude"; readonly model: string | undefined; readonly claudeArgs: readonly string[]; readonly provider?: ProviderType | undefined };
 
 export const USAGE = `Usage: codex2cc [options] [-- <claude arguments>]
@@ -38,6 +39,8 @@ Modes (default: launch Claude Code):
   --reset-config            Reset both Claude Code CLI and Claude Desktop configurations
   --reset-cli               Reset Claude Code CLI configuration
   --reset-desktop           Reset Claude Desktop configuration
+  --sync-desktop-sessions   Copy missing Code-tab sessions between the Desktop claude.ai and
+                            gateway profiles (Claude Desktop must be closed)
   --list-models             Print the models available to your ChatGPT account
   -h, --help                Show this help
 
@@ -49,6 +52,7 @@ Options:
   --gateway-url, --url <u>  Base URL for setup (default: http://127.0.0.1:${DEFAULT_PORT})
   --token <secret>          API key/token for setup (or CODEX2CC_TOKEN)
   --provider <name>         Backend provider: codex (ChatGPT) or antigravity (Google agy)
+  --dry-run                 With --sync-desktop-sessions: show what would be copied, change nothing
   -p, --print <prompt>      Run Claude Code non-interactively
   -c, --continue            Continue the previous Claude Code session
   --permission-mode <mode>  Claude Code permission mode
@@ -79,6 +83,8 @@ const OPTIONS = {
   "reset-config": { type: "boolean" },
   "reset-cli": { type: "boolean" },
   "reset-desktop": { type: "boolean" },
+  "sync-desktop-sessions": { type: "boolean" },
+  "dry-run": { type: "boolean" },
   "gateway-url": { type: "string" },
   url: { type: "string" },
   token: { type: "string" },
@@ -107,7 +113,7 @@ function parsePort(raw: string | undefined): number {
 /**
  * Parses codex2cc arguments. Everything before `--` configures the gateway and is validated
  * strictly; everything after it is passed to Claude Code unchanged. Mode precedence:
- * --help, --ui, --list-models, --reset-config/cli/desktop, --setup/cli/desktop, --serve.
+ * --help, --ui, --list-models, --sync-desktop-sessions, --reset-config/cli/desktop, --setup/cli/desktop, --serve.
  */
 export function parseCli(argv: readonly string[]): CliCommand {
   const separator = argv.indexOf("--");
@@ -125,6 +131,10 @@ export function parseCli(argv: readonly string[]): CliCommand {
   if (values.help) return { kind: "help" };
   if (values.ui) return { kind: "ui", model, port: parsePort(values.port), ...(provider !== undefined ? { provider } : {}) };
   if (values["list-models"]) return { kind: "list-models", ...(provider !== undefined ? { provider } : {}) };
+
+  const dryRun = values["dry-run"] === true;
+  if (values["sync-desktop-sessions"]) return { kind: "sync-desktop-sessions", dryRun };
+  if (dryRun) throw new BridgeError(400, "invalid_arguments", "--dry-run is only valid with --sync-desktop-sessions.");
 
   if (values["reset-config"] || values["reset-cli"] || values["reset-desktop"]) {
     const target = values["reset-config"] ? "all" : values["reset-desktop"] ? "desktop" : "cli";

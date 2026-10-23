@@ -4,6 +4,8 @@ import { createServer, type ServerResponse } from "node:http";
 import {
   AnthropicStream,
   BridgeError,
+  decodeReasoningSignature,
+  encodeReasoningSignature,
   estimateInputTokens,
   MessageAccumulator,
   MessageRequest,
@@ -516,11 +518,11 @@ test("AnthropicStream emits an empty text block when the response has no content
   assert.throws(() => failing.stream.assertCompleted(), (error: unknown) => error instanceof BridgeError && error.code === "upstream_truncated");
 });
 
-test("MessageAccumulator returns every parallel tool call and tolerates malformed arguments", () => {
+test("MessageAccumulator returns every parallel tool call and rejects malformed arguments", () => {
   const accumulator = new MessageAccumulator("gpt-model");
   accumulator.accept({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", name: "Read", call_id: "call_a" } });
   accumulator.accept({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", name: "Grep", call_id: "call_b" } });
-  accumulator.accept({ type: "response.function_call_arguments.delta", output_index: 1, delta: "{broken" });
+  accumulator.accept({ type: "response.function_call_arguments.delta", output_index: 1, delta: '{"p":"b"}' });
   accumulator.accept({ type: "response.function_call_arguments.delta", output_index: 0, delta: '{"path":"a"}' });
   accumulator.accept({ type: "response.output_item.done", output_index: 0, item: { type: "function_call", name: "Read", call_id: "call_a" } });
   accumulator.accept({ type: "response.output_item.done", output_index: 1, item: { type: "function_call", name: "Grep", call_id: "call_b" } });
@@ -528,9 +530,44 @@ test("MessageAccumulator returns every parallel tool call and tolerates malforme
   const message = accumulator.buildMessage() as { content: unknown[]; stop_reason: string };
   assert.deepEqual(message.content, [
     { type: "tool_use", id: "call_a", name: "Read", input: { path: "a" } },
-    { type: "tool_use", id: "call_b", name: "Grep", input: {} },
+    { type: "tool_use", id: "call_b", name: "Grep", input: { p: "b" } },
   ]);
   assert.equal(message.stop_reason, "tool_use");
+
+  const malformed = new MessageAccumulator("gpt-model");
+  malformed.accept({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", name: "Bash", call_id: "call_c" } });
+  malformed.accept({ type: "response.function_call_arguments.delta", output_index: 0, delta: '{"command": "rm -' });
+  malformed.accept({ type: "response.output_item.done", output_index: 0, item: { type: "function_call", name: "Bash", call_id: "call_c" } });
+  assert.throws(
+    () => malformed.accept({ type: "response.completed", response: { id: "resp_1" } }),
+    (error: unknown) => error instanceof BridgeError && error.code === "invalid_tool_arguments" && error.status === 502,
+    "a completed response with unparseable arguments is an upstream defect",
+  );
+});
+
+test("a tool call cut off by the output limit ends with max_tokens and is never returned for execution", () => {
+  const accumulator = new MessageAccumulator("gpt-model");
+  accumulator.accept({ type: "response.output_text.delta", delta: "Running it." });
+  accumulator.accept({ type: "response.output_text.done" });
+  accumulator.accept({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", name: "Bash", call_id: "call_cut" } });
+  accumulator.accept({ type: "response.function_call_arguments.delta", output_index: 1, delta: '{"command": "rm -' });
+  accumulator.accept({ type: "response.output_item.done", output_index: 1, item: { type: "function_call", name: "Bash", call_id: "call_cut" } });
+  accumulator.accept({ type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" }, usage: { input_tokens: 4, output_tokens: 64 } } });
+  accumulator.assertCompleted();
+  const message = accumulator.buildMessage() as { content: unknown[]; stop_reason: string; usage: unknown };
+  assert.equal(message.stop_reason, "max_tokens");
+  assert.deepEqual(message.content, [{ type: "text", text: "Running it." }]);
+  assert.deepEqual(message.usage, { input_tokens: 4, output_tokens: 64 });
+
+  const filtered = new MessageAccumulator("gpt-model");
+  filtered.accept({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", name: "Bash", call_id: "call_f" } });
+  filtered.accept({ type: "response.function_call_arguments.delta", output_index: 0, delta: "{bad" });
+  filtered.accept({ type: "response.output_item.done", output_index: 0, item: { type: "function_call", name: "Bash", call_id: "call_f" } });
+  assert.throws(
+    () => filtered.accept({ type: "response.incomplete", response: { incomplete_details: { reason: "content_filter" } } }),
+    (error: unknown) => error instanceof BridgeError && error.code === "invalid_tool_arguments",
+    "only the output limit excuses unparseable arguments",
+  );
 });
 
 test("toOpenAIRequest translates output_config.effort and reasoning_effort into reasoning object", () => {
@@ -540,7 +577,7 @@ test("toOpenAIRequest translates output_config.effort and reasoning_effort into 
     output_config: { effort: "high" },
   });
   const converted1 = toOpenAIRequest(req1, "gpt-6.1-sol");
-  assert.deepEqual(converted1.reasoning, { effort: "high" });
+  assert.deepEqual(converted1.reasoning, { effort: "high", summary: "auto" });
 
   const req2 = MessageRequest.parse({
     model: "claude-3-7-sonnet-20250219",
@@ -548,7 +585,7 @@ test("toOpenAIRequest translates output_config.effort and reasoning_effort into 
     output_config: { effort: "max" },
   });
   const converted2 = toOpenAIRequest(req2, "gpt-6.1-sol");
-  assert.deepEqual(converted2.reasoning, { effort: "max" });
+  assert.deepEqual(converted2.reasoning, { effort: "max", summary: "auto" });
 
   const req3 = MessageRequest.parse({
     model: "claude-3-7-sonnet-20250219",
@@ -556,11 +593,157 @@ test("toOpenAIRequest translates output_config.effort and reasoning_effort into 
     reasoning_effort: "low",
   });
   const converted3 = toOpenAIRequest(req3, "gpt-6-sol");
-  assert.deepEqual(converted3.reasoning, { effort: "low" });
+  assert.deepEqual(converted3.reasoning, { effort: "low", summary: "auto" });
 
   assert.throws(() => MessageRequest.parse({
     model: "claude-sonnet-5-5",
     messages: [{ role: "user", content: "hello" }],
     output_config: { effort: "invalid" },
   }));
+});
+
+test("non-streaming upstream failures and truncation raise instead of returning an empty message", () => {
+  const failed = new MessageAccumulator("gpt-model");
+  failed.accept({ type: "response.created", response: { id: "resp_1" } });
+  assert.throws(
+    () => failed.accept({ type: "response.failed", response: { error: { code: "server_error", message: "boom" } } }),
+    (error: unknown) => error instanceof BridgeError && error.status === 502 && error.code === "server_error",
+  );
+  const bareError = new MessageAccumulator("gpt-model");
+  assert.throws(
+    () => bareError.accept({ type: "error", code: "rate_limit_exceeded", message: "slow down" }),
+    (error: unknown) => error instanceof BridgeError && error.status === 429 && error.message === "slow down",
+  );
+  const truncated = new MessageAccumulator("gpt-model");
+  truncated.accept({ type: "response.output_text.delta", delta: "partial" });
+  assert.throws(() => truncated.assertCompleted(), (error: unknown) => error instanceof BridgeError && error.code === "upstream_truncated");
+});
+
+test("response.incomplete at the output limit ends with stop_reason max_tokens in both modes", () => {
+  const incomplete = { type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" }, usage: { input_tokens: 5, output_tokens: 9 } } };
+  const { stream, events } = captureStream();
+  stream.accept({ type: "response.created", response: { id: "resp_1" } });
+  stream.accept({ type: "response.output_text.delta", delta: "half an ans" });
+  stream.accept(incomplete);
+  stream.assertCompleted();
+  const delta = events().find((e) => e.event === "message_delta");
+  assert.deepEqual((delta?.data as { delta: unknown }).delta, { stop_reason: "max_tokens", stop_sequence: null });
+
+  const accumulator = new MessageAccumulator("gpt-model");
+  accumulator.accept({ type: "response.output_text.delta", delta: "half an ans" });
+  accumulator.accept(incomplete);
+  accumulator.assertCompleted();
+  const message = accumulator.buildMessage() as { content: unknown[]; stop_reason: string; usage: unknown };
+  assert.equal(message.stop_reason, "max_tokens");
+  assert.deepEqual(message.content, [{ type: "text", text: "half an ans" }]);
+  assert.deepEqual(message.usage, { input_tokens: 5, output_tokens: 9 });
+
+  assert.throws(
+    () => captureStream().stream.accept({ type: "response.incomplete", response: { incomplete_details: { reason: "something_new" } } }),
+    (error: unknown) => error instanceof BridgeError && error.code === "upstream_incomplete" && /something_new/.test(error.message),
+  );
+});
+
+test("AnthropicStream holds message_start until content and keepAlive emits pings after it", () => {
+  const { stream, events } = captureStream();
+  stream.accept({ type: "response.created", response: { id: "resp_9" } });
+  assert.deepEqual(events(), [], "nothing is written before the first content or ping");
+  stream.keepAlive();
+  stream.keepAlive();
+  assert.deepEqual(events().map((e) => e.event), ["message_start", "ping", "ping"]);
+  assert.equal((events()[0]!.data as { message: { id: string } }).message.id, "resp_9");
+  stream.accept({ type: "response.completed", response: { id: "resp_9" } });
+  stream.keepAlive();
+  assert.equal(events().filter((e) => e.event === "ping").length, 2, "no ping after message_stop");
+});
+
+test("Codex reasoning streams as a thinking block whose signature carries the encrypted content", () => {
+  const { stream, events } = captureStream();
+  stream.accept({ type: "response.created", response: { id: "resp_1" } });
+  stream.accept({ type: "response.output_item.added", output_index: 0, item: { type: "reasoning" } });
+  stream.accept({ type: "response.reasoning_summary_text.delta", output_index: 0, summary_index: 0, delta: "Plan the " });
+  stream.accept({ type: "response.reasoning_summary_text.delta", output_index: 0, summary_index: 0, delta: "edit." });
+  stream.accept({ type: "response.reasoning_summary_text.delta", output_index: 0, summary_index: 1, delta: "Then test." });
+  stream.accept({ type: "response.output_item.done", output_index: 0, item: { type: "reasoning", encrypted_content: "gAAAA-enc-1", summary: [] } });
+  stream.accept({ type: "response.output_item.done", output_index: 1, item: { type: "reasoning", encrypted_content: "gAAAA-enc-2", summary: [] } });
+  stream.accept({ type: "response.output_text.delta", delta: "Done." });
+  stream.accept({ type: "response.completed", response: { id: "resp_1" } });
+
+  const frames = events();
+  const signature = encodeReasoningSignature("gpt-model", "gAAAA-enc-1");
+  assert.deepEqual(frames.map((e) => `${e.event}#${String((e.data as { index?: number }).index ?? "")}`), [
+    "message_start#", "content_block_start#0", "content_block_delta#0", "content_block_delta#0", "content_block_delta#0",
+    "content_block_delta#0", "content_block_delta#0", "content_block_stop#0",
+    "content_block_start#1", "content_block_stop#1",
+    "content_block_start#2", "content_block_delta#2", "content_block_stop#2", "message_delta#", "message_stop#",
+  ]);
+  assert.deepEqual((frames[1]!.data as { content_block: unknown }).content_block, { type: "thinking", thinking: "", signature: "" });
+  const thinking = frames.slice(2, 6).map((e) => (e.data as { delta: { thinking: string } }).delta.thinking).join("");
+  assert.equal(thinking, "Plan the edit.\n\nThen test.");
+  assert.deepEqual((frames[6]!.data as { delta: unknown }).delta, { type: "signature_delta", signature });
+  assert.deepEqual((frames[8]!.data as { content_block: unknown }).content_block, {
+    type: "redacted_thinking",
+    data: encodeReasoningSignature("gpt-model", "gAAAA-enc-2"),
+  });
+});
+
+test("MessageAccumulator keeps reasoning as thinking or redacted_thinking blocks in order", () => {
+  const accumulator = new MessageAccumulator("gpt-model");
+  accumulator.accept({ type: "response.output_item.done", output_index: 0, item: { type: "reasoning", encrypted_content: "enc-a", summary: [{ type: "summary_text", text: "Look first." }] } });
+  accumulator.accept({ type: "response.output_item.done", output_index: 1, item: { type: "reasoning", encrypted_content: "enc-b", summary: [] } });
+  accumulator.accept({ type: "response.output_item.done", output_index: 2, item: { type: "reasoning", summary: [{ type: "summary_text", text: "no content" }] } });
+  accumulator.accept({ type: "response.output_text.delta", delta: "Answer" });
+  accumulator.accept({ type: "response.completed", response: { id: "resp_1" } });
+  assert.deepEqual((accumulator.buildMessage() as { content: unknown[] }).content, [
+    { type: "thinking", thinking: "Look first.", signature: encodeReasoningSignature("gpt-model", "enc-a") },
+    { type: "redacted_thinking", data: encodeReasoningSignature("gpt-model", "enc-b") },
+    { type: "text", text: "Answer" },
+  ]);
+});
+
+test("toOpenAIRequest replays only reasoning this gateway issued for the same model", () => {
+  assert.equal(decodeReasoningSignature(encodeReasoningSignature("gpt-6-sol", "enc"), "gpt-6-sol"), "enc");
+  assert.equal(decodeReasoningSignature(encodeReasoningSignature("gpt-6-sol", "enc"), "gpt-6-luna"), undefined);
+  assert.equal(decodeReasoningSignature("EqQBCkgIBhABGAIiQ...anthropic", "gpt-6-sol"), undefined);
+
+  const request = MessageRequest.parse({
+    model: "claude-sonnet-5-5",
+    messages: [
+      { role: "user", content: "fix it" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "Read the file.", signature: encodeReasoningSignature("gpt-6-sol", "enc-1") },
+          { type: "redacted_thinking", data: encodeReasoningSignature("gpt-6-sol", "enc-2") },
+          { type: "thinking", thinking: "real Claude thought", signature: "anthropic-signature" },
+          { type: "thinking", thinking: "other model", signature: encodeReasoningSignature("gpt-6-luna", "enc-3") },
+          { type: "text", text: "Reading." },
+          { type: "tool_use", id: "call_1", name: "Read", input: { path: "a" } },
+        ],
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "ok" }] },
+    ],
+  });
+  const converted = toOpenAIRequest(request, "gpt-6-sol");
+  assert.deepEqual(converted.include, ["reasoning.encrypted_content"]);
+  assert.deepEqual(converted.reasoning, { summary: "auto" });
+  assert.deepEqual(converted.input.slice(1), [
+    { type: "reasoning", summary: [{ type: "summary_text", text: "Read the file." }], encrypted_content: "enc-1" },
+    { type: "reasoning", summary: [], encrypted_content: "enc-2" },
+    { role: "assistant", content: [{ type: "output_text", text: "Reading." }] },
+    { type: "function_call", call_id: "call_1", name: "Read", arguments: '{"path":"a"}' },
+    { type: "function_call_output", call_id: "call_1", output: "ok" },
+  ]);
+
+  const disabled = toOpenAIRequest(MessageRequest.parse({ model: "m", messages: [{ role: "user", content: "hi" }], thinking: { type: "disabled" } }), "gpt-6-sol");
+  assert.equal(disabled.reasoning, undefined);
+});
+
+test("parallel tool calls follow Anthropic's disable_parallel_tool_use and need tools", () => {
+  const tools = [{ name: "Read", description: "", input_schema: { type: "object" } }];
+  const base = { model: "m", messages: [{ role: "user", content: "hi" }] };
+  assert.equal(toOpenAIRequest(MessageRequest.parse({ ...base, tools }), "g").parallel_tool_calls, true);
+  assert.equal(toOpenAIRequest(MessageRequest.parse({ ...base, tools, tool_choice: { type: "auto", disable_parallel_tool_use: true } }), "g").parallel_tool_calls, false);
+  assert.equal(toOpenAIRequest(MessageRequest.parse({ ...base, tools, tool_choice: { type: "none" } }), "g").parallel_tool_calls, undefined);
+  assert.equal(toOpenAIRequest(MessageRequest.parse(base), "g").parallel_tool_calls, undefined);
 });

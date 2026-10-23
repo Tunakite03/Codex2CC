@@ -3,12 +3,14 @@ import { ServerResponse } from "node:http";
 import { Socket } from "node:net";
 import test from "node:test";
 import {
+  agyBinary,
   createLimiter,
   formatMessagesForAntigravity,
   handleAntigravityMessage,
   isAntigravityAvailable,
   modelHasEmbeddedEffort,
   parseAssistantOutput,
+  pruneToolsForAntigravity,
   type AntigravityRunner,
   type AntigravityStreamEvent,
 } from "./antigravity.js";
@@ -80,6 +82,81 @@ test("formatMessagesForAntigravity serializes system, tools, conversation, and t
 test("isAntigravityAvailable returns boolean without throwing", () => {
   const available = isAntigravityAvailable();
   assert.equal(typeof available, "boolean");
+});
+
+test("agyBinary honours CODEX2CC_AGY_BIN and falls back to agy on PATH", () => {
+  const original = process.env.CODEX2CC_AGY_BIN;
+  try {
+    delete process.env.CODEX2CC_AGY_BIN;
+    assert.equal(agyBinary(), "agy");
+    process.env.CODEX2CC_AGY_BIN = "/opt/agy/bin/agy";
+    assert.equal(agyBinary(), "/opt/agy/bin/agy");
+    process.env.CODEX2CC_AGY_BIN = "   ";
+    assert.equal(agyBinary(), "agy");
+  } finally {
+    if (original === undefined) {
+      delete process.env.CODEX2CC_AGY_BIN;
+    } else {
+      process.env.CODEX2CC_AGY_BIN = original;
+    }
+  }
+});
+
+test("pruneToolsForAntigravity drops MCP tools but keeps built-in tools and a forced MCP tool", () => {
+  const tools = [
+    { name: "Read", description: "Read a file", input_schema: { type: "object" } },
+    { name: "mcp__supabase__execute_sql", description: "Run SQL", input_schema: { type: "object" } },
+  ];
+  const request: MessageRequest = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 1024,
+    stream: false,
+    messages: [{ role: "user", content: "Hi" }],
+    tools,
+  };
+  assert.deepEqual(pruneToolsForAntigravity(request).tools?.map((tool) => tool.name), ["Read"]);
+
+  const forced: MessageRequest = { ...request, tool_choice: { type: "tool", name: "mcp__supabase__execute_sql" } };
+  assert.deepEqual(pruneToolsForAntigravity(forced).tools?.map((tool) => tool.name), ["Read", "mcp__supabase__execute_sql"]);
+});
+
+test("handleAntigravityMessage keeps MCP tool schemas out of the prompt sent to agy", async () => {
+  let promptSeen = "";
+  const runner: AntigravityRunner = async (options, onEvent) => {
+    promptSeen = options.prompt;
+    onEvent({
+      event: "step_update",
+      step_update: { step_index: 0, state: "ACTIVE", step_type: "agent_response", text_delta: "Done." },
+    });
+    onEvent({
+      event: "step_update",
+      step_update: {
+        step_index: 0,
+        state: "DONE",
+        step_type: "agent_response",
+        usage: { input_tokens: 15, output_tokens: 6, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 21 },
+      },
+    });
+  };
+
+  const { response, getStatus } = createMockResponse();
+  const clientGone = new AbortController();
+  const req: MessageRequest = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 4096,
+    stream: false,
+    messages: [{ role: "user", content: "Review the project" }],
+    tools: [
+      { name: "Read", description: "Read a file", input_schema: { type: "object" } },
+      { name: "mcp__supabase__execute_sql", description: "Run SQL", input_schema: { type: "object" } },
+    ],
+  };
+
+  await handleAntigravityMessage({ model: "gemini-3.8-flash-high", runner }, req, response, clientGone.signal);
+
+  assert.equal(getStatus(), 200);
+  assert.match(promptSeen, /- Read: Read a file/);
+  assert.doesNotMatch(promptSeen, /mcp__supabase__execute_sql/);
 });
 
 test("handleAntigravityMessage streams SSE events and tracks tokens", async () => {

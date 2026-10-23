@@ -105,3 +105,12 @@ test("parseCli rejects unknown options, stray arguments and bad ports instead of
 test("arguments after -- are not validated as codex2cc options", () => {
   assert.deepEqual(parseCli(["--", "--bogus", "stray"]), { kind: "claude", model: undefined, claudeArgs: ["--bogus", "stray"] });
 });
+
+test("parseCli reads --sync-desktop-sessions with an optional --dry-run and rejects a stray --dry-run", () => {
+  assert.deepEqual(parseCli(["--sync-desktop-sessions"]), { kind: "sync-desktop-sessions", dryRun: false });
+  assert.deepEqual(parseCli(["--sync-desktop-sessions", "--dry-run"]), { kind: "sync-desktop-sessions", dryRun: true });
+  assert.deepEqual(parseCli(["--sync-desktop-sessions", "--setup-desktop"]), { kind: "sync-desktop-sessions", dryRun: false });
+  for (const argv of [["--dry-run"], ["--setup", "--dry-run"], ["--reset-desktop", "--dry-run"]]) {
+    assert.throws(() => parseCli(argv), (error: unknown) => error instanceof BridgeError && error.code === "invalid_arguments" && /--dry-run/.test(error.message), argv.join(" "));
+  }
+});

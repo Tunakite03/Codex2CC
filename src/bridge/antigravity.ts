@@ -72,7 +72,15 @@ export function modelHasEmbeddedEffort(slug: string): boolean {
 let availabilityCache: { readonly value: boolean; readonly checkedAt: number } | undefined;
 
 /**
- * Checks if the `agy` CLI binary is installed and executable on PATH. The probe spawns a
+ * Resolves the agy CLI to run: CODEX2CC_AGY_BIN (a command name on PATH or an absolute path) when
+ * set, otherwise `agy` looked up on PATH. Set it when the gateway's PATH cannot see agy.
+ */
+export function agyBinary(): string {
+  return process.env.CODEX2CC_AGY_BIN?.trim() || "agy";
+}
+
+/**
+ * Checks if the agy CLI (see agyBinary) is installed and executable. The probe spawns a
  * process synchronously, so the answer is cached briefly instead of blocking every status poll.
  */
 export function isAntigravityAvailable(): boolean {
@@ -82,7 +90,7 @@ export function isAntigravityAvailable(): boolean {
   }
   let value = false;
   try {
-    value = spawnSync("agy", ["--help"], { stdio: "ignore" }).status === 0;
+    value = spawnSync(agyBinary(), ["--help"], { stdio: "ignore" }).status === 0;
   } catch (error) {
     recordLog({
       level: "warn",
@@ -113,6 +121,17 @@ const TEXT_ONLY_PROTOCOL = [
 
 function toolsOffered(request: MessageRequest): boolean {
   return (request.tools?.length ?? 0) > 0 && request.tool_choice?.type !== "none";
+}
+
+/**
+ * Claude Code sends every connected MCP server tool as `mcp__<server>__<tool>`, and their schemas
+ * can make up most of the prompt. agy is offered only the built-in tools, plus an MCP tool that
+ * tool_choice forces, because dropping that one would make the forced call impossible.
+ */
+export function pruneToolsForAntigravity(request: MessageRequest): MessageRequest {
+  const forced = request.tool_choice?.type === "tool" ? request.tool_choice.name : undefined;
+  const tools = (request.tools ?? []).filter((tool) => !tool.name.startsWith("mcp__") || tool.name === forced);
+  return { ...request, tools };
 }
 
 function toolChoiceInstruction(request: MessageRequest): string | undefined {
@@ -341,7 +360,7 @@ function spawnAgy(options: AntigravityRunOptions, onEvent: (event: AntigravitySt
   }
 
   return new Promise<void>((resolve, reject) => {
-    const child = spawn("agy", args, { stdio: ["pipe", "pipe", "pipe"], cwd: agySandboxDir() });
+    const child = spawn(agyBinary(), args, { stdio: ["pipe", "pipe", "pipe"], cwd: agySandboxDir() });
     let stderrTail = "";
     let timedOut = false;
     let killTimer: NodeJS.Timeout | undefined;
@@ -508,12 +527,14 @@ function emitBlock(response: ServerResponse, index: number, block: AssistantBloc
  */
 export async function handleAntigravityMessage(
   options: AntigravityHandlerOptions,
-  inbound: MessageRequest,
+  clientRequest: MessageRequest,
   response: ServerResponse,
   clientGone: AbortSignal,
 ): Promise<void> {
   const startTime = Date.now();
   const activeModel = options.model;
+  const inbound = pruneToolsForAntigravity(clientRequest);
+  const toolsDropped = (clientRequest.tools?.length ?? 0) - (inbound.tools?.length ?? 0);
   const prompt = formatMessagesForAntigravity(inbound);
   const requestedEffort = inbound.output_config?.effort ?? inbound.reasoning_effort ?? options.effort;
   const runner = options.runner ?? defaultAntigravityRunner;
@@ -525,7 +546,7 @@ export async function handleAntigravityMessage(
     level: "info",
     operation: "antigravity_request",
     message: `Forwarding request to Google Antigravity (model: "${activeModel}", stream: ${stream}, tools: ${withTools}, effort: ${requestedEffort ?? "default"})`,
-    details: { provider: "antigravity", model: activeModel, stream, tools: withTools, effort: requestedEffort ?? "default" },
+    details: { provider: "antigravity", model: activeModel, stream, tools: withTools, toolsDropped, effort: requestedEffort ?? "default" },
   });
 
   const msgId = newMessageId();

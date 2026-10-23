@@ -13,3 +13,7 @@ process.env.CODEX2CC_LOG_FILE = join(sandbox, "codex2cc.log");
 process.env.CODEX2CC_SETTINGS_FILE = join(sandbox, "settings.json");
 process.env.CODEX2CC_USAGE_FILE = join(sandbox, "usage.json");
 process.env.CODEX2CC_HOME = sandbox;
+// Claude Code and Claude Desktop config paths resolve from the home directory; control panel routes
+// rewrite the applied Desktop config, so they must never reach the developer's real one.
+process.env.HOME = sandbox;
+process.env.USERPROFILE = sandbox;

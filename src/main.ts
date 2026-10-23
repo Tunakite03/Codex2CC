@@ -5,11 +5,29 @@ import { ChatGPTSession } from "./auth/auth.js";
 import { BridgeError } from "./bridge/bridge.js";
 import { parseCli, standalonePolicy, USAGE } from "./cli/cli.js";
 import { createGatewayServer, listenOnLoopback, type ModelInfo, type UpstreamSession } from "./gateway/gateway.js";
+import { claudeLaunchEnvironment } from "./config/config-setup.js";
+import {
+  BOTH_PROFILES,
+  describeOutcome,
+  describePlans,
+  desktopProcessState,
+  DRY_RUN_TENSE,
+  planDesktopSessionSync,
+  requireDesktopClosed,
+  resolveDesktopSessionPaths,
+  runDesktopSessionSync,
+  syncDesktopSessionsWhenClosed,
+  TO_CLAUDE_PROFILE,
+  TO_GATEWAY_PROFILE,
+  type SyncDirection,
+} from "./config/desktop-sessions.js";
 import { getActiveLogFilePath } from "./telemetry/logger.js";
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
   ANTIGRAVITY_MODELS,
   OFFLINE_CODEX_MODELS,
+  routedModels,
+  smallestContextWindow,
   tierModel,
   type ProviderType,
 } from "./models/models.js";
@@ -103,19 +121,16 @@ async function serveClaudeCli(
   const sonnetModel = tierModel(tiers, "sonnet", modelSlugs, selectedModel);
   const haikuModel = tierModel(tiers, "haiku", modelSlugs, selectedModel);
 
-  const environment: NodeJS.ProcessEnv = {
-    ...process.env,
-    ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
-    ANTHROPIC_AUTH_TOKEN: secret,
-    ANTHROPIC_MODEL: selectedModel,
-    ANTHROPIC_DEFAULT_OPUS_MODEL: opusModel,
-    ANTHROPIC_DEFAULT_SONNET_MODEL: sonnetModel,
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: haikuModel,
-    ...(process.env.CLAUDE_CODE_EFFORT_LEVEL ? { CLAUDE_CODE_EFFORT_LEVEL: process.env.CLAUDE_CODE_EFFORT_LEVEL } : {}),
-    CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
-    CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1",
-  };
-  delete environment.ANTHROPIC_API_KEY;
+  const environment = claudeLaunchEnvironment(process.env, {
+    gatewayUrl: `http://127.0.0.1:${port}`,
+    token: secret,
+    model: selectedModel,
+    opusModel,
+    sonnetModel,
+    haikuModel,
+    // Unavailable tier models fall back to selectedModel, which routedModels already includes.
+    maxContextTokens: smallestContextWindow(availableModels, routedModels(tiers, selectedModel)),
+  });
 
   const providerLabel = provider === "antigravity" ? "Google Antigravity" : "ChatGPT Plus";
   // Status goes to stderr so `codex2cc -p "..."` keeps stdout clean for piping.
@@ -132,6 +147,15 @@ async function serveClaudeCli(
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
+}
+
+/** Runs after a Desktop setup or reset; a Desktop that is open (or unverifiable) skips it with a hint. */
+function syncDesktopSessionsAfterSwitch(directions: readonly SyncDirection[]): void {
+  const outcome = syncDesktopSessionsWhenClosed(directions, resolveDesktopSessionPaths(), desktopProcessState(), new Date());
+  process.stdout.write(`\n🔁 Desktop session lists:\n`);
+  for (const line of describeOutcome(outcome)) process.stdout.write(`   ${line}\n`);
+  // The setup or reset itself is done; a failed sync still makes the command exit non-zero.
+  if (outcome.status === "failed") process.exitCode = 1;
 }
 
 async function main(): Promise<void> {
@@ -200,6 +224,19 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command.kind === "sync-desktop-sessions") {
+    const paths = resolveDesktopSessionPaths();
+    if (command.dryRun) {
+      for (const line of describePlans(planDesktopSessionSync(BOTH_PROFILES, paths), DRY_RUN_TENSE)) process.stdout.write(`${line}\n`);
+      return;
+    }
+    requireDesktopClosed(desktopProcessState());
+    const outcome = runDesktopSessionSync(BOTH_PROFILES, paths, new Date());
+    for (const line of describeOutcome(outcome)) process.stdout.write(`${line}\n`);
+    if (outcome.status === "failed") process.exitCode = 1;
+    return;
+  }
+
   if (command.kind === "reset-config") {
     const { resetConfig } = await import("./config/config-setup.js");
     const result = resetConfig(command.target);
@@ -210,6 +247,7 @@ async function main(): Promise<void> {
       process.stdout.write(`   Files updated:\n`);
       for (const file of result.filesModified) process.stdout.write(`     - ${file}\n`);
     }
+    if (result.desktopReset) syncDesktopSessionsAfterSwitch(TO_CLAUDE_PROFILE);
     process.stdout.write(`\nPlease restart Claude Desktop and any active terminal/IDE sessions.\n\n`);
     return;
   }
@@ -218,6 +256,7 @@ async function main(): Promise<void> {
     const { setupConfig } = await import("./config/config-setup.js");
     const tiers = TierModelStore.open(resolveTierFilePath(process.env), process.env).current();
     let availableModels: string[] | undefined;
+    let maxContextTokens: number | undefined;
     let selectedModel = command.model;
 
     try {
@@ -227,6 +266,7 @@ async function main(): Promise<void> {
       if (!selectedModel) {
         selectedModel = models[0]?.slug;
       }
+      maxContextTokens = smallestContextWindow(models, routedModels(tiers, selectedModel ?? tiers.sonnet));
     } catch (error) {
       // ChatGPT session is optional for setup (e.g. configuring external gateway or before login)
       warnLoginUnavailable("setup_login_unavailable", error as Error);
@@ -241,6 +281,7 @@ async function main(): Promise<void> {
       effort,
       tiers,
       availableModels,
+      maxContextTokens,
     });
 
     process.stdout.write(`\n✅ Codex2CC Gateway Configuration Applied!\n`);
@@ -267,6 +308,7 @@ async function main(): Promise<void> {
       process.stdout.write(`   CODEX2CC_TOKEN="${result.token}" node dist/main.js --serve --port ${parsedPort}\n`);
     }
     if (result.desktopConfigured) {
+      syncDesktopSessionsAfterSwitch(TO_GATEWAY_PROFILE);
       process.stdout.write(`\n👉 Claude Desktop: Restart Claude Desktop, then select "Continue with Gateway".\n`);
     }
     if (result.cliConfigured) {

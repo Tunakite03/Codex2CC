@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import test from "node:test";
+import { CODEX2CC_DESKTOP_CONFIG_ID, resolveDefaultPaths } from "../config/config-setup.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
 import { DEFAULT_TIER_MODELS, ANTIGRAVITY_TIER_MODELS, type TierModels } from "../models/models.js";
 import { TierModelStore } from "../models/tier-store.js";
@@ -90,6 +91,9 @@ test("renderDashboardHtml generates rich HTML markup with control panel componen
   const html = renderDashboardHtml();
   assert.ok(html.includes("Codex2CC Control Panel"));
   assert.ok(html.includes("btn-apply"));
+  assert.ok(html.includes("select-target"));
+  assert.ok(html.includes("btn-quick-cli"));
+  assert.ok(html.includes("btn-quick-desktop"));
   assert.ok(html.includes("tier-fable"));
   assert.ok(html.includes("tier-opus"));
   assert.ok(html.includes("tier-sonnet"));
@@ -122,6 +126,32 @@ test("renderDashboardHtml generates rich HTML markup with control panel componen
   assert.ok(!html.includes("prefers-color-scheme: dark"));
   assert.ok(html.includes("family=Outfit"));
   assert.ok(html.includes("family=Plus+Jakarta+Sans"));
+  assert.ok(html.includes('id="btn-provider-submit"'));
+  assert.ok(!html.includes("M11.04 19.32Q12 21.51"), "sparkle icon must not be present in markup");
+});
+
+test("setup section holds the provider switch, gateway endpoint, Claude clients and model map", () => {
+  const html = renderDashboardHtml();
+  const setupStart = html.indexOf('id="tab-setup"');
+  const usageStart = html.indexOf('id="tab-usage"');
+  assert.ok(setupStart !== -1 && usageStart > setupStart);
+  const setup = html.slice(setupStart, usageStart);
+  for (const marker of ['id="btn-provider-submit"', 'id="input-url"', 'id="btn-quick-cli"', 'id="tier-fable"', 'id="btn-save-tier-mapping"']) {
+    assert.ok(setup.includes(marker), `${marker} should live in the setup section`);
+  }
+  assert.ok(!html.includes('id="tab-routing"'), "model routing is merged into setup");
+  assert.ok(html.includes('id="app-sidebar"'));
+  assert.ok(html.includes('id="btn-toggle-sidebar"'));
+});
+
+test("provider buttons only stage a choice; the switch runs when Submit is pressed", () => {
+  const html = renderDashboardHtml();
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(script);
+  assert.ok(script.includes('addEventListener("click", () => selectProvider("codex"))'));
+  assert.ok(script.includes('addEventListener("click", () => selectProvider("antigravity"))'));
+  assert.ok(!script.includes('() => switchProvider("'), "provider buttons must not switch the provider directly");
+  assert.ok(script.includes("await switchProvider(selectedProvider)"));
 });
 
 test("getStatus provides gateway metadata and client detection without model controls", () => {
@@ -251,6 +281,56 @@ test("tier mapping API saves, applies, and resets the UI mapping", async () => {
     assert.equal(tierStore.isCustom(), false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("saving the tier mapping relabels Claude Desktop's model picker with the routed account models", async () => {
+  // Desktop config paths resolve under HOME, so the applied config stays inside a sandbox.
+  const home = mkdtempSync(join(tmpdir(), "codex2cc-ui-labels-home-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  const tierStore = TierModelStore.open(join(home, "tier-models.json"), {});
+  const options: GatewayOptions = { ...mockOptions, tierStore };
+  const tiers = { fable: "gpt-6-sol", opus: "gpt-6.1-sol", sonnet: "gpt-6-sol", haiku: "gpt-6-sol" };
+  const configFile = join(resolveDefaultPaths().claudeDesktopDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+  const desktopStatus = (): { inSync: boolean } => (getStatus(options, 3456) as { desktop: { inSync: boolean } }).desktop;
+  try {
+    const unapplied = createMockResponse();
+    await handleUiRoute(options, createMockRequest("POST", "/api/ui/tiers", { tiers }), unapplied.response, "/api/ui/tiers", 3456);
+    assert.equal(JSON.parse(unapplied.getOutput().body).desktopLabelsUpdated, false, "Desktop not on the gateway is left alone");
+
+    const setup = createMockResponse();
+    await handleUiRoute(
+      options,
+      createMockRequest("POST", "/api/ui/setup", { target: "desktop", token: mockOptions.policy.mode === "token" ? mockOptions.policy.token : "" }),
+      setup.response,
+      "/api/ui/setup",
+      3456,
+    );
+    assert.equal(setup.getOutput().statusCode, 200);
+    assert.equal(desktopStatus().inSync, true);
+
+    const changed = { ...tiers, opus: "gpt-6-sol", sonnet: "gpt-6.1-sol" };
+    const save = createMockResponse();
+    await handleUiRoute(options, createMockRequest("POST", "/api/ui/tiers", { tiers: changed }), save.response, "/api/ui/tiers", 3456);
+    assert.equal(save.getOutput().statusCode, 200);
+    assert.equal(JSON.parse(save.getOutput().body).desktopLabelsUpdated, true);
+    const config = JSON.parse(readFileSync(configFile, "utf8")) as { inferenceModels: unknown; inferenceGatewayApiKey: string };
+    assert.deepEqual(config.inferenceModels, [
+      { name: "claude-sonnet-5-5", labelOverride: "gpt-6.1-sol" },
+      { name: "claude-opus-5-5", labelOverride: "gpt-6-sol" },
+      { name: "claude-haiku-5", labelOverride: "gpt-6-sol" },
+      { name: "claude-fable-5-1", labelOverride: "gpt-6-sol" },
+    ]);
+    assert.equal(config.inferenceGatewayApiKey, mockOptions.policy.mode === "token" ? mockOptions.policy.token : "");
+    assert.equal(desktopStatus().inSync, true);
+
+    writeFileSync(configFile, JSON.stringify({ ...config, inferenceModels: [{ name: "claude-sonnet-5-5" }] }), "utf8");
+    assert.equal(desktopStatus().inSync, false, "a config without the current labels needs re-applying");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -532,3 +612,29 @@ test("unified settings.json persists provider, effort, and per-provider model ma
 
 
 
+
+test("a Desktop reset reports the session-list sync it ran, separately from the reset itself", async () => {
+  // Every client and Desktop path resolves under HOME, so the reset and the sync stay inside a sandbox.
+  const home = mkdtempSync(join(tmpdir(), "codex2cc-ui-reset-home-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const { response, getOutput } = createMockResponse();
+    await handleUiRoute(mockOptions, createMockRequest("POST", "/api/ui/reset", { target: "desktop" }), response, "/api/ui/reset", 3456);
+    const out = getOutput();
+    assert.equal(out.statusCode, 200);
+    const data = JSON.parse(out.body) as { ok: boolean; desktopSessionSync: { status: string; level: string; messages: string[] } };
+    assert.equal(data.ok, true);
+    const expectedLevel: Record<string, string> = { applied: "success", skipped: "warning", failed: "error" };
+    assert.equal(data.desktopSessionSync.level, expectedLevel[data.desktopSessionSync.status]);
+    assert.ok(Array.isArray(data.desktopSessionSync.messages));
+
+    const cliOnly = createMockResponse();
+    await handleUiRoute(mockOptions, createMockRequest("POST", "/api/ui/reset", { target: "cli" }), cliOnly.response, "/api/ui/reset", 3456);
+    assert.equal(JSON.parse(cliOnly.getOutput().body).desktopSessionSync, null, "no Desktop switch, no sync report");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});

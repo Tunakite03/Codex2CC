@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { connect } from "node:net";
 import test from "node:test";
-import { createGatewayServer, listenOnLoopback, type GatewayOptions } from "./gateway.js";
+import { createGatewayServer, listenOnLoopback, promptCacheKey, type GatewayOptions } from "./gateway.js";
+import { encodeReasoningSignature } from "../bridge/bridge.js";
 import { getLogs } from "../telemetry/logger.js";
 import { getTokenUsageStats, resetTokenUsage } from "../telemetry/usage.js";
 
@@ -168,7 +169,7 @@ test("gateway streams an Anthropic response and forwards the mapped model with u
       stream: true,
       store: false,
       instructions: "Be brief.",
-      reasoning: { effort: "max" },
+      reasoning: { effort: "max", summary: "auto" },
     });
   });
 });
@@ -185,7 +186,7 @@ test("Haiku route forwards reasoning effort to GPT-6 Luna", async () => {
 
     const sent = JSON.parse(upstream.requests[0]!.body) as { model: string; reasoning: { effort: string } };
     assert.equal(sent.model, "gpt-6-luna");
-    assert.deepEqual(sent.reasoning, { effort: "xhigh" });
+    assert.deepEqual(sent.reasoning, { effort: "xhigh", summary: "auto" });
   }, {
     availableModels: [
       { slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 1000000 },
@@ -204,15 +205,15 @@ test("Haiku route defaults to max effort for GPT-6 Luna when the client omits ef
 
     const sent = JSON.parse(upstream.requests[0]!.body) as { model: string; reasoning: { effort: string } };
     assert.equal(sent.model, "gpt-6-luna");
-    assert.deepEqual(sent.reasoning, { effort: "max" });
+    assert.deepEqual(sent.reasoning, { effort: "max", summary: "auto" });
 
     const sonnetResponse = await post(gateway, CHAT_REQUEST);
     assert.equal(sonnetResponse.status, 200);
     await sonnetResponse.text();
 
-    const sonnetSent = JSON.parse(upstream.requests[1]!.body) as { model: string; reasoning?: { effort: string } };
+    const sonnetSent = JSON.parse(upstream.requests[1]!.body) as { model: string; reasoning?: { effort?: string } };
     assert.equal(sonnetSent.model, "gpt-6-sol");
-    assert.equal(sonnetSent.reasoning, undefined);
+    assert.equal(sonnetSent.reasoning?.effort, undefined);
   }, {
     availableModels: [
       { slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 1000000 },
@@ -279,28 +280,82 @@ test("gateway rejects malformed JSON, invalid messages and oversized bodies with
   }, { maxBodyBytes: 500 });
 });
 
-test("gateway retries a transient 429 and then succeeds", async () => {
-  await withGateway((_request, response, attempt) => {
-    if (attempt === 1) {
-      response.writeHead(429).end("slow down");
-      return;
-    }
-    response.writeHead(200, { "Content-Type": "text/event-stream" }).end(HELLO_STREAM);
-  }, async (gateway, upstream) => {
-    const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
-    assert.equal(response.status, 200);
-    assert.equal(upstream.requests.length, 2);
-  });
-});
-
-test("gateway gives up after bounded retries and reports rate limiting", async () => {
+test("gateway passes a 429 through without retrying and tells Claude Code when the usage limit resets", async () => {
   await withGateway((_request, response) => {
-    response.writeHead(429).end("slow down");
+    response.writeHead(429, { "Content-Type": "application/json" }).end(JSON.stringify({
+      error: { type: "usage_limit_reached", message: "The usage limit has been reached", resets_in_seconds: 3600 },
+    }));
   }, async (gateway, upstream) => {
     const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
     assert.equal(response.status, 429);
-    assert.equal(((await response.json()) as { error: { type: string } }).error.type, "rate_limit_error");
+    assert.equal(response.headers.get("retry-after"), "3600");
+    const body = await response.json() as { error: { type: string; message: string } };
+    assert.equal(body.error.type, "rate_limit_error");
+    assert.match(body.error.message, /usage limit has been reached/);
+    assert.equal(upstream.requests.length, 1);
+  });
+});
+
+test("gateway forwards an upstream Retry-After header on 429", async () => {
+  await withGateway((_request, response) => {
+    response.writeHead(429, { "Retry-After": "7" }).end("slow down");
+  }, async (gateway) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: true });
+    assert.equal(response.status, 429);
+    assert.equal(response.headers.get("retry-after"), "7");
+    assert.match(response.headers.get("content-type") ?? "", /application\/json/);
+  });
+});
+
+test("gateway gives up on 503 after bounded retries", async () => {
+  await withGateway((_request, response) => {
+    response.writeHead(503).end("busy");
+  }, async (gateway, upstream) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
+    assert.equal(response.status, 502);
     assert.equal(upstream.requests.length, 3);
+  });
+});
+
+test("gateway keeps an upstream 400 a 400 with the upstream message instead of a retryable 502", async () => {
+  await withGateway((_request, response) => {
+    response.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: { message: "Invalid schema for function 'Bash'", code: "invalid_function_parameters" } }));
+  }, async (gateway, upstream) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
+    assert.equal(response.status, 400);
+    const body = await response.json() as { error: { type: string; message: string } };
+    assert.equal(body.error.type, "invalid_request_error");
+    assert.match(body.error.message, /Invalid schema for function 'Bash'/);
+    assert.equal(upstream.requests.length, 1);
+  });
+});
+
+test("gateway reports an upstream context overflow as Anthropic's prompt-too-long error, over HTTP and mid-stream", async () => {
+  await withGateway((_request, response) => {
+    response.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({
+      error: { message: "Your input exceeds the context window of this model.", type: "invalid_request_error", code: "context_length_exceeded" },
+    }));
+  }, async (gateway) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: true });
+    assert.equal(response.status, 400);
+    const body = await response.json() as { error: { type: string; message: string } };
+    assert.equal(body.error.type, "invalid_request_error");
+    assert.match(body.error.message, /^prompt is too long: 1000001 tokens > 1000000 maximum\. /);
+    assert.match(body.error.message, /capability_rejected: prompt_too_long/);
+  });
+
+  const failedStream = sse(
+    { type: "response.created", response: { id: "resp_1" } },
+    { type: "response.failed", response: { error: { code: "context_length_exceeded", message: "Input too long." } } },
+  );
+  await withGateway(replyWithStream(failedStream), async (gateway) => {
+    const streamed = await post(gateway, { ...CHAT_REQUEST, stream: true });
+    assert.equal(streamed.status, 400, "a failure before any content still gets its HTTP status");
+    assert.match(((await streamed.json()) as { error: { message: string } }).error.message, /^prompt is too long/);
+
+    const plain = await post(gateway, { ...CHAT_REQUEST, stream: false });
+    assert.equal(plain.status, 400);
+    assert.match(((await plain.json()) as { error: { message: string } }).error.message, /^prompt is too long/);
   });
 });
 
@@ -552,3 +607,84 @@ test("UI endpoint rejects invalid provider with 400", async () => {
 });
 
 
+
+test("gateway answers a failed non-streaming upstream response with an error, not an empty 200", async () => {
+  const failed = sse(
+    { type: "response.created", response: { id: "resp_1" } },
+    { type: "response.failed", response: { error: { code: "server_error", message: "upstream exploded" } } },
+  );
+  await withGateway(replyWithStream(failed), async (gateway) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
+    assert.equal(response.status, 502);
+    assert.match(((await response.json()) as { error: { message: string } }).error.message, /upstream exploded/);
+  });
+  const truncated = sse({ type: "response.created", response: { id: "resp_1" } }, { type: "response.output_text.delta", delta: "Hel" });
+  await withGateway(replyWithStream(truncated), async (gateway) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: false });
+    assert.equal(response.status, 502);
+    assert.match(((await response.json()) as { error: { message: string } }).error.message, /without response\.completed/);
+  });
+});
+
+test("gateway sends SSE pings while the upstream is silent", async () => {
+  await withGateway((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.write(sse({ type: "response.created", response: { id: "resp_1" } }));
+    setTimeout(() => response.end(sse(
+      { type: "response.output_text.delta", delta: "Hello" },
+      { type: "response.completed", response: { id: "resp_1", usage: { input_tokens: 3, output_tokens: 2 } } },
+    )), 200);
+  }, async (gateway) => {
+    const response = await post(gateway, { ...CHAT_REQUEST, stream: true });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
+    const names = [...(await response.text()).matchAll(/^event: (\S+)$/gm)].map((match) => match[1]);
+    assert.equal(names[0], "message_start");
+    assert.ok(names.filter((name) => name === "ping").length >= 2, `expected pings, got ${names.join(",")}`);
+    assert.equal(names.at(-1), "message_stop");
+  }, { keepAliveMs: 30 });
+});
+
+test("gateway derives prompt_cache_key from the Claude Code session and agent headers", async () => {
+  assert.equal(promptCacheKey({}), undefined);
+  const main = promptCacheKey({ "x-claude-code-session-id": "session-1" });
+  const agent = promptCacheKey({ "x-claude-code-session-id": "session-1", "x-claude-code-agent-id": "agent-7" });
+  assert.match(main ?? "", /^[A-Za-z0-9_-]{43}$/);
+  assert.notEqual(main, agent);
+  assert.equal(promptCacheKey({ "x-claude-code-session-id": "session-1" }), main, "stable across requests");
+
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
+    await (await post(gateway, CHAT_REQUEST, { ...AUTH, "x-claude-code-session-id": "session-1" })).text();
+    await (await post(gateway, CHAT_REQUEST)).text();
+    const [withSession, withoutSession] = upstream.requests.map((sent) => JSON.parse(sent.body) as { prompt_cache_key?: string; include: string[] });
+    assert.equal(withSession!.prompt_cache_key, main);
+    assert.equal(withoutSession!.prompt_cache_key, undefined);
+    assert.deepEqual(withSession!.include, ["reasoning.encrypted_content"]);
+  });
+});
+
+test("gateway retries once without replayed reasoning when upstream rejects its encrypted content", async () => {
+  await withGateway((_request, response, attempt) => {
+    if (attempt === 1) {
+      response.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({
+        error: { message: "The encrypted content could not be verified.", param: "input[1].encrypted_content", code: "invalid_encrypted_content" },
+      }));
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/event-stream" }).end(HELLO_STREAM);
+  }, async (gateway, upstream) => {
+    const response = await post(gateway, {
+      ...CHAT_REQUEST,
+      stream: false,
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: encodeReasoningSignature("gpt-6-sol", "stale") }, { type: "text", text: "hello" }] },
+        { role: "user", content: "again" },
+      ],
+    });
+    assert.equal(response.status, 200);
+    assert.equal(upstream.requests.length, 2);
+    const types = upstream.requests.map((sent) => (JSON.parse(sent.body) as { input: Array<{ type?: string }> }).input.map((item) => item.type ?? "message"));
+    assert.deepEqual(types, [["message", "reasoning", "message", "message"], ["message", "message", "message"]]);
+  });
+});

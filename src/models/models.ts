@@ -74,6 +74,22 @@ export function loadTierModels(env: NodeJS.ProcessEnv): TierModels {
   };
 }
 
+/**
+ * The smallest known context window among `slugs`, for CLAUDE_CODE_MAX_CONTEXT_TOKENS: Claude Code
+ * applies one window to whichever routed model is active, so the tightest one must not overflow.
+ */
+export function smallestContextWindow(catalog: readonly ModelCatalogItem[], slugs: readonly string[]): number | undefined {
+  const windows = catalog
+    .filter((model) => slugs.includes(model.slug) && model.contextWindow !== undefined)
+    .map((model) => model.contextWindow as number);
+  return windows.length === 0 ? undefined : Math.min(...windows);
+}
+
+/** Every account model a Claude Code session can reach: the default plus each tier route, Fable included. */
+export function routedModels(tiers: TierModels, defaultModel: string): string[] {
+  return [defaultModel, tiers.fable, tiers.opus, tiers.sonnet, tiers.haiku];
+}
+
 /** The model for a Claude tier when the account has it, otherwise `fallback`. */
 export function tierModel(tiers: TierModels, tier: Tier, available: ReadonlySet<string>, fallback: string): string {
   return available.has(tiers[tier]) ? tiers[tier] : fallback;

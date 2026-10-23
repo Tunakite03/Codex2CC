@@ -117,7 +117,15 @@ node dist/main.js --setup --gateway-url https://my-gateway.internal --token "my-
 
 # Reset all configurations back to standard Anthropic defaults:
 node dist/main.js --reset-config
+
+# Copy missing Code-tab sessions between Desktop's claude.ai and gateway profiles (quit Desktop first):
+node dist/main.js --sync-desktop-sessions --dry-run
+node dist/main.js --sync-desktop-sessions
 ```
+
+Claude Desktop keeps a separate Code-tab session list for the gateway profile (`Claude-3p`) and the claude.ai profile (`Claude`); both point at the same transcripts in `~/.claude/projects`. Desktop setup copies claude.ai sessions into the gateway list, and Desktop reset copies gateway sessions back, only when Claude Desktop is closed. The sync adds missing entries without overwriting any file Desktop created, skips sessions deleted in the destination, and records every change under `logs/desktop-session-sync/`. A copy the sync made earlier is replaced by its original when the original has newer activity; the replaced file is first saved under `logs/desktop-session-sync/backups/` and the manifest names that backup. A copy you continued in is left alone, and its original is not updated from it.
+
+Each profile keeps one session list per signed-in account and organization (`claude-code-sessions/<account>/<org>`). When the destination profile has more than one, the sync stops instead of guessing and lists them; choose one with `CODEX2CC_CLAUDE_SESSION_SCOPE` (claude.ai profile) or `CODEX2CC_GATEWAY_SESSION_SCOPE` (gateway profile), for example `CODEX2CC_CLAUDE_SESSION_SCOPE=<account>/<org> node dist/main.js --sync-desktop-sessions --dry-run`. Setting a variable also limits copies from that profile to the chosen scope. Deleting, archiving or renaming a session in one profile does not carry over to the other. Chat-tab conversations live on claude.ai and are not synced.
 
 ### Next Steps after Setup
 1. **Start the gateway**:
@@ -162,7 +170,8 @@ Codex2CC reads credentials directly from `~/.codex/auth.json` and never prompts 
 ## Limitations
 
 - Uses ChatGPT's internal Codex backend endpoint (`/backend-api/codex/responses`), which may change without notice. Check OpenAI's terms before production reliance.
-- `max_tokens`, `stop_sequences`, and raw `thinking` blocks are not forwarded upstream.
+- `max_tokens` and `stop_sequences` are not forwarded upstream. Codex reasoning is returned as `thinking` blocks whose signature carries the encrypted reasoning, and is replayed only to the model that produced it; Anthropic-signed thinking is not forwarded.
+- Upstream context overflow is reported as Anthropic's `prompt is too long` error so Claude Code compacts, and a ChatGPT usage-limit `429` carries `Retry-After` and is not retried by the gateway.
 - Content block types unsupported by the Codex Responses API (such as `document`) are stripped with an explicit note, and tools lacking an `input_schema` are omitted; both are recorded in the activity log.
 - `count_tokens` calculates a local heuristic (~4 characters per token).
 - If a requested model is not available in your ChatGPT account, the gateway falls back to your account's default model with a logged warning.

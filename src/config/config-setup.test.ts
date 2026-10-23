@@ -5,8 +5,10 @@ import { join } from "node:path";
 import test from "node:test";
 import { BridgeError } from "../bridge/bridge.js";
 import {
+  claudeLaunchEnvironment,
   CODEX2CC_DESKTOP_CONFIG_ID,
   configuredGatewayToken,
+  refreshDesktopModelLabels,
   resetConfig,
   setupConfig,
   validateGatewayUrl,
@@ -138,10 +140,10 @@ test("setupConfig configures Claude Desktop library, models and _meta.json", () 
     assert.equal(config.inferenceGatewayAuthScheme, "x-api-key");
     assert.equal(config.modelDiscoveryEnabled, true);
     assert.deepEqual(config.inferenceModels, [
-      { name: "claude-sonnet-5-5" },
-      { name: "claude-opus-5-5" },
-      { name: "claude-haiku-5" },
-      { name: "claude-fable-5-1" },
+      { name: "claude-sonnet-5-5", labelOverride: "gpt-6-sol" },
+      { name: "claude-opus-5-5", labelOverride: "gpt-6.1-sol" },
+      { name: "claude-haiku-5", labelOverride: "gpt-6-luna" },
+      { name: "claude-fable-5-1", labelOverride: "gpt-6-astra" },
     ]);
 
     const metaFile = join(paths.claudeDesktopDir, "_meta.json");
@@ -153,6 +155,42 @@ test("setupConfig configures Claude Desktop library, models and _meta.json", () 
       const devSettings = JSON.parse(readFileSync(devPath, "utf8"));
       assert.equal(devSettings.allowDevTools, true);
     }
+  } finally {
+    cleanup();
+  }
+});
+
+test("refreshDesktopModelLabels relabels only an applied Codex2CC Desktop config and keeps its credential", () => {
+  const { paths, cleanup } = createSandbox();
+  const tiers = { fable: "gpt-6-sol", opus: "gpt-6-sol", sonnet: "gpt-6.1-sol", haiku: "gpt-6-luna" };
+  try {
+    assert.deepEqual(refreshDesktopModelLabels(tiers, paths), [], "nothing to relabel before setup");
+
+    setupConfig("desktop", { gatewayUrl: "http://127.0.0.1:3456", token: "secure-token-1234567890123456", paths });
+    const configFile = join(paths.claudeDesktopDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+    assert.deepEqual(refreshDesktopModelLabels(tiers, paths), [configFile]);
+
+    const config = JSON.parse(readFileSync(configFile, "utf8"));
+    assert.deepEqual(config.inferenceModels, [
+      { name: "claude-sonnet-5-5", labelOverride: "gpt-6.1-sol" },
+      { name: "claude-opus-5-5", labelOverride: "gpt-6-sol" },
+      { name: "claude-haiku-5", labelOverride: "gpt-6-luna" },
+      { name: "claude-fable-5-1", labelOverride: "gpt-6-sol" },
+    ]);
+    assert.equal(config.inferenceGatewayBaseUrl, "http://127.0.0.1:3456");
+    assert.equal(config.inferenceGatewayApiKey, "secure-token-1234567890123456");
+    assert.equal(config.modelDiscoveryEnabled, true);
+
+    resetConfig("desktop", paths);
+    assert.deepEqual(refreshDesktopModelLabels(tiers, paths), [], "a reset Desktop is left alone");
+
+    setupConfig("desktop", { gatewayUrl: "http://127.0.0.1:3456", token: "secure-token-1234567890123456", paths });
+    writeFileSync(configFile, "{ broken", "utf8");
+    assert.throws(
+      () => refreshDesktopModelLabels(tiers, paths),
+      (error: unknown) => error instanceof BridgeError && error.code === "invalid_saved_gateway_config",
+    );
+    assert.equal(readFileSync(configFile, "utf8"), "{ broken", "a corrupt config is reported, not overwritten");
   } finally {
     cleanup();
   }
@@ -227,4 +265,41 @@ test("resetConfig cleanly strips gateway settings from CLI and Desktop without c
   } finally {
     cleanup();
   }
+});
+
+test("setupConfig writes the routed models' context window and resetConfig removes it", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    setupConfig("cli", { gatewayUrl: "http://127.0.0.1:3456", token: "secure-token-1234567890123456", maxContextTokens: 272_000, paths });
+    const settings = JSON.parse(readFileSync(paths.claudeSettingsPath, "utf8"));
+    assert.equal(settings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "272000");
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT, undefined);
+
+    resetConfig("cli", paths);
+    assert.equal(JSON.parse(readFileSync(paths.claudeSettingsPath, "utf8")).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test("claudeLaunchEnvironment keeps auto-compaction on and declares the real context window", () => {
+  const launch = {
+    gatewayUrl: "http://127.0.0.1:4000",
+    token: "secret",
+    model: "gpt-6-sol",
+    opusModel: "gpt-6.1-sol",
+    sonnetModel: "gpt-6-sol",
+    haikuModel: "gpt-6-luna",
+    maxContextTokens: 272_000,
+  };
+  const environment = claudeLaunchEnvironment({ PATH: "/bin", ANTHROPIC_API_KEY: "sk-ant-real" }, launch);
+  assert.equal(environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "272000");
+  assert.equal(environment.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT, undefined);
+  assert.equal(environment.ANTHROPIC_BASE_URL, "http://127.0.0.1:4000");
+  assert.equal(environment.ANTHROPIC_DEFAULT_HAIKU_MODEL, "gpt-6-luna");
+  assert.equal(environment.ANTHROPIC_API_KEY, undefined);
+  assert.equal(environment.PATH, "/bin");
+
+  assert.equal(claudeLaunchEnvironment({ CLAUDE_CODE_MAX_CONTEXT_TOKENS: "100000" }, launch).CLAUDE_CODE_MAX_CONTEXT_TOKENS, "100000", "an explicit user value wins");
+  assert.equal(claudeLaunchEnvironment({}, { ...launch, maxContextTokens: undefined }).CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
 });

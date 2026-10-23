@@ -1,15 +1,19 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { z } from "zod";
 import {
   AnthropicStream,
   BridgeError,
   estimateInputTokens,
+  hasReasoningItems,
   MessageAccumulator,
   MessageRequest,
   readSse,
   toOpenAIRequest,
   unsupportedBlockTypes,
   unsupportedToolNames,
+  withoutReasoningItems,
+  type OpenAIRequest,
 } from "../bridge/bridge.js";
 import { handleAntigravityMessage, type AntigravityRunner } from "../bridge/antigravity.js";
 import { checkClient, checkHost, checkUiOrigin, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
@@ -33,6 +37,8 @@ export const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/resp
 const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024;
 const UPSTREAM_TIMEOUT_MS = 600_000;
 const UPSTREAM_ATTEMPTS = 3;
+// Claude Code aborts a gateway stream after 300s without bytes; reasoning without a summary sends none.
+const DEFAULT_KEEP_ALIVE_MS = 10_000;
 
 export type ModelInfo = { slug: string; displayName: string; contextWindow?: number };
 
@@ -58,11 +64,14 @@ export type GatewayOptions = {
   provider?: ProviderType;
   readonly antigravityRunner?: AntigravityRunner;
   readonly antigravityModels?: readonly ModelInfo[];
+  /** Interval between SSE pings while a streamed response is open. */
+  readonly keepAliveMs?: number;
 };
 
 type ResolvedGatewayOptions = GatewayOptions & {
   readonly upstreamUrl: string;
   readonly maxBodyBytes: number;
+  readonly keepAliveMs: number;
   readonly currentTiers: () => TierModels;
   readonly modelSlugs: () => ReadonlySet<string>;
   readonly warnedModels: Set<string>;
@@ -73,7 +82,10 @@ function errorType(status: number): string {
   if (status === 400) return "invalid_request_error";
   if (status === 401) return "authentication_error";
   if (status === 403) return "permission_error";
+  if (status === 404) return "not_found_error";
+  if (status === 413) return "request_too_large";
   if (status === 429) return "rate_limit_error";
+  if (status >= 400 && status < 500) return "invalid_request_error";
   return "api_error";
 }
 
@@ -83,8 +95,81 @@ function sendError(response: ServerResponse, error: BridgeError): void {
     response.write(`event: error\ndata: ${JSON.stringify(body)}\n\n`);
     response.end();
   } else {
-    response.writeHead(error.status, { "Content-Type": "application/json" }).end(JSON.stringify(body));
+    response.writeHead(error.status, {
+      "Content-Type": "application/json",
+      ...(error.retryAfterSeconds === undefined ? {} : { "Retry-After": String(error.retryAfterSeconds) }),
+    }).end(JSON.stringify(body));
   }
+}
+
+const UpstreamErrorBody = z.object({
+  error: z.object({
+    type: z.string().optional(),
+    code: z.string().nullable().optional(),
+    message: z.string().optional(),
+    param: z.string().nullable().optional(),
+    resets_in_seconds: z.number().nonnegative().optional(),
+    resets_at: z.number().nonnegative().optional(),
+  }).loose(),
+}).loose();
+type UpstreamErrorBody = z.infer<typeof UpstreamErrorBody>["error"];
+
+function parseUpstreamError(text: string): UpstreamErrorBody | undefined {
+  try {
+    const parsed = UpstreamErrorBody.safeParse(JSON.parse(text));
+    return parsed.success ? parsed.data.error : undefined;
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Whole seconds until a rate limit lifts, from the Retry-After header or the ChatGPT usage-limit body.
+ * Claude Code stops retrying and shows the error when this exceeds 60 seconds.
+ */
+function retryAfterSeconds(header: string | null, body: UpstreamErrorBody | undefined, now: number): number | undefined {
+  if (header !== null) {
+    if (/^\d+$/.test(header.trim())) return Number(header.trim());
+    const date = Date.parse(header);
+    if (!Number.isNaN(date)) return Math.max(0, Math.ceil((date - now) / 1000));
+  }
+  if (body?.resets_in_seconds !== undefined) return Math.ceil(body.resets_in_seconds);
+  if (body?.resets_at !== undefined) return Math.max(0, Math.ceil(body.resets_at - now / 1000));
+  return undefined;
+}
+
+/** Turns a non-2xx upstream answer into the error Claude Code needs to recover (compact, back off, re-auth). */
+function upstreamHttpError(status: number, headers: Headers, text: string): BridgeError {
+  const body = parseUpstreamError(text);
+  const detail = body?.message ?? text.slice(0, 500);
+  const message = `ChatGPT inference returned HTTP ${status}: ${detail}`;
+  if (body?.code === "context_length_exceeded" || (status === 400 && /context (window|length)/i.test(detail))) {
+    return new BridgeError(400, "context_length_exceeded", detail);
+  }
+  if (status === 400 && (body?.param?.includes("encrypted_content") === true || /encrypted.content/i.test(detail))) {
+    return new BridgeError(400, "reasoning_rejected", message);
+  }
+  if (status === 429) return new BridgeError(429, "inference_failed", message, retryAfterSeconds(headers.get("retry-after"), body, Date.now()));
+  return new BridgeError(status >= 400 && status < 500 ? status : 502, "inference_failed", message);
+}
+
+/**
+ * The context-overflow error in the shape Claude Code recognizes, so it compacts the conversation
+ * instead of retrying. The token count is the local estimate, raised above the limit it overflowed.
+ */
+function promptTooLong(detail: string, estimatedTokens: number, contextWindow: number | undefined): BridgeError {
+  const counts = contextWindow === undefined ? "" : ` ${Math.max(estimatedTokens, contextWindow + 1)} tokens > ${contextWindow} maximum.`;
+  return new BridgeError(400, "prompt_too_long", `prompt is too long:${counts} ${detail} (capability_rejected: prompt_too_long)`);
+}
+
+/** Stable per-conversation cache routing key; subagents get their own because their prefix differs. */
+export function promptCacheKey(headers: IncomingHttpHeaders): string | undefined {
+  const session = headers["x-claude-code-session-id"];
+  if (typeof session !== "string" || session.length === 0) return undefined;
+  const agent = headers["x-claude-code-agent-id"];
+  const scope = typeof agent === "string" && agent.length > 0 ? `${session}:${agent}` : session;
+  return createHash("sha256").update(scope, "utf8").digest("base64url");
 }
 
 function sendGuardFailure(response: ServerResponse, failure: Extract<GuardResult, { ok: false }>): void {
@@ -149,7 +234,8 @@ async function openInference(options: ResolvedGatewayOptions, body: object, clie
       token = await options.session.refreshAfterRejection(token);
       continue;
     }
-    if ((response.status === 429 || response.status === 503) && attempt < UPSTREAM_ATTEMPTS) {
+    // 429 is not retried here: Claude Code backs off itself and honors the Retry-After passed through.
+    if (response.status === 503 && attempt < UPSTREAM_ATTEMPTS) {
       process.stderr.write(`${JSON.stringify({ level: "warn", operation: "inference", attempt, status: response.status })}\n`);
       recordLog({
         level: "warn",
@@ -162,13 +248,7 @@ async function openInference(options: ResolvedGatewayOptions, body: object, clie
       continue;
     }
     if (!response.ok) {
-      const errText = await response.text().catch(() => "");
-      const passthrough = response.status === 401 || response.status === 403 || response.status === 429;
-      throw new BridgeError(
-        passthrough ? response.status : 502,
-        "inference_failed",
-        `ChatGPT inference returned HTTP ${response.status}: ${errText.slice(0, 200)}`,
-      );
+      throw upstreamHttpError(response.status, response.headers, await response.text());
     }
     if (!response.body) throw new BridgeError(502, "missing_stream", "ChatGPT inference returned no stream.");
     return response;
@@ -215,7 +295,7 @@ async function handleMessage(
     await routeToAntigravity(options, inbound, requestedEffort, response, clientGone);
     return;
   }
-  await routeToCodex(options, inbound, response, clientGone, startTime);
+  await routeToCodex(options, inbound, request.headers, response, clientGone, startTime);
 }
 
 async function routeToAntigravity(
@@ -251,9 +331,30 @@ async function routeToAntigravity(
   );
 }
 
+/**
+ * Opens the upstream stream. Replayed reasoning the upstream cannot decrypt (expired, or issued to
+ * another account) is dropped once instead of failing the turn.
+ */
+async function openCodexInference(options: ResolvedGatewayOptions, outgoing: OpenAIRequest, clientGone: AbortSignal): Promise<Response> {
+  try {
+    return await openInference(options, outgoing, clientGone);
+  } catch (error) {
+    if (!(error instanceof BridgeError && error.code === "reasoning_rejected" && hasReasoningItems(outgoing))) throw error;
+    process.stderr.write(`${JSON.stringify({ level: "warn", operation: "reasoning_rejected", action: "retry_without_reasoning" })}\n`);
+    recordLog({
+      level: "warn",
+      operation: "reasoning_rejected",
+      message: "ChatGPT rejected replayed reasoning; retrying without it",
+      details: { action: "retry_without_reasoning" },
+    });
+    return openInference(options, withoutReasoningItems(outgoing), clientGone);
+  }
+}
+
 async function routeToCodex(
   options: ResolvedGatewayOptions,
   inbound: MessageRequest,
+  headers: IncomingHttpHeaders,
   response: ServerResponse,
   clientGone: AbortSignal,
   startTime: number,
@@ -271,75 +372,94 @@ async function routeToCodex(
     });
   }
   const outgoing = toOpenAIRequest(inbound, activeModel);
+  const cacheKey = promptCacheKey(headers);
+  if (cacheKey !== undefined) outgoing.prompt_cache_key = cacheKey;
   const defaultEffort = options.tierStore?.getEffort();
-  if (outgoing.reasoning === undefined) {
+  if (outgoing.reasoning?.effort === undefined) {
     if (defaultEffort) {
-      outgoing.reasoning = { effort: defaultEffort };
+      outgoing.reasoning = { ...outgoing.reasoning, effort: defaultEffort };
     } else if (activeModel === options.currentTiers().haiku || activeModel === DEFAULT_TIER_MODELS.haiku) {
-      outgoing.reasoning = { effort: "max" };
+      outgoing.reasoning = { ...outgoing.reasoning, effort: "max" };
     }
   }
   const effort = outgoing.reasoning?.effort ?? "upstream_default";
-  const upstream = await openInference(options, outgoing, clientGone);
-  if (inbound.stream) {
-    response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-    const encoder = new AnthropicStream(response, activeModel, estimateInputTokens(inbound));
-    await readSse(upstream.body!, (event) => encoder.accept(event));
-    encoder.assertCompleted();
-    response.end();
-    const usage = encoder.getUsage();
-    const inputTokens = usage?.input_tokens ?? estimateInputTokens(inbound);
-    const outputTokens = usage?.output_tokens ?? 0;
-    const cachedTokens = usage?.cache_read_input_tokens ?? 0;
-    recordTokenUsage({
-      model: activeModel,
-      inputTokens,
-      outputTokens,
-      cachedTokens,
-    });
-    recordLog({
-      level: "info",
-      operation: "stream_complete",
-      message: `Stream completed for model "${activeModel}" in ${Date.now() - startTime}ms`,
-      details: {
+  const estimatedTokens = estimateInputTokens(inbound);
+  try {
+    const upstream = await openCodexInference(options, outgoing, clientGone);
+    if (inbound.stream) {
+      // Headers go out with the first SSE frame, so a failure reported before any content still gets its status.
+      response.statusCode = 200;
+      response.setHeader("Content-Type", "text/event-stream");
+      response.setHeader("Cache-Control", "no-cache");
+      response.setHeader("Connection", "keep-alive");
+      const encoder = new AnthropicStream(response, activeModel, estimatedTokens);
+      const keepAlive = setInterval(() => encoder.keepAlive(), options.keepAliveMs);
+      try {
+        await readSse(upstream.body!, (event) => encoder.accept(event));
+      } finally {
+        clearInterval(keepAlive);
+      }
+      encoder.assertCompleted();
+      response.end();
+      const usage = encoder.getUsage();
+      const inputTokens = usage?.input_tokens ?? estimatedTokens;
+      const outputTokens = usage?.output_tokens ?? 0;
+      const cachedTokens = usage?.cache_read_input_tokens ?? 0;
+      recordTokenUsage({
         model: activeModel,
-        effort,
-        durationMs: Date.now() - startTime,
         inputTokens,
         outputTokens,
         cachedTokens,
-        totalTokens: inputTokens + outputTokens + cachedTokens,
-      },
-    });
-  } else {
-    const accumulator = new MessageAccumulator(activeModel);
-    await readSse(upstream.body!, (event) => accumulator.accept(event));
-    const msg = accumulator.buildMessage();
-    response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(msg));
-    const usage = accumulator.getUsage();
-    const inputTokens = usage.input_tokens;
-    const outputTokens = usage.output_tokens;
-    const cachedTokens = usage.cache_read_input_tokens ?? 0;
-    recordTokenUsage({
-      model: activeModel,
-      inputTokens,
-      outputTokens,
-      cachedTokens,
-    });
-    recordLog({
-      level: "info",
-      operation: "message_complete",
-      message: `Message completed for model "${activeModel}" in ${Date.now() - startTime}ms`,
-      details: {
+      });
+      recordLog({
+        level: "info",
+        operation: "stream_complete",
+        message: `Stream completed for model "${activeModel}" in ${Date.now() - startTime}ms`,
+        details: {
+          model: activeModel,
+          effort,
+          durationMs: Date.now() - startTime,
+          inputTokens,
+          outputTokens,
+          cachedTokens,
+          totalTokens: inputTokens + outputTokens + cachedTokens,
+        },
+      });
+    } else {
+      const accumulator = new MessageAccumulator(activeModel);
+      await readSse(upstream.body!, (event) => accumulator.accept(event));
+      accumulator.assertCompleted();
+      const msg = accumulator.buildMessage();
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(msg));
+      const usage = accumulator.getUsage();
+      const inputTokens = usage.input_tokens;
+      const outputTokens = usage.output_tokens;
+      const cachedTokens = usage.cache_read_input_tokens ?? 0;
+      recordTokenUsage({
         model: activeModel,
-        effort,
-        durationMs: Date.now() - startTime,
         inputTokens,
         outputTokens,
         cachedTokens,
-        totalTokens: inputTokens + outputTokens + cachedTokens,
-      },
-    });
+      });
+      recordLog({
+        level: "info",
+        operation: "message_complete",
+        message: `Message completed for model "${activeModel}" in ${Date.now() - startTime}ms`,
+        details: {
+          model: activeModel,
+          effort,
+          durationMs: Date.now() - startTime,
+          inputTokens,
+          outputTokens,
+          cachedTokens,
+          totalTokens: inputTokens + outputTokens + cachedTokens,
+        },
+      });
+    }
+  } catch (error) {
+    if (!(error instanceof BridgeError && error.code === "context_length_exceeded")) throw error;
+    const contextWindow = options.availableModels.find((model) => model.slug === activeModel)?.contextWindow;
+    throw promptTooLong(error.message, estimatedTokens, contextWindow);
   }
 }
 
@@ -374,6 +494,7 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
     ...gatewayOptions,
     upstreamUrl: gatewayOptions.upstreamUrl ?? CHATGPT_RESPONSES_URL,
     maxBodyBytes: gatewayOptions.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+    keepAliveMs: gatewayOptions.keepAliveMs ?? DEFAULT_KEEP_ALIVE_MS,
     currentTiers: () => activeTierModels(gatewayOptions),
     activeProvider: () => gatewayOptions.provider ?? "codex",
     modelSlugs: () => {

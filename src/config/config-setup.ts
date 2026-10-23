@@ -37,6 +37,8 @@ export type SetupOptions = {
   readonly effort?: string | undefined;
   readonly tiers?: TierModels | undefined;
   readonly availableModels?: readonly string[] | undefined;
+  /** Context window Claude Code should assume for the routed models (CLAUDE_CODE_MAX_CONTEXT_TOKENS). */
+  readonly maxContextTokens?: number | undefined;
   readonly paths?: SetupPaths | undefined;
   readonly configName?: string | undefined;
 };
@@ -221,6 +223,39 @@ function removeLegacyHaikuProfileRow(settings: Record<string, unknown>): void {
   settings.modelPicker = { ...currentPicker, options: retainedOptions };
 }
 
+export type ClaudeLaunch = {
+  readonly gatewayUrl: string;
+  readonly token: string;
+  readonly model: string;
+  readonly opusModel: string;
+  readonly sonnetModel: string;
+  readonly haikuModel: string;
+  readonly maxContextTokens: number | undefined;
+};
+
+/**
+ * Environment for a `claude` child pointed at an ephemeral gateway. A context window the user set
+ * explicitly wins; otherwise the routed models' real window replaces Claude Code's 200K assumption,
+ * which keeps proactive auto-compaction working for model IDs it does not recognize.
+ */
+export function claudeLaunchEnvironment(base: NodeJS.ProcessEnv, launch: ClaudeLaunch): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    ...base,
+    ANTHROPIC_BASE_URL: launch.gatewayUrl,
+    ANTHROPIC_AUTH_TOKEN: launch.token,
+    ANTHROPIC_MODEL: launch.model,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: launch.opusModel,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: launch.sonnetModel,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: launch.haikuModel,
+    CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
+  };
+  if (!base.CLAUDE_CODE_MAX_CONTEXT_TOKENS && launch.maxContextTokens !== undefined) {
+    environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(launch.maxContextTokens);
+  }
+  delete environment.ANTHROPIC_API_KEY;
+  return environment;
+}
+
 export function setupClaudeCodeCli(options: SetupOptions): readonly string[] {
   const paths = resolvePaths(options.paths);
   const tiers = options.tiers ?? DEFAULT_TIER_MODELS;
@@ -250,6 +285,9 @@ export function setupClaudeCodeCli(options: SetupOptions): readonly string[] {
   if (options.effort) {
     currentEnv.CLAUDE_CODE_EFFORT_LEVEL = options.effort;
   }
+  if (options.maxContextTokens !== undefined) {
+    currentEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(options.maxContextTokens);
+  }
   delete currentEnv.ANTHROPIC_API_KEY;
 
   settingsData.env = currentEnv;
@@ -276,6 +314,16 @@ export function setupClaudeCodeCli(options: SetupOptions): readonly string[] {
   return modified;
 }
 
+export type DesktopInferenceModel = { readonly name: string; readonly labelOverride: string };
+
+/**
+ * Desktop rejects route IDs naming a non-Anthropic model (gpt, codex, gemini, …), so each route keeps
+ * its Claude ID and the picker shows the routed account model through `labelOverride` instead.
+ */
+export function desktopInferenceModels(tiers: TierModels): readonly DesktopInferenceModel[] {
+  return CLAUDE_GATEWAY_MODELS.map((model) => ({ name: model.id, labelOverride: tiers[model.tier] }));
+}
+
 export function setupClaudeDesktop(options: SetupOptions): readonly string[] {
   const paths = resolvePaths(options.paths);
   const modified: string[] = [];
@@ -288,7 +336,7 @@ export function setupClaudeDesktop(options: SetupOptions): readonly string[] {
     inferenceGatewayAuthScheme: "x-api-key",
     inferenceCredentialKind: "static",
     modelDiscoveryEnabled: true,
-    inferenceModels: CLAUDE_GATEWAY_MODELS.map((model) => ({ name: model.id })),
+    inferenceModels: desktopInferenceModels(options.tiers ?? DEFAULT_TIER_MODELS),
     chatTabEnabled: true,
     coworkTabEnabled: true,
     isClaudeCodeForDesktopEnabled: true,
@@ -333,6 +381,27 @@ export function setupClaudeDesktop(options: SetupOptions): readonly string[] {
   return modified;
 }
 
+/**
+ * Rewrites the picker labels of the applied Codex2CC Desktop config after the tier mapping changes,
+ * keeping its gateway URL and credential. Returns no files when Desktop is not pointed at Codex2CC.
+ */
+export function refreshDesktopModelLabels(tiers: TierModels, pathsInput?: SetupPaths): readonly string[] {
+  const paths = resolvePaths(pathsInput);
+  const meta = readSavedGatewayConfig(join(paths.claudeDesktopDir, "_meta.json"), z.object({ appliedId: z.string() }));
+  if (meta?.appliedId !== CODEX2CC_DESKTOP_CONFIG_ID) return [];
+
+  const configFile = join(paths.claudeDesktopDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+  const config = readSavedGatewayConfig(
+    configFile,
+    z.looseObject({ inferenceGatewayBaseUrl: z.string(), inferenceGatewayApiKey: z.string() }),
+  );
+  if (config === undefined) {
+    throw new BridgeError(500, "missing_saved_gateway_config", "Applied Claude Desktop gateway configuration file is missing.");
+  }
+  writeJson(configFile, { ...config, inferenceModels: desktopInferenceModels(tiers) });
+  return [configFile];
+}
+
 export function resetClaudeCodeCli(pathsInput?: SetupPaths | undefined): readonly string[] {
   const paths = resolvePaths(pathsInput);
   const modified: string[] = [];
@@ -364,6 +433,7 @@ export function resetClaudeCodeCli(pathsInput?: SetupPaths | undefined): readonl
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK",
         "CLAUDE_CODE_EFFORT_LEVEL",
         "CLAUDE_CODE_MODEL_CAPABILITIES",
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
         "API_TIMEOUT_MS",
       ];
       for (const k of keysToRemove) delete env[k];
