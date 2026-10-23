@@ -18,9 +18,9 @@ import {
 } from "../config/config-setup.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
 import { ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, PROVIDERS, PROVIDER_LABELS, isProviderType, routedModels, smallestContextWindow, type ProviderType } from "../models/models.js";
-import { API_PROVIDERS, apiProviderTiers, hasApiKey, isApiProvider, parseApiProviderConfig } from "../providers/config.js";
+import { API_PROVIDERS, MODEL_CATALOG_LIMIT, apiProviderTiers, hasApiKey, isApiProvider, parseApiProviderConfig } from "../providers/config.js";
 import { currentProvider, getProviderConfig, providerDefaultModel, providerModels } from "../providers/runtime.js";
-import { discoverApiModels } from "../providers/discovery.js";
+import { discoverApiModels, mergeDiscoveredModels } from "../providers/discovery.js";
 import { probeApiProvider } from "../providers/probe.js";
 import { isAntigravityAvailable } from "../bridge/antigravity.js";
 import {
@@ -505,10 +505,11 @@ export async function handleUiRoute(
     const clientGone = new AbortController();
     response.once("close", () => clientGone.abort());
     try {
-      const models = await discoverApiModels(provider, config, options.providerEnv ?? process.env, clientGone.signal);
-      recordLog({ level: "info", operation: "provider_models_listed", message: "Listed API provider models", details: { provider, count: models.length } });
+      const discovered = await discoverApiModels(provider, config, options.providerEnv ?? process.env, clientGone.signal);
+      const merged = mergeDiscoveredModels(config.models, discovered, MODEL_CATALOG_LIMIT);
+      recordLog({ level: "info", operation: "provider_models_listed", message: "Listed API provider models", details: { provider, listed: discovered.length, added: merged.added, omitted: merged.omitted } });
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, provider, models }));
+      response.end(JSON.stringify({ ok: true, provider, listed: discovered.length, added: merged.added, omitted: merged.omitted, limit: MODEL_CATALOG_LIMIT, models: merged.models }));
     } catch (error) {
       if (!(error instanceof BridgeError)) throw error;
       // A failed listing is a valid result for the panel to show, not a failed control panel request.
@@ -1132,49 +1133,49 @@ export function renderDashboardHtml(): string {
     .provider-btn {
       /* preserved for selector compatibility */
     }
-    .btn-provider-submit {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.35rem;
-      padding: 0.35rem 0.75rem;
-      border-radius: 0.45rem;
-      font-size: 0.75rem;
-      font-weight: 700;
-      border: 1.5px solid var(--border);
-      background: var(--surface-soft);
-      color: var(--ink-faint);
-      box-shadow: 1.5px 1.5px 0 var(--border);
-      transition: all 0.15s ease;
-      cursor: not-allowed;
-      opacity: 0.55;
+    .api-panel { margin-top: 1rem; padding: 1rem; border: 1px solid var(--line-soft); border-radius: var(--radius); background: var(--surface-soft); gap: 0.85rem; }
+    .api-panel:not([hidden]) { display: grid; }
+    .api-panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 0.75rem; }
+    .api-panel-head h3 { margin: 0; font-size: 1rem; }
+    .key-status { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.2rem 0.6rem; border: 1px solid var(--line-soft); border-radius: 999px; background: var(--surface); font-family: monospace; font-size: 0.75rem; overflow-wrap: anywhere; }
+    .key-status::before { content: ""; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--ink-faint); }
+    .key-status[data-state="ok"]::before { background: var(--primary); }
+    .key-status[data-state="missing"]::before { background: var(--destructive); }
+    .api-panel .supporting-text { margin: 0; }
+    .api-form { display: grid; gap: 0.85rem; }
+    .api-field { display: grid; gap: 0.3rem; font-size: 0.8rem; }
+    .api-form input, .api-form select { min-height: 2.25rem; padding: 0.4rem 0.6rem; border: 1px solid var(--input); border-radius: var(--radius); background: var(--surface); color: var(--ink); font: inherit; }
+    .api-form input:focus-visible, .api-form select:focus-visible, .api-form textarea:focus-visible, .api-form button:focus-visible, .api-form summary:focus-visible { outline: 3px solid var(--ring); outline-offset: 1px; }
+    .api-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 0.75rem; }
+    .api-fields label { display: grid; gap: 0.3rem; font-size: 0.8rem; }
+    .api-models-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.6rem; }
+    .api-models-head h4 { margin: 0; font-size: 0.9rem; }
+    .api-models-head .btn { margin-left: auto; }
+    .api-model-list { list-style: none; margin: 0; padding: 0; max-height: 17rem; overflow-y: auto; border: 1px solid var(--line-soft); border-radius: var(--radius); background: var(--surface); }
+    .api-model-list:empty::before { content: attr(data-empty); display: block; padding: 0.9rem; font-size: 0.8rem; color: var(--ink-soft); }
+    .api-model-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0.55rem 0.75rem; border-bottom: 1px solid var(--line-soft); }
+    .api-model-row:last-child { border-bottom: 0; }
+    .api-model-info { display: grid; gap: 0.15rem; min-width: 0; }
+    .api-model-info code { font-size: 0.8rem; overflow-wrap: anywhere; }
+    .api-model-meta { font-size: 0.72rem; color: var(--ink-soft); overflow-wrap: anywhere; }
+    .api-model-tag { flex: none; padding: 0.15rem 0.5rem; border-radius: 999px; background: var(--accent); color: var(--accent-foreground); font-size: 0.72rem; }
+    .api-model-row .btn { flex: none; }
+    .api-advanced { font-size: 0.8rem; }
+    .api-advanced summary { cursor: pointer; color: var(--ink-soft); padding: 0.2rem 0; }
+    .api-advanced[open] { display: grid; gap: 0.75rem; padding-top: 0.5rem; }
+    .api-advanced textarea { width: 100%; min-height: 12rem; padding: 0.6rem; border: 1px solid var(--input); border-radius: var(--radius); background: var(--surface); color: var(--ink); font-family: monospace; font-size: 0.75rem; resize: vertical; }
+    .api-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem; }
+    .api-test { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; min-width: 0; }
+    .api-test-label { font-size: 0.8rem; color: var(--ink-soft); }
+    .api-status { margin: 0; padding: 0.5rem 0.7rem; border: 1px solid var(--line-soft); border-left-width: 4px; border-radius: var(--radius); background: var(--surface); font-size: 0.8rem; overflow-wrap: anywhere; }
+    .api-status[data-state="ok"] { border-left-color: var(--teal-soft); }
+    .api-status[data-state="error"] { border-left-color: var(--destructive); }
+    .api-status[data-state="warning"] { border-left-color: var(--yellow); }
+    @media (max-width: 480px) {
+      .api-panel { padding: 0.85rem; }
+      .api-models-head .btn, .api-footer .btn-primary, .api-test .btn { width: 100%; margin-left: 0; }
+      .api-test .model-combobox { width: 100%; }
     }
-    .btn-provider-submit.pending {
-      opacity: 1;
-      cursor: pointer;
-      background: var(--coral);
-      border-color: var(--line);
-      color: #ffffff;
-      box-shadow: 1.5px 1.5px 0 var(--line);
-    }
-    .btn-provider-submit.pending:hover {
-      background: var(--coral-dark);
-      transform: translate(-1px, -1px);
-      box-shadow: 2.5px 2.5px 0 var(--line);
-    }
-    .btn-provider-submit.pending:active {
-      transform: translate(1px, 1px);
-      box-shadow: 1px 1px 0 var(--line);
-    }
-    .api-provider-settings { margin-top: 1rem; padding: 1rem; border: 1px solid var(--line-soft); border-radius: var(--radius); background: var(--surface-soft); }
-    .api-provider-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 0.75rem; margin: 0.75rem 0; }
-    .api-provider-fields label { display: grid; gap: 0.3rem; font-size: 0.8rem; }
-    .api-provider-settings textarea { width: 100%; min-height: 15rem; padding: 0.65rem; border: 1px solid var(--input); border-radius: var(--radius); background: var(--surface); color: var(--ink); font-family: monospace; resize: vertical; }
-    .api-provider-settings textarea:focus-visible { outline: 3px solid var(--ring); }
-    .api-provider-actions { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.6rem; margin-top: 0.75rem; }
-    .api-provider-actions label { display: grid; gap: 0.3rem; font-size: 0.8rem; min-width: min(100%, 240px); }
-    .api-test-result { margin: 0.6rem 0 0; padding: 0.55rem 0.7rem; border: 1px solid var(--line-soft); border-left-width: 4px; border-radius: var(--radius); background: var(--surface); font-size: 0.8rem; overflow-wrap: anywhere; }
-    .api-test-result[data-state="ok"] { border-left-color: var(--teal-soft); }
-    .api-test-result[data-state="error"] { border-left-color: var(--destructive); }
     /* Navigation Tabs */
     .nav-tabs {
       display: flex;
@@ -1637,6 +1638,17 @@ export function renderDashboardHtml(): string {
       padding: 0.38rem 0.55rem;
       background-color: var(--card);
     }
+    .model-combobox { position: relative; min-width: 0; }
+    .combo-input { width: 100%; min-height: 2.1rem; padding: 0.38rem 0.55rem; border: 1px solid var(--input); border-radius: var(--radius); background: var(--card); color: var(--ink); font: inherit; font-size: 0.785rem; }
+    .combo-input:focus-visible { outline: 3px solid var(--ring); outline-offset: 1px; }
+    .combo-list { position: absolute; z-index: 30; top: calc(100% + 0.3rem); left: 0; right: 0; max-height: 18rem; margin: 0; padding: 0.3rem; overflow-y: auto; list-style: none; border: 1px solid var(--line-soft); border-radius: var(--radius); background: var(--surface); box-shadow: 0 10px 28px var(--hard-shadow); }
+    .combo-list[hidden] { display: none; }
+    .combo-option { padding: 0.45rem 0.55rem; border-radius: 0.4rem; font-size: 0.8rem; line-height: 1.35; cursor: pointer; overflow-wrap: anywhere; }
+    .combo-option[aria-selected="true"] { font-weight: 600; }
+    .combo-option.is-active { background: var(--accent); }
+    .combo-empty { padding: 0.5rem 0.55rem; font-size: 0.8rem; color: var(--muted-foreground); }
+    .api-test .model-combobox { width: min(100%, 18rem); }
+    .api-test .combo-list { width: max(100%, 16rem); }
     .tier-actions {
       display: flex;
       justify-content: space-between;
@@ -2309,51 +2321,61 @@ export function renderDashboardHtml(): string {
               </button>`).join("\n")}
             </div>
           </div>
-          <button class="btn btn-primary btn-provider-submit" id="btn-provider-submit" type="button" disabled title="Click to apply and switch provider">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            <span>Submit</span>
-          </button>
         </div>
 
         <p class="instruction-card" id="provider-hint" hidden>Antigravity needs the <code>agy</code> CLI. Put agy on the gateway's PATH, or set <code>CODEX2CC_AGY_BIN</code> to its full path, then restart the gateway.</p>
 
-        <section id="api-provider-settings" class="api-provider-settings" aria-labelledby="api-provider-title" hidden>
-          <h3 id="api-provider-title">API provider settings</h3>
-          <p id="api-key-status" role="status"></p>
-          <p class="supporting-text">Enter the environment variable name, never the API key itself. Set its value in the gateway process environment or in the <code>.env</code> file beside <code>logs/</code>, then restart the gateway. Saving settings does not select a provider; press Submit above to switch.</p>
-          <p id="custom-provider-help" class="supporting-text" hidden>Custom supports Chat Completions, Responses and Anthropic Messages compatible APIs. Replace the example endpoint and model with your server settings. Enter complete resource URLs, not base URLs. HTTPS is required except for localhost HTTP.</p>
-          <form id="api-provider-form">
-            <div class="api-provider-fields">
-              <label for="api-key-env">API key environment variable name
-                <input id="api-key-env" type="text" autocomplete="off" spellcheck="false" required pattern="[A-Z][A-Z0-9_]*_API_KEY" aria-describedby="api-key-status" />
-              </label>
-              <label for="api-default-model">Default model slug
-                <input id="api-default-model" type="text" spellcheck="false" required />
-              </label>
-              <label for="api-endpoint-chat-completions">Chat Completions endpoint URL
-                <input id="api-endpoint-chat-completions" type="url" spellcheck="false" placeholder="https://api.openai.com/v1/chat/completions" />
-              </label>
-              <label for="api-endpoint-responses">Responses endpoint URL
-                <input id="api-endpoint-responses" type="url" spellcheck="false" placeholder="https://api.openai.com/v1/responses" />
-              </label>
-              <label for="api-endpoint-anthropic-messages">Anthropic Messages endpoint URL
-                <input id="api-endpoint-anthropic-messages" type="url" spellcheck="false" placeholder="https://opencode.ai/inference/anthropic/v1/messages" />
-              </label>
-            </div>
-            <label for="api-model-catalog">Model catalog (JSON array)</label>
-            <p id="api-model-schema" class="supporting-text">Each model requires slug, displayName, and protocol: chat-completions, responses, or anthropic-messages. reasoning is none, openai, or openrouter (default: none). Anthropic Messages uses none; Responses supports openai or none. Optional contextWindow and maxOutputTokens are positive integers. Each protocol needs its complete endpoint URL. The default model must exist in this catalog. Only these adapter protocols are supported, not every model a provider offers.</p>
-            <textarea id="api-model-catalog" spellcheck="false" required aria-describedby="api-model-schema api-model-example"></textarea>
-            <p id="api-model-example" class="supporting-text">Example: [{"slug":"gpt-5.5","displayName":"GPT-5.5","protocol":"responses","reasoning":"openai","contextWindow":200000,"maxOutputTokens":8192}]. Provider defaults load automatically; edit them to match your account. Fetch models adds the chat models your provider lists and keeps existing entries.</p>
-            <div class="api-provider-actions">
-              <button class="btn btn-primary btn-sm" id="btn-save-provider-config" type="submit">Save provider settings</button>
-              <label for="api-test-model">Model to test
-                <select id="api-test-model" data-test="provider-test-model"></select>
-              </label>
-              <button class="btn btn-secondary btn-sm" id="btn-test-provider" type="button" data-test="provider-test">Test connection</button>
+        <section id="api-provider-settings" class="api-panel" aria-labelledby="api-provider-title" hidden>
+          <div class="api-panel-head">
+            <h3 id="api-provider-title">API provider</h3>
+            <span id="api-key-status" class="key-status" role="status"></span>
+          </div>
+          <p id="api-key-hint" class="supporting-text" hidden>Add <code id="api-key-hint-name"></code> to the gateway environment or to the <code>.env</code> file beside <code>logs/</code>, then restart the gateway.</p>
+          <p id="custom-provider-help" class="supporting-text" hidden>Enter complete endpoint URLs, not base URLs. HTTPS is required except for localhost.</p>
+          <form id="api-provider-form" class="api-form">
+            <label for="api-default-model" class="api-field">Default model
+              <input id="api-default-model" type="text" spellcheck="false" required />
+            </label>
+
+            <div class="api-models-head">
+              <h4 id="api-models-title">Models</h4>
+              <span id="api-model-count" class="supporting-text"></span>
               <button class="btn btn-secondary btn-sm" id="btn-discover-models" type="button" data-test="provider-discover-models">Fetch models</button>
             </div>
-            <p id="api-test-result" class="api-test-result" role="status" aria-live="polite" data-test="provider-test-result" hidden></p>
-            <p id="api-discover-result" class="api-test-result" role="status" aria-live="polite" data-test="provider-discover-result" hidden></p>
+            <ul id="api-model-list" class="api-model-list" aria-labelledby="api-models-title"></ul>
+
+            <details id="api-advanced" class="api-advanced">
+              <summary>Advanced: key variable, endpoints and catalog JSON</summary>
+              <div class="api-fields">
+                <label for="api-key-env">API key variable name
+                  <input id="api-key-env" type="text" autocomplete="off" spellcheck="false" required pattern="[A-Z][A-Z0-9_]*_API_KEY" aria-describedby="api-key-status" />
+                </label>
+                <label for="api-endpoint-chat-completions">Chat Completions endpoint
+                  <input id="api-endpoint-chat-completions" type="url" spellcheck="false" placeholder="https://api.openai.com/v1/chat/completions" />
+                </label>
+                <label for="api-endpoint-responses">Responses endpoint
+                  <input id="api-endpoint-responses" type="url" spellcheck="false" placeholder="https://api.openai.com/v1/responses" />
+                </label>
+                <label for="api-endpoint-anthropic-messages">Anthropic Messages endpoint
+                  <input id="api-endpoint-anthropic-messages" type="url" spellcheck="false" placeholder="https://opencode.ai/inference/anthropic/v1/messages" />
+                </label>
+              </div>
+              <label for="api-model-catalog" class="api-field">Catalog JSON (up to 200 models)
+                <textarea id="api-model-catalog" spellcheck="false" required aria-describedby="api-model-schema"></textarea>
+              </label>
+              <p id="api-model-schema" class="supporting-text">Each model needs slug, displayName and protocol: chat-completions, responses or anthropic-messages. Reasoning is none, openai or openrouter. Each protocol needs its complete endpoint URL.</p>
+            </details>
+
+            <div class="api-footer">
+              <button class="btn btn-primary btn-sm" id="btn-save-provider-config" type="submit">Save</button>
+              <div class="api-test">
+                <label for="api-test-model-search" class="api-test-label">Test with</label>
+                <select id="api-test-model" data-test="provider-test-model" data-model-picker aria-label="Test model"></select>
+                <button class="btn btn-secondary btn-sm" id="btn-test-provider" type="button" data-test="provider-test">Test connection</button>
+              </div>
+            </div>
+            <p id="api-test-result" class="api-status" role="status" aria-live="polite" data-test="provider-test-result" hidden></p>
+            <p id="api-discover-result" class="api-status" role="status" aria-live="polite" data-test="provider-discover-result" hidden></p>
           </form>
         </section>
 
@@ -2378,6 +2400,74 @@ export function renderDashboardHtml(): string {
             <div class="input-group">
               <input type="password" id="input-token" autocomplete="off" placeholder="No token required" readonly />
               <button class="btn btn-secondary btn-sm" id="btn-copy-token" type="button" title="Copy token">Copy</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card-section-divider"></div>
+
+        <!-- Model Routing Section -->
+        <div class="setup-section" aria-labelledby="tier-mapping-title">
+          <div class="card-header">
+            <h2 class="card-title" id="tier-mapping-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+              Model routing
+            </h2>
+            <span class="badge-sub" id="tier-mapping-status">Loading…</span>
+          </div>
+          <p class="card-desc" id="tier-mapping-desc">Map each Claude tier to a backend model. Changes apply immediately upon saving.</p>
+
+          <div class="tier-grid">
+            <div class="tier-item">
+              <div class="tier-label-row">
+                <label for="tier-fable" class="tier-name">Fable</label>
+                <span class="tier-hint">Preview</span>
+              </div>
+              <select id="tier-fable" data-tier="fable" data-model-picker aria-label="Fable model"></select>
+            </div>
+            <div class="tier-item">
+              <div class="tier-label-row">
+                <label for="tier-opus" class="tier-name">Opus</label>
+                <span class="tier-hint">Reasoning</span>
+              </div>
+              <select id="tier-opus" data-tier="opus" data-model-picker aria-label="Opus model"></select>
+            </div>
+            <div class="tier-item">
+              <div class="tier-label-row">
+                <label for="tier-sonnet" class="tier-name">Sonnet</label>
+                <span class="tier-hint">Coding / Daily</span>
+              </div>
+              <select id="tier-sonnet" data-tier="sonnet" data-model-picker aria-label="Sonnet model"></select>
+            </div>
+            <div class="tier-item">
+              <div class="tier-label-row">
+                <label for="tier-haiku" class="tier-name">Haiku</label>
+                <span class="tier-hint">Fast / Light</span>
+              </div>
+              <select id="tier-haiku" data-tier="haiku" data-model-picker aria-label="Haiku model"></select>
+            </div>
+          </div>
+
+          <div class="effort-row" style="display:flex;align-items:center;justify-content:space-between;padding:0.75rem 1rem;background:var(--surface-soft);border:1px solid var(--line-soft);border-radius:0.6rem;">
+            <div>
+              <label for="select-effort" style="font-weight:600;font-size:0.875rem;">Thinking Level</label>
+              <p style="font-size:0.75rem;color:var(--muted-foreground);margin:0.15rem 0 0 0;">Default thinking level applied to reasoning models (saved to settings.json).</p>
+            </div>
+            <select id="select-effort" style="width:auto;min-width:140px;padding:0.4rem 0.6rem;border-radius:0.45rem;border:1.5px solid var(--input);background:var(--surface);color:inherit;">
+              <option value="">Default (None)</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="xhigh">X-High</option>
+              <option value="max">Max</option>
+            </select>
+          </div>
+
+          <div class="tier-actions">
+            <span class="supporting-text">Re-apply client setup and reload Claude Code to refresh saved model aliases.</span>
+            <div style="display:flex;gap:0.5rem;">
+              <button class="btn btn-secondary btn-sm" id="btn-reset-tier-mapping" type="button">Use defaults</button>
+              <button class="btn btn-primary btn-sm" id="btn-save-tier-mapping" type="button">Save mapping</button>
             </div>
           </div>
         </div>
@@ -2442,74 +2532,6 @@ export function renderDashboardHtml(): string {
           </div>
 
           <p class="instruction-card"><strong>Next:</strong> Restart Claude Desktop and choose “Continue with Gateway” (not claude.ai). Reload your terminal or editor before running <code>claude</code>.</p>
-        </div>
-
-        <div class="card-section-divider"></div>
-
-        <!-- Model Routing Section -->
-        <div class="setup-section" aria-labelledby="tier-mapping-title">
-          <div class="card-header">
-            <h2 class="card-title" id="tier-mapping-title">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg>
-              Model routing
-            </h2>
-            <span class="badge-sub" id="tier-mapping-status">Loading…</span>
-          </div>
-          <p class="card-desc" id="tier-mapping-desc">Map each Claude tier to a backend model. Changes apply immediately upon saving.</p>
-
-          <div class="tier-grid">
-            <div class="tier-item">
-              <div class="tier-label-row">
-                <label for="tier-fable" class="tier-name">Fable</label>
-                <span class="tier-hint">Preview</span>
-              </div>
-              <select id="tier-fable" data-tier="fable"></select>
-            </div>
-            <div class="tier-item">
-              <div class="tier-label-row">
-                <label for="tier-opus" class="tier-name">Opus</label>
-                <span class="tier-hint">Reasoning</span>
-              </div>
-              <select id="tier-opus" data-tier="opus"></select>
-            </div>
-            <div class="tier-item">
-              <div class="tier-label-row">
-                <label for="tier-sonnet" class="tier-name">Sonnet</label>
-                <span class="tier-hint">Coding / Daily</span>
-              </div>
-              <select id="tier-sonnet" data-tier="sonnet"></select>
-            </div>
-            <div class="tier-item">
-              <div class="tier-label-row">
-                <label for="tier-haiku" class="tier-name">Haiku</label>
-                <span class="tier-hint">Fast / Light</span>
-              </div>
-              <select id="tier-haiku" data-tier="haiku"></select>
-            </div>
-          </div>
-
-          <div class="effort-row" style="display:flex;align-items:center;justify-content:space-between;padding:0.75rem 1rem;background:var(--surface-soft);border:1px solid var(--line-soft);border-radius:0.6rem;">
-            <div>
-              <label for="select-effort" style="font-weight:600;font-size:0.875rem;">Thinking Level</label>
-              <p style="font-size:0.75rem;color:var(--muted-foreground);margin:0.15rem 0 0 0;">Default thinking level applied to reasoning models (saved to settings.json).</p>
-            </div>
-            <select id="select-effort" style="width:auto;min-width:140px;padding:0.4rem 0.6rem;border-radius:0.45rem;border:1.5px solid var(--input);background:var(--surface);color:inherit;">
-              <option value="">Default (None)</option>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-              <option value="xhigh">X-High</option>
-              <option value="max">Max</option>
-            </select>
-          </div>
-
-          <div class="tier-actions">
-            <span class="supporting-text">Re-apply client setup and reload Claude Code to refresh saved model aliases.</span>
-            <div style="display:flex;gap:0.5rem;">
-              <button class="btn btn-secondary btn-sm" id="btn-reset-tier-mapping" type="button">Use defaults</button>
-              <button class="btn btn-primary btn-sm" id="btn-save-tier-mapping" type="button">Save mapping</button>
-            </div>
-          </div>
         </div>
       </section>
     </div>
@@ -2878,17 +2900,25 @@ export function renderDashboardHtml(): string {
       section.hidden = !entry?.config;
       document.getElementById("custom-provider-help").hidden = selectedProvider !== "custom";
       if (!entry?.config) return;
-      document.getElementById("api-provider-title").textContent = providerLabels[selectedProvider] + " settings";
-      document.getElementById("api-key-status").textContent = entry.config.apiKeyEnv + (entry.keyConfigured ? ": configured in the gateway environment" : ": missing or invalid in the gateway environment; set it in the shell or the .env file beside logs/, then restart the gateway");
+      document.getElementById("api-provider-title").textContent = providerLabels[selectedProvider];
+      const keyStatus = document.getElementById("api-key-status");
+      keyStatus.dataset.state = entry.keyConfigured ? "ok" : "missing";
+      keyStatus.textContent = entry.config.apiKeyEnv + (entry.keyConfigured ? " is set" : " is not set");
+      document.getElementById("api-key-hint").hidden = entry.keyConfigured;
+      document.getElementById("api-key-hint-name").textContent = entry.config.apiKeyEnv;
       if (editingProvider === selectedProvider && providerConfigDirty) return;
-      if (editingProvider !== selectedProvider) document.getElementById("api-test-result").hidden = true;
+      if (editingProvider !== selectedProvider) {
+        document.getElementById("api-test-result").hidden = true;
+        document.getElementById("api-discover-result").hidden = true;
+        document.getElementById("api-advanced").open = selectedProvider === "custom";
+      }
       editingProvider = selectedProvider;
       providerConfigDirty = false;
       document.getElementById("api-key-env").value = entry.config.apiKeyEnv;
       document.getElementById("api-default-model").value = entry.config.defaultModel;
       for (const protocol of apiProtocols) document.getElementById("api-endpoint-" + protocol).value = entry.config.endpoints[protocol] || "";
       document.getElementById("api-model-catalog").value = JSON.stringify(entry.config.models, null, 2);
-      renderTestModelOptions();
+      renderModels();
     }
 
     function readProviderForm() {
@@ -2905,34 +2935,86 @@ export function renderDashboardHtml(): string {
       };
     }
 
-    /** Lists catalog slugs from the form; tier-mapped and default models are the useful ones to test. */
-    function renderTestModelOptions() {
-      const select = document.getElementById("api-test-model");
-      const previous = select.value;
-      let slugs = [];
+    /** Returns the catalog array as typed, or null while the JSON is unparseable or not an array. */
+    function parseCatalog() {
       try {
         const models = JSON.parse(document.getElementById("api-model-catalog").value);
-        if (Array.isArray(models)) slugs = models.map((model) => model && model.slug).filter((slug) => typeof slug === "string" && slug.trim());
+        return Array.isArray(models) ? models : null;
       } catch (error) {
         if (!(error instanceof SyntaxError)) throw error;
+        return null;
       }
+    }
+
+    function renderModelRow(model, defaultModel) {
+      const row = document.createElement("li");
+      row.className = "api-model-row";
+      const info = document.createElement("div");
+      info.className = "api-model-info";
+      const slug = document.createElement("code");
+      slug.textContent = model.slug;
+      const meta = document.createElement("span");
+      meta.className = "api-model-meta";
+      meta.textContent = [typeof model.displayName === "string" && model.displayName !== model.slug ? model.displayName : null, model.protocol].filter(Boolean).join(" · ");
+      info.append(slug, meta);
+      row.append(info);
+      if (model.slug === defaultModel) {
+        const tag = document.createElement("span");
+        tag.className = "api-model-tag";
+        tag.textContent = "Default";
+        row.append(tag);
+      } else {
+        const remove = document.createElement("button");
+        remove.className = "btn btn-secondary btn-sm";
+        remove.type = "button";
+        remove.dataset.slug = model.slug;
+        remove.textContent = "Remove";
+        remove.setAttribute("aria-label", "Remove " + model.slug);
+        row.append(remove);
+      }
+      return row;
+    }
+
+    /** Redraws the model list, its count and the test selector from the catalog JSON. */
+    function renderModels() {
+      const catalog = parseCatalog();
       const defaultModel = document.getElementById("api-default-model").value.trim();
+      const models = (catalog || []).filter((model) => model && typeof model.slug === "string" && model.slug.trim());
+      const slugs = models.map((model) => model.slug);
+      const list = document.getElementById("api-model-list");
+      list.dataset.empty = catalog === null ? "The catalog JSON is invalid. Open Advanced to fix it." : "No models yet. Fetch models or add them in Advanced.";
+      list.replaceChildren(...models.map((model) => renderModelRow(model, defaultModel)));
+      document.getElementById("api-model-count").textContent = catalog === null ? "" : slugs.length + " / 200";
+      const select = document.getElementById("api-test-model");
+      const previous = select.value;
       select.replaceChildren(...slugs.map((slug) => {
         const option = document.createElement("option");
         option.value = slug;
-        option.textContent = slug === defaultModel ? slug + " (default)" : slug;
+        option.textContent = slug;
         return option;
       }));
       select.value = slugs.includes(previous) ? previous : slugs.includes(defaultModel) ? defaultModel : slugs[0] || "";
+      refreshModelCombobox(select);
       document.getElementById("btn-test-provider").disabled = isProviderTesting || slugs.length === 0;
     }
 
-    function showProviderTestResult(state, text) {
-      const result = document.getElementById("api-test-result");
+    /** Shows one status line under the panel; a newer test or fetch replaces the older message. */
+    function showApiStatus(id, state, text) {
+      for (const statusId of ["api-test-result", "api-discover-result"]) document.getElementById(statusId).hidden = statusId !== id;
+      const result = document.getElementById(id);
       result.dataset.state = state;
       result.textContent = text;
       result.hidden = false;
     }
+
+    document.getElementById("api-model-list").addEventListener("click", (event) => {
+      const slug = event.target.dataset ? event.target.dataset.slug : undefined;
+      const catalog = parseCatalog();
+      if (!slug || catalog === null) return;
+      document.getElementById("api-model-catalog").value = JSON.stringify(catalog.filter((model) => model && model.slug !== slug), null, 2);
+      providerConfigDirty = true;
+      renderModels();
+    });
 
     document.getElementById("btn-test-provider").addEventListener("click", async () => {
       if (isProviderTesting) return;
@@ -2941,7 +3023,7 @@ export function renderDashboardHtml(): string {
       isProviderTesting = true;
       button.disabled = true;
       button.textContent = "Testing...";
-      showProviderTestResult("pending", "Sending a test message to " + providerLabels[provider] + "...");
+      showApiStatus("api-test-result", "pending", "Sending a test message to " + providerLabels[provider] + "...");
       try {
         const config = readProviderForm();
         const model = document.getElementById("api-test-model").value;
@@ -2950,25 +3032,18 @@ export function renderDashboardHtml(): string {
         });
         const data = await response.json();
         if (data.ok) {
-          showProviderTestResult("ok", "Connected: " + data.model + " via " + data.protocol + " answered in " + data.latencyMs + " ms" + (data.reply ? ' ("' + data.reply + '")' : "") + ".");
+          showApiStatus("api-test-result", "ok", "Connected to " + data.model + " in " + data.latencyMs + " ms" + (data.reply ? ': "' + data.reply + '"' : "") + ".");
         } else {
-          showProviderTestResult("error", "Failed" + (data.code ? " [" + data.code + (data.status ? " " + data.status : "") + "]" : "") + ": " + (data.error || "Unknown error"));
+          showApiStatus("api-test-result", "error", "Failed" + (data.code ? " [" + data.code + (data.status ? " " + data.status : "") + "]" : "") + ": " + (data.error || "Unknown error"));
         }
       } catch (error) {
-        showProviderTestResult("error", error instanceof SyntaxError ? "Model catalog must be a valid JSON array." : "Test request failed: " + error.message);
+        showApiStatus("api-test-result", "error", error instanceof SyntaxError ? "The model catalog must be a valid JSON array." : "Test request failed: " + error.message);
       } finally {
         isProviderTesting = false;
         button.textContent = "Test connection";
-        renderTestModelOptions();
+        renderModels();
       }
     });
-
-    function showDiscoverResult(state, text) {
-      const result = document.getElementById("api-discover-result");
-      result.dataset.state = state;
-      result.textContent = text;
-      result.hidden = false;
-    }
 
     document.getElementById("btn-discover-models").addEventListener("click", async () => {
       if (isProviderDiscovering) return;
@@ -2977,7 +3052,7 @@ export function renderDashboardHtml(): string {
       isProviderDiscovering = true;
       button.disabled = true;
       button.textContent = "Fetching...";
-      showDiscoverResult("pending", "Fetching models from " + providerLabels[provider] + "...");
+      showApiStatus("api-discover-result", "pending", "Fetching models from " + providerLabels[provider] + "...");
       try {
         const config = readProviderForm();
         const response = await fetch("/api/ui/provider-models", {
@@ -2985,24 +3060,21 @@ export function renderDashboardHtml(): string {
         });
         const data = await response.json();
         if (provider !== selectedProvider) {
-          showDiscoverResult("error", "The provider changed before the list arrived. Fetch again for " + providerLabels[selectedProvider] + ".");
+          showApiStatus("api-discover-result", "error", "The provider changed before the list arrived. Fetch again for " + providerLabels[selectedProvider] + ".");
         } else if (!data.ok) {
-          showDiscoverResult("error", "Failed" + (data.code ? " [" + data.code + (data.status ? " " + data.status : "") + "]" : "") + ": " + (data.error || "Unknown error"));
+          showApiStatus("api-discover-result", "error", "Failed" + (data.code ? " [" + data.code + (data.status ? " " + data.status : "") + "]" : "") + ": " + (data.error || "Unknown error"));
         } else {
-          const known = new Set(config.models.map((model) => model.slug));
-          const added = data.models.filter((model) => !known.has(model.slug));
-          const merged = config.models.concat(added);
-          if (merged.length > 200) {
-            showDiscoverResult("error", "The catalog would hold " + merged.length + " models, but the limit is 200. Remove entries, then fetch again.");
-          } else {
-            document.getElementById("api-model-catalog").value = JSON.stringify(merged, null, 2);
-            providerConfigDirty = true;
-            renderTestModelOptions();
-            showDiscoverResult("ok", "Found " + data.models.length + " chat models and added " + added.length + " new. Review the catalog, then save provider settings.");
+          document.getElementById("api-model-catalog").value = JSON.stringify(data.models, null, 2);
+          providerConfigDirty = true;
+          renderModels();
+          let message = data.added > 0 ? "Added " + data.added + " models from " + data.listed + " listed." : "No new models: every listed model is already in the catalog.";
+          if (data.omitted > 0) {
+            message += " " + data.omitted + " not added because the catalog holds " + data.limit + " models. Remove models to make room, then fetch again.";
           }
+          showApiStatus("api-discover-result", data.omitted > 0 ? "warning" : "ok", message);
         }
       } catch (error) {
-        showDiscoverResult("error", error instanceof SyntaxError ? "Model catalog must be a valid JSON array." : "Model listing request failed: " + error.message);
+        showApiStatus("api-discover-result", "error", error instanceof SyntaxError ? "The model catalog must be a valid JSON array." : "Model listing request failed: " + error.message);
       } finally {
         isProviderDiscovering = false;
         button.textContent = "Fetch models";
@@ -3011,8 +3083,9 @@ export function renderDashboardHtml(): string {
     });
 
     document.getElementById("api-provider-form").addEventListener("input", (event) => {
+      if (event.target.classList.contains("combo-input")) return;
       providerConfigDirty = true;
-      if (event.target.id === "api-model-catalog" || event.target.id === "api-default-model") renderTestModelOptions();
+      if (event.target.id === "api-model-catalog" || event.target.id === "api-default-model") renderModels();
     });
     document.getElementById("api-provider-form").addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -3033,7 +3106,7 @@ export function renderDashboardHtml(): string {
         showToast("Saved " + providerLabels[provider] + " settings. Re-apply client setup if models changed.");
         await fetchStatus();
       } catch (error) {
-        showToast(error instanceof SyntaxError ? "Model catalog must be a valid JSON array." : error.message, "error");
+        showToast(error instanceof SyntaxError ? "The model catalog must be a valid JSON array." : error.message, "error");
       } finally {
         isProviderConfigSaving = false;
         button.disabled = false;
@@ -3044,7 +3117,6 @@ export function renderDashboardHtml(): string {
     function updateProviderControls(availableList) {
       const btnCodex = document.getElementById("btn-provider-codex");
       const btnAnt = document.getElementById("btn-provider-antigravity");
-      const btnSubmit = document.getElementById("btn-provider-submit");
       if (!btnCodex || !btnAnt) return;
 
       let antigravityReady = true;
@@ -3093,21 +3165,10 @@ export function renderDashboardHtml(): string {
         const isPending = selectedProvider !== currentActiveProvider;
         triggerBadge.textContent = isPending ? "Pending" : "Active";
         triggerBadge.classList.toggle("staged", isPending);
-        triggerBadge.title = isPending ? "Staged: click Submit to activate" : "Currently active provider";
+        triggerBadge.title = isPending ? "Staged: click Apply configuration to activate" : "Currently active provider";
       }
 
       renderProviderSettings();
-
-      const isPending = selectedProvider !== currentActiveProvider;
-      if (btnSubmit) {
-        btnSubmit.disabled = isProviderSwitching || isProviderConfigSaving || !isPending;
-        btnSubmit.classList.toggle("pending", isPending && !isProviderSwitching);
-        if (isPending) {
-          btnSubmit.title = "Click to apply and switch to " + providerLabels[selectedProvider];
-        } else {
-          btnSubmit.title = "Active provider already selected";
-        }
-      }
     }
 
     function selectProvider(target) {
@@ -3242,39 +3303,19 @@ export function renderDashboardHtml(): string {
           // Finish the previous provider read before refreshing the new provider.
           await usageRequest;
           await fetchUsage(true);
+          return true;
         } else {
           showToast("Failed to switch provider: " + (data.error || "Unknown error"), "error");
         }
       } catch (err) {
         showToast("Error switching provider: " + err.message, "error");
       }
+      return false;
     }
 
     document.getElementById("btn-provider-codex")?.addEventListener("click", () => selectProvider("codex"));
     document.getElementById("btn-provider-antigravity")?.addEventListener("click", () => selectProvider("antigravity"));
     ${API_PROVIDERS.map((provider) => `document.getElementById("btn-provider-${provider}")?.addEventListener("click", () => selectProvider("${provider}"));`).join("\n    ")}
-
-    document.getElementById("btn-provider-submit")?.addEventListener("click", async () => {
-      if (selectedProvider === currentActiveProvider || isProviderSwitching || isProviderConfigSaving) return;
-      if (hasUnsavedTierChanges()) {
-        if (!confirm("You have unsaved model routing edits for the current provider. Switch anyway?")) return;
-      }
-      const btnSubmit = document.getElementById("btn-provider-submit");
-      isProviderSwitching = true;
-      if (btnSubmit) {
-        btnSubmit.disabled = true;
-        btnSubmit.textContent = "Switching…";
-      }
-      try {
-        await switchProvider(selectedProvider);
-      } finally {
-        isProviderSwitching = false;
-        if (btnSubmit) {
-          btnSubmit.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> <span>Submit</span>';
-        }
-        updateProviderControls();
-      }
-    });
 
     /* True when the model map holds selections that differ from the mapping saved on the server. */
     function hasUnsavedTierChanges() {
@@ -3283,6 +3324,141 @@ export function renderDashboardHtml(): string {
       const tiersChanged = ["fable", "opus", "sonnet", "haiku"].some((tier) => document.getElementById("tier-" + tier).value !== saved.current[tier]);
       return tiersChanged || document.getElementById("select-effort").value !== (saved.effort || "");
     }
+
+    /* Searchable model pickers for the model routing tiers. Each hidden select stays the source of truth for saving. */
+    const modelComboboxes = new Map();
+
+    function mountModelCombobox(select) {
+      const wrap = document.createElement("div");
+      wrap.className = "model-combobox";
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "combo-input";
+      input.id = select.id + "-search";
+      input.setAttribute("role", "combobox");
+      input.setAttribute("aria-autocomplete", "list");
+      input.setAttribute("aria-expanded", "false");
+      input.setAttribute("aria-controls", select.id + "-list");
+      input.setAttribute("aria-label", select.getAttribute("aria-label") ?? "Model");
+      input.placeholder = "Search models";
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      const list = document.createElement("ul");
+      list.id = select.id + "-list";
+      list.className = "combo-list";
+      list.setAttribute("role", "listbox");
+      list.hidden = true;
+      select.before(wrap);
+      select.hidden = true;
+      wrap.append(input, list, select);
+      const state = { select, input, list, options: [], matches: [], query: "", active: -1, open: false };
+      modelComboboxes.set(select.id, state);
+      input.addEventListener("focus", () => { input.select(); openModelCombobox(state); });
+      // A click after the picker closed lands in the middle of the label; select it again so typing starts a new search.
+      input.addEventListener("click", () => { if (state.query === "") input.select(); openModelCombobox(state); });
+      input.addEventListener("input", () => { openModelCombobox(state); state.query = input.value; state.active = 0; renderModelComboboxList(state); });
+      input.addEventListener("keydown", (event) => handleModelComboboxKey(state, event));
+      input.addEventListener("blur", () => closeModelCombobox(state));
+      list.addEventListener("mousedown", (event) => event.preventDefault());
+      list.addEventListener("click", (event) => {
+        const option = event.target.closest("li[data-value]");
+        if (option) pickModelComboboxOption(state, option.dataset.value);
+      });
+      return state;
+    }
+
+    /** Copies the select's options into the picker and shows the current choice. */
+    function refreshModelCombobox(select) {
+      const state = modelComboboxes.get(select.id);
+      if (!state) return;
+      state.options = [...select.options].map((option) => ({ value: option.value, label: option.textContent }));
+      if (state.open) {
+        renderModelComboboxList(state);
+      } else {
+        state.input.value = selectedModelLabel(state);
+      }
+    }
+
+    function selectedModelLabel(state) {
+      const option = state.options.find((item) => item.value === state.select.value);
+      return option ? option.label : "";
+    }
+
+    function openModelCombobox(state) {
+      if (state.open) return;
+      state.open = true;
+      state.query = "";
+      state.active = -1;
+      state.input.setAttribute("aria-expanded", "true");
+      state.list.hidden = false;
+      renderModelComboboxList(state);
+    }
+
+    function closeModelCombobox(state) {
+      state.open = false;
+      state.query = "";
+      state.list.hidden = true;
+      state.input.setAttribute("aria-expanded", "false");
+      state.input.value = selectedModelLabel(state);
+    }
+
+    function renderModelComboboxList(state) {
+      const query = state.query.trim().toLowerCase();
+      state.matches = state.options.filter((option) => option.label.toLowerCase().includes(query));
+      if (state.active === -1) state.active = state.matches.findIndex((option) => option.value === state.select.value);
+      if (state.active >= state.matches.length) state.active = state.matches.length - 1;
+      const items = state.matches.map((option, index) => {
+        const item = document.createElement("li");
+        item.id = state.list.id + "-" + index;
+        item.setAttribute("role", "option");
+        item.dataset.value = option.value;
+        item.textContent = option.label;
+        item.className = "combo-option";
+        item.setAttribute("aria-selected", option.value === state.select.value ? "true" : "false");
+        if (index === state.active) {
+          item.classList.add("is-active");
+          state.input.setAttribute("aria-activedescendant", item.id);
+        }
+        return item;
+      });
+      if (items.length === 0) {
+        const empty = document.createElement("li");
+        empty.className = "combo-empty";
+        empty.textContent = "No models match “" + state.query + "”";
+        items.push(empty);
+        state.input.removeAttribute("aria-activedescendant");
+      }
+      state.list.replaceChildren(...items);
+      const active = state.list.querySelector(".is-active");
+      if (active) active.scrollIntoView({ block: "nearest" });
+    }
+
+    function pickModelComboboxOption(state, value) {
+      state.select.value = value;
+      state.select.dispatchEvent(new Event("change", { bubbles: true }));
+      closeModelCombobox(state);
+    }
+
+    function handleModelComboboxKey(state, event) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        openModelCombobox(state);
+        const step = event.key === "ArrowDown" ? 1 : -1;
+        const count = state.matches.length;
+        if (count > 0) state.active = (Math.max(state.active, -1) + step + count) % count;
+        renderModelComboboxList(state);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        const option = state.open ? state.matches[state.active] : undefined;
+        if (option) pickModelComboboxOption(state, option.value);
+      } else if (event.key === "Escape") {
+        if (!state.open) return;
+        event.preventDefault();
+        closeModelCombobox(state);
+      }
+    }
+
+    for (const select of document.querySelectorAll("select[data-model-picker]")) mountModelCombobox(select);
 
     function renderTierMapping(mapping) {
       const tiers = ["fable", "opus", "sonnet", "haiku"];
@@ -3302,6 +3478,7 @@ export function renderDashboardHtml(): string {
           select.appendChild(option);
         }
         select.value = selectedModel;
+        refreshModelCombobox(select);
       }
       const status = document.getElementById("tier-mapping-status");
       status.textContent = mapping.custom ? "Saved mapping" : "Environment or built-in defaults";
@@ -3366,11 +3543,27 @@ export function renderDashboardHtml(): string {
     });
 
     document.getElementById("btn-apply").addEventListener("click", async () => {
+      if (isProviderSwitching || isProviderConfigSaving) return;
       const target = document.getElementById("select-target").value;
       const gatewayUrl = document.getElementById("input-url").value.trim();
       const token = document.getElementById("input-token").value.trim();
+      const btnApply = document.getElementById("btn-apply");
 
+      btnApply.disabled = true;
       try {
+        if (providerConfigDirty && !confirm("Unsaved API provider settings will not be applied. Apply anyway?")) return;
+        // Client setup is built from the gateway's active provider, so activate the selected one first.
+        if (selectedProvider !== currentActiveProvider) {
+          if (hasUnsavedTierChanges() && !confirm("You have unsaved model routing edits for the current provider. Switch anyway?")) return;
+          isProviderSwitching = true;
+          updateProviderControls();
+          try {
+            if (!(await switchProvider(selectedProvider))) return;
+          } finally {
+            isProviderSwitching = false;
+            updateProviderControls();
+          }
+        }
         const res = await fetch("/api/ui/setup", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -3382,6 +3575,8 @@ export function renderDashboardHtml(): string {
         fetchStatus();
       } catch (err) {
         showToast("Failed to apply configuration: " + err.message, "error");
+      } finally {
+        btnApply.disabled = false;
       }
     });
 

@@ -29,6 +29,7 @@ function usageUi() {
   }
   class Element {
     textContent = '';
+    value = '';
     disabled = false;
     hidden = true;
     open = false;
@@ -47,31 +48,44 @@ function usageUi() {
     if (!elements.has(id)) elements.set(id, new Element());
     return elements.get(id)!;
   };
-  const requests: Array<{ url: string; options: { method?: string; signal: AbortSignal }; result: ReturnType<typeof deferred<Reply>> }> = [];
+  const requests: Array<{ url: string; options: { method?: string; body?: string; signal: AbortSignal }; result: ReturnType<typeof deferred<Reply>> }> = [];
   const rendered: unknown[] = [];
   const toasts: Array<{ message: string; type: string }> = [];
   const timeouts: number[] = [];
+  const configurationResults: string[] = [];
+  const globals = {
+    selectedProvider: 'codex',
+    currentActiveProvider: 'codex',
+    isProviderSwitching: false,
+    isProviderConfigSaving: false,
+    providerConfigDirty: false,
+    hasUnsavedTierChanges: () => false,
+    updateProviderControls: () => {},
+    confirm: () => true,
+    showConfigurationResult: (message: string) => configurationResults.push(message),
+  };
   const api = runInNewContext(
     section('    let usageRequest =', '    let cachedLimits =') +
     section('    function setupUsageControls()', '    setupTabs();') +
     section('    async function switchProvider(', '    document.getElementById("btn-provider-codex")') +
+    section('    document.getElementById("btn-apply").addEventListener', '    document.getElementById("btn-save-tier-mapping")') +
     'setupUsageControls(); ({ fetchUsage, switchProvider });',
-    {
+    Object.assign(globals, {
       document: { getElementById: element },
       fetchStatus: async () => {},
       providerLabels: { openai: 'OpenAI' },
       AbortSignal: { timeout: (ms: number) => { timeouts.push(ms); return new AbortController().signal; } },
-      fetch: (url: string, options: { method?: string; signal: AbortSignal }) => {
+      fetch: (url: string, options: { method?: string; body?: string; signal: AbortSignal }) => {
         const result = deferred<Reply>();
         requests.push({ url, options, result });
         return result.promise;
       },
       renderUsage: (data: unknown) => rendered.push(data),
       showToast: (message: string, type = 'success') => toasts.push({ message, type }),
-    },
-  ) as { fetchUsage(refresh?: boolean): Promise<boolean>; switchProvider(provider: string): Promise<void> };
+    }),
+  ) as { fetchUsage(refresh?: boolean): Promise<boolean>; switchProvider(provider: string): Promise<boolean> };
   return {
-    ...api, html, element, requests, rendered, toasts, timeouts,
+    ...api, html, element, requests, rendered, toasts, timeouts, globals, configurationResults,
     fire: (id: string, name = 'click') => {
       let prevented = false;
       const result = element(id).listeners.get(name)?.({ preventDefault() { prevented = true; } });
@@ -244,4 +258,50 @@ test('provider switch waits for an old read then requests fresh provider usage',
   ui.requests[2]!.result.resolve(reply({ provider: 'openai' }));
   await switching;
   assert.deepEqual(ui.rendered.at(-1), { provider: 'openai' });
+});
+
+test('Apply configuration activates the selected provider before setting up clients', async () => {
+  const ui = usageUi();
+  ui.globals.selectedProvider = 'openai';
+  ui.element('select-target').value = 'cli';
+  const applying = ui.fire('btn-apply').result;
+  await tick();
+  assert.equal(ui.requests[0]!.url, '/api/ui/provider');
+  assert.equal(ui.globals.isProviderSwitching, true);
+  assert.equal(ui.element('btn-apply').disabled, true);
+  ui.requests[0]!.result.resolve(reply());
+  await tick();
+  assert.equal(ui.requests[1]!.url, '/api/ui/usage?refresh=true');
+  ui.requests[1]!.result.resolve(reply({ provider: 'openai' }));
+  await tick();
+  assert.equal(ui.requests[2]!.url, '/api/ui/setup');
+  assert.equal(ui.globals.isProviderSwitching, false);
+  assert.deepEqual(JSON.parse(ui.requests[2]!.options.body!), { target: 'cli', gatewayUrl: '', token: '' });
+  ui.requests[2]!.result.resolve(reply());
+  await applying;
+  assert.deepEqual(ui.configurationResults, ['Configuration applied successfully!']);
+  assert.equal(ui.element('btn-apply').disabled, false);
+});
+
+test('Apply configuration skips client setup when the provider switch fails', async () => {
+  const ui = usageUi();
+  ui.globals.selectedProvider = 'openai';
+  const applying = ui.fire('btn-apply').result;
+  await tick();
+  ui.requests[0]!.result.resolve(reply({ ok: false, error: 'missing key' }));
+  await applying;
+  assert.equal(ui.requests.length, 1, 'setup must not run against the old provider');
+  assert.deepEqual(ui.toasts.at(-1), { message: 'Failed to switch provider: missing key', type: 'error' });
+  assert.equal(ui.globals.isProviderSwitching, false);
+  assert.equal(ui.element('btn-apply').disabled, false);
+});
+
+test('Apply configuration with the active provider sets up clients without switching', async () => {
+  const ui = usageUi();
+  const applying = ui.fire('btn-apply').result;
+  await tick();
+  assert.equal(ui.requests[0]!.url, '/api/ui/setup');
+  ui.requests[0]!.result.resolve(reply());
+  await applying;
+  assert.equal(ui.requests.length, 1);
 });

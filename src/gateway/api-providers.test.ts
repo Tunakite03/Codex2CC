@@ -407,7 +407,57 @@ test("connection test rejects models outside the catalog", async () => {
   });
 });
 
-type ModelListBody = { ok: boolean; models?: Array<{ slug: string }>; code?: string; status?: number; error?: string };
+type ModelListBody = { ok: boolean; listed?: number; added?: number; omitted?: number; limit?: number; models?: Array<{ slug: string }>; code?: string; status?: number; error?: string };
+
+async function withModelList(list: object, run: (fixture: Fixture) => Promise<void>): Promise<void> {
+  const requests: Recorded[] = [];
+  const upstream = createServer((request, response) => {
+    requests.push({ url: request.url ?? "", headers: request.headers, body: "" });
+    response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(list));
+  });
+  const port = await listenOnLoopback(upstream, 0);
+  const upstreamUrl = `http://127.0.0.1:${port}`;
+  const directory = mkdtempSync(join(tmpdir(), "codex2cc-model-list-gateway-"));
+  const store = TierModelStore.open(join(directory, "settings.json"), {});
+  const initial = defaultApiProviderConfig("openrouter");
+  store.saveApiProviderConfig("openrouter", { ...initial, endpoints: { "chat-completions": `${upstreamUrl}/api/v1/chat/completions` } });
+  store.setProvider("openrouter");
+  const options: GatewayOptions = {
+    session: { async accessToken() { assert.fail("API providers must not access ChatGPT session"); }, async refreshAfterRejection() { assert.fail("API provider 401 must not refresh ChatGPT session"); }, accountId() { assert.fail("API provider must not read ChatGPT account ID"); } },
+    defaultModel: "codex-model", availableModels: [{ slug: "codex-model", displayName: "Codex model" }],
+    policy: { mode: "token", token: "fixture-client-token-0123456789" }, tierStore: store,
+    providerEnv: { [initial.apiKeyEnv]: API_KEY }, keepAliveMs: 20,
+  };
+  const gateway = createGatewayServer(options);
+  try {
+    const gatewayPort = await listenOnLoopback(gateway, 0);
+    await run({ base: `http://127.0.0.1:${gatewayPort}`, requests, store, options, upstreamUrl });
+  } finally {
+    await close(gateway);
+    await close(upstream);
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test("model listing route merges free and tool-capable models into the catalog and reports the totals", async () => {
+  const list = { data: [
+    { id: "paid/model", created: 2, pricing: { prompt: "0.000001", completion: "0.000002" }, supported_parameters: ["tools"] },
+    { id: "free/model:free", created: 1, pricing: { prompt: "0", completion: "0" }, supported_parameters: ["tools"] },
+    { id: "text-embedding-fixture" },
+  ] };
+  await withModelList(list, async (fixture) => {
+    const result = await listModels(fixture, { provider: "openrouter" });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.listed, 2);
+    assert.equal(result.added, 2);
+    assert.equal(result.omitted, 0);
+    assert.equal(result.limit, 200);
+    assert.deepEqual(result.models?.map((model) => model.slug), ["anthropic/claude-sonnet-4.6", "free/model:free", "paid/model"]);
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0]!.url, "/api/v1/models");
+    assert.equal(fixture.requests[0]!.headers.authorization, `Bearer ${API_KEY}`);
+  });
+});
 async function listModels(fixture: Fixture, body: object): Promise<ModelListBody> {
   const response = await fetch(`${fixture.base}/api/ui/provider-models`, { method: "POST", headers: { "Content-Type": "application/json", Origin: fixture.base }, body: JSON.stringify(body) });
   assert.equal(response.status, 200);

@@ -36,6 +36,11 @@ function dashboardActions(initialReport: DesktopSyncReport | null) {
     showToast: (message: string, type = "success") => toasts.push({ message, type }),
     fetchStatus: () => {},
     confirm: () => true,
+    isProviderSwitching: false,
+    isProviderConfigSaving: false,
+    providerConfigDirty: false,
+    selectedProvider: "codex",
+    currentActiveProvider: "codex",
     fetch: async (url: string) => {
       calls.push(url);
       return { json: async () => ({ ok: true, desktopSessionSync: report }) };

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { BridgeError } from "../bridge/bridge.js";
 import { recordLog } from "../telemetry/logger.js";
 import { ApiModelSchema, requireApiKey, type ApiModel, type ApiProtocol, type ApiProvider, type ApiProviderConfig } from "./config.js";
+import { USAGE_PRIORITY } from "./usage-priority.js";
 
 const MAX_ATTEMPTS = 3;
 const MAX_PAGES = 10;
@@ -27,6 +28,10 @@ const ModelListPage = z.object({
     name: z.string().nullish(),
     context_length: z.number().int().positive().nullish(),
     max_input_tokens: z.number().int().positive().nullish(),
+    created: z.number().nullish(),
+    pricing: z.object({ prompt: z.string().nullish(), completion: z.string().nullish() }).nullish(),
+    supported_parameters: z.array(z.string()).nullish(),
+    architecture: z.object({ output_modalities: z.array(z.string()).nullish() }).nullish(),
   })),
   has_more: z.boolean().nullish(),
   last_id: z.string().nullish(),
@@ -45,15 +50,52 @@ export function modelsUrlFor(endpoint: string, protocol: ApiProtocol): URL {
   return url;
 }
 
-/** Keeps chat-capable entries that pass the catalog schema; each rejected id is reported, never dropped silently. */
-export function toDiscoveredModels(entries: readonly ModelListEntry[], protocol: ApiProtocol): { readonly models: ApiModel[]; readonly skipped: string[] } {
+/** OpenRouter marks free variants with a ":free" suffix or zero prompt and completion prices. */
+function isFree(entry: ModelListEntry): boolean {
+  if (entry.id.endsWith(":free")) return true;
+  return entry.pricing?.prompt === "0" && entry.pricing?.completion === "0";
+}
+
+/** Claude Code sends tools on every turn, so a model without tool support cannot serve it. */
+function supportsTools(entry: ModelListEntry): boolean {
+  return entry.supported_parameters?.includes("tools") === true;
+}
+
+/** Models that emit audio or images cannot answer a chat request. Missing metadata counts as text. */
+function emitsTextOnly(entry: ModelListEntry): boolean {
+  return (entry.architecture?.output_modalities ?? ["text"]).every((modality) => modality === "text");
+}
+
+/** Tool-capable models in the usage list first (most used first), then tool-capable free, tool-capable paid, then the rest. */
+function priorityTier(entry: ModelListEntry, usage: ReadonlyMap<string, number>): number {
+  if (supportsTools(entry) && usage.has(entry.id)) return 0;
+  if (supportsTools(entry)) return isFree(entry) ? 1 : 2;
+  return isFree(entry) ? 3 : 4;
+}
+
+/** Usage tier sorts by usage rank; other tiers put the newest model first. Providers that omit timestamps sort last. */
+function comparePriority(usage: ReadonlyMap<string, number>): (left: ModelListEntry, right: ModelListEntry) => number {
+  return (left, right) => {
+    const tier = priorityTier(left, usage) - priorityTier(right, usage);
+    if (tier !== 0) return tier;
+    if (priorityTier(left, usage) === 0) return (usage.get(left.id) ?? 0) - (usage.get(right.id) ?? 0);
+    return (right.created ?? 0) - (left.created ?? 0);
+  };
+}
+
+/**
+ * Keeps chat-capable entries in priority order that pass the catalog schema; each rejected id is reported, never dropped silently.
+ * `usageOrder` lists model ids most used first; ids the provider does not list are ignored.
+ */
+export function toDiscoveredModels(entries: readonly ModelListEntry[], protocol: ApiProtocol, usageOrder: readonly string[]): { readonly models: ApiModel[]; readonly skipped: string[] } {
+  const usage = new Map(usageOrder.map((id, rank) => [id, rank] as const));
   const seen = new Set<string>();
   const models: ApiModel[] = [];
   const skipped: string[] = [];
-  for (const entry of entries) {
+  for (const entry of [...entries].sort(comparePriority(usage))) {
     if (seen.has(entry.id)) continue;
     seen.add(entry.id);
-    if (NON_CHAT_MODEL.test(entry.id)) continue;
+    if (NON_CHAT_MODEL.test(entry.id) || !emitsTextOnly(entry)) continue;
     const parsed = ApiModelSchema.safeParse({
       slug: entry.id,
       displayName: entry.display_name ?? entry.name ?? entry.id,
@@ -65,6 +107,16 @@ export function toDiscoveredModels(entries: readonly ModelListEntry[], protocol:
     else skipped.push(entry.id);
   }
   return { models, skipped };
+}
+
+export type CatalogMerge = { readonly models: ApiModel[]; readonly added: number; readonly omitted: number };
+
+/** Keeps every existing entry, then fills free slots from the ranked list in order. Omitted models are counted, not hidden. */
+export function mergeDiscoveredModels(existing: readonly ApiModel[], discovered: readonly ApiModel[], limit: number): CatalogMerge {
+  const known = new Set(existing.map((model) => model.slug));
+  const fresh = discovered.filter((model) => !known.has(model.slug));
+  const added = fresh.slice(0, Math.max(0, limit - existing.length));
+  return { models: [...existing, ...added], added: added.length, omitted: fresh.length - added.length };
 }
 
 function authHeaders(protocol: ApiProtocol, apiKey: string): Readonly<Record<string, string>> {
@@ -131,7 +183,7 @@ export async function discoverApiModels(provider: ApiProvider, config: ApiProvid
     const page = await fetchPage(pageUrl, headers, provider, signal);
     entries.push(...page.data);
     if (page.has_more !== true) {
-      const { models, skipped } = toDiscoveredModels(entries, defaultModel.protocol);
+      const { models, skipped } = toDiscoveredModels(entries, defaultModel.protocol, USAGE_PRIORITY[provider] ?? []);
       if (skipped.length > 0) {
         recordLog({ level: "warn", operation: "provider_models_skipped", message: "Skipped provider models that do not fit the catalog schema", details: { provider, count: skipped.length } });
       }
