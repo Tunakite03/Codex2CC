@@ -39,9 +39,15 @@ export function resolveDesktopSessionPaths(env: NodeJS.ProcessEnv = process.env,
     : platformName === "win32"
       ? env.APPDATA || join(home, "AppData", "Roaming")
       : env.XDG_CONFIG_HOME || join(home, ".config");
+  const gatewayData = platformName === "win32"
+    ? env.LOCALAPPDATA || join(home, "AppData", "Local")
+    : appData;
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR?.trim() || join(home, ".claude");
+  const thirdPartyDir = platformName === "win32" && !existsSync(join(gatewayData, "Claude-3p", "claude-code-sessions")) && existsSync(join(appData, "Claude-3p", "claude-code-sessions"))
+    ? join(appData, "Claude-3p")
+    : join(gatewayData, "Claude-3p");
   return {
-    profiles: { claude: join(appData, "Claude"), thirdParty: join(appData, "Claude-3p") },
+    profiles: { claude: join(appData, "Claude"), thirdParty: thirdPartyDir },
     projectsDir: join(claudeConfigDir, "projects"),
     manifestDir: join(resolveDataDir(env), "logs", "desktop-session-sync"),
     selectedScopes: {

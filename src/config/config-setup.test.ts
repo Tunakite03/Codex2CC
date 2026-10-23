@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { BridgeError } from "../bridge/bridge.js";
@@ -9,6 +9,7 @@ import {
   CODEX2CC_DESKTOP_CONFIG_ID,
   configuredGatewayToken,
   refreshDesktopModelLabels,
+  resolveDefaultPaths,
   resetConfig,
   setupConfig,
   validateGatewayUrl,
@@ -34,6 +35,37 @@ function createSandbox(): { sandboxDir: string; paths: ResolvedSetupPaths; clean
   };
 }
 
+test("Windows Desktop setup writes the gateway library to LocalAppData instead of Roaming", () => {
+  const { sandboxDir, cleanup } = createSandbox();
+  const previousAppData = process.env.APPDATA;
+  const previousLocalAppData = process.env.LOCALAPPDATA;
+  const roaming = join(sandboxDir, "Roaming");
+  const local = join(sandboxDir, "Local");
+  process.env.APPDATA = roaming;
+  process.env.LOCALAPPDATA = local;
+  try {
+    const paths = resolveDefaultPaths("win32");
+    const result = setupConfig("desktop", {
+      gatewayUrl: "http://127.0.0.1:3456",
+      token: "secure-token-1234567890123456",
+      paths,
+    });
+    const library = join(local, "Claude-3p", "configLibrary");
+    assert.equal(paths.claudeDesktopDir, library);
+    assert.ok(result.filesModified.includes(join(library, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`)));
+    const meta = JSON.parse(readFileSync(join(library, "_meta.json"), "utf8")) as { appliedId: string };
+    assert.equal(meta.appliedId, CODEX2CC_DESKTOP_CONFIG_ID);
+    assert.ok(paths.claudeDeveloperSettingsPaths.includes(join(roaming, "Claude", "developer_settings.json")));
+    assert.ok(paths.claudeDeveloperSettingsPaths.includes(join(local, "Claude-3p", "developer_settings.json")));
+  } finally {
+    if (previousAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = previousAppData;
+    if (previousLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousLocalAppData;
+    cleanup();
+  }
+});
+
 test("validateGatewayUrl accepts http and https and strips trailing slashes", () => {
   assert.equal(validateGatewayUrl("http://127.0.0.1:3456/"), "http://127.0.0.1:3456");
   assert.equal(validateGatewayUrl("https://my-gateway.internal/api/"), "https://my-gateway.internal/api");
@@ -45,6 +77,40 @@ test("validateGatewayUrl accepts http and https and strips trailing slashes", ()
     () => validateGatewayUrl("not-a-valid-url"),
     (err: unknown) => err instanceof BridgeError && err.code === "invalid_gateway_url",
   );
+});
+
+test("macOS Desktop setup paths stay under Application Support", () => {
+  const paths = resolveDefaultPaths("darwin");
+  const appSupport = join(homedir(), "Library", "Application Support");
+  assert.equal(paths.claudeDesktopDir, join(appSupport, "Claude-3p", "configLibrary"));
+  assert.deepEqual(paths.claudeDeveloperSettingsPaths, [
+    join(appSupport, "Claude", "developer_settings.json"),
+    join(appSupport, "Claude-3p", "developer_settings.json"),
+  ]);
+});
+
+test("Desktop setup reactivates gateway mode after reset and preserves profile preferences", () => {
+  const { sandboxDir, paths, cleanup } = createSandbox();
+  try {
+    const profileDir = join(sandboxDir, "Claude-3p");
+    const profileConfig = join(profileDir, "claude_desktop_config.json");
+    mkdirSync(profileDir, { recursive: true });
+    writeFileSync(profileConfig, JSON.stringify({ deploymentMode: "1p", preferences: { locale: "vi" } }));
+    const options = { gatewayUrl: "http://127.0.0.1:3456", token: "secure-token-1234567890123456", paths };
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      const setup = setupConfig("desktop", options);
+      assert.deepEqual(JSON.parse(readFileSync(profileConfig, "utf8")), {
+        deploymentMode: "3p", preferences: { locale: "vi" },
+      });
+      assert.ok(setup.filesModified.includes(profileConfig));
+      resetConfig("desktop", paths);
+      assert.deepEqual(JSON.parse(readFileSync(profileConfig, "utf8")), {
+        deploymentMode: "1p", preferences: { locale: "vi" },
+      });
+    }
+  } finally {
+    cleanup();
+  }
 });
 
 test("validateToken generates fresh tokens when empty and enforces length", () => {
@@ -262,6 +328,43 @@ test("resetConfig cleanly strips gateway settings from CLI and Desktop without c
       metaAfter.entries.some((e: { id: string }) => e.id === CODEX2CC_DESKTOP_CONFIG_ID),
       false,
     );
+  } finally {
+    cleanup();
+  }
+});
+
+test("Desktop reset restores account mode while preserving profile preferences", () => {
+  const { sandboxDir, paths, cleanup } = createSandbox();
+  try {
+    setupConfig("desktop", { gatewayUrl: "http://127.0.0.1:3456", token: "secure-token-1234567890123456", paths });
+    const profileConfig = join(sandboxDir, "Claude-3p", "claude_desktop_config.json");
+    writeFileSync(profileConfig, JSON.stringify({ deploymentMode: "3p", preferences: { locale: "vi" } }));
+
+    const result = resetConfig("desktop", paths);
+    assert.deepEqual(JSON.parse(readFileSync(profileConfig, "utf8")), {
+      deploymentMode: "1p",
+      preferences: { locale: "vi" },
+    });
+    assert.ok(result.filesModified.includes(profileConfig));
+    assert.deepEqual(resetConfig("desktop", paths).filesModified, [join(paths.claudeDesktopDir, "_meta.json")]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("Desktop reset keeps another gateway's active deployment mode", () => {
+  const { sandboxDir, paths, cleanup } = createSandbox();
+  try {
+    setupConfig("desktop", { gatewayUrl: "http://127.0.0.1:3456", token: "secure-token-1234567890123456", paths });
+    const profileConfig = join(sandboxDir, "Claude-3p", "claude_desktop_config.json");
+    writeFileSync(profileConfig, JSON.stringify({ deploymentMode: "3p" }));
+    writeFileSync(join(paths.claudeDesktopDir, "_meta.json"), JSON.stringify({
+      appliedId: "another-gateway",
+      entries: [{ id: CODEX2CC_DESKTOP_CONFIG_ID, name: "Codex2CC" }, { id: "another-gateway", name: "Other" }],
+    }));
+
+    resetConfig("desktop", paths);
+    assert.deepEqual(JSON.parse(readFileSync(profileConfig, "utf8")), { deploymentMode: "3p" });
   } finally {
     cleanup();
   }
