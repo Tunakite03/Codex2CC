@@ -286,48 +286,55 @@ export function unsupportedToolNames(request: MessageRequest): string[] {
   return (request.tools ?? []).filter((tool) => tool.input_schema === undefined).map((tool) => tool.name);
 }
 
-const CHARS_PER_TOKEN = 4;
 const IMAGE_TOKEN_ESTIMATE = 1_500;
+// Approximate framing allowances, not model-specific tokenizer constants.
+const ITEM_TOKEN_OVERHEAD = 4;
+const TOOL_TOKEN_OVERHEAD = 8;
 
-function blockWeight(block: { type: string }): { chars: number; images: number } {
-  if (isTextBlock(block)) return { chars: block.text.length, images: 0 };
-  if (isImageBlock(block)) return { chars: 0, images: 1 };
-  if (!isKnownBlock(block)) return { chars: JSON.stringify(block).length, images: 0 };
-  if (block.type === "tool_use") return { chars: block.name.length + JSON.stringify(block.input).length, images: 0 };
-  if (block.type === "tool_result") {
-    if (block.content === undefined) return { chars: 0, images: 0 };
-    if (typeof block.content === "string") return { chars: block.content.length, images: 0 };
-    return block.content.reduce((total, inner) => {
-      const weight = blockWeight(inner);
-      return { chars: total.chars + weight.chars, images: total.images + weight.images };
-    }, { chars: 0, images: 0 });
+/** Local heuristic only; neither a tokenizer count nor an upper bound on model usage. */
+export function estimateTextTokens(text: string): number {
+  let tokens = 0;
+  for (const character of text) {
+    tokens += character.charCodeAt(0) < 128 ? 0.25 : Buffer.byteLength(character, "utf8") / 2;
   }
-  if (block.type === "thinking") return { chars: (block.thinking ?? "").length, images: 0 };
-  return { chars: 0, images: 0 };
+  return Math.ceil(tokens);
+}
+
+function estimateContentTokens(content: string | readonly (InputText | InputImage | OutputText | Refusal)[]): number {
+  if (typeof content === "string") return estimateTextTokens(content);
+  return content.reduce((total, block) => {
+    if (block.type === "input_image") return total + IMAGE_TOKEN_ESTIMATE;
+    return total + estimateTextTokens(block.type === "refusal" ? block.refusal : block.text);
+  }, 0);
 }
 
 /**
- * Heuristic input size (about 4 characters per token, a fixed cost per image). The Responses API has
- * no token-counting endpoint, so this only has to be good enough for Claude Code's context accounting.
+ * Estimates the converted Codex payload, excluding transport fields and encoded image bytes.
+ * Image cost and framing remain heuristic; encrypted reasoning's hidden token cost is unknown.
+ * Count only its visible summary rather than treating ciphertext as prompt text.
  */
-export function estimateInputTokens(request: MessageRequest): number {
-  let chars = typeof request.system === "string" ? request.system.length : (request.system ?? []).reduce((sum, block) => sum + block.text.length, 0);
-  let images = 0;
+export function estimateCodexInputTokens(request: OpenAIRequest): number {
+  let tokens = request.instructions === undefined ? 0 : ITEM_TOKEN_OVERHEAD + estimateTextTokens(request.instructions);
   for (const tool of request.tools ?? []) {
-    chars += tool.name.length + tool.description.length + JSON.stringify(tool.input_schema ?? {}).length;
+    tokens += TOOL_TOKEN_OVERHEAD + estimateTextTokens(tool.name) + estimateTextTokens(tool.description)
+      + estimateTextTokens(JSON.stringify(tool.parameters));
   }
-  for (const message of request.messages) {
-    if (typeof message.content === "string") {
-      chars += message.content.length;
-      continue;
-    }
-    for (const block of message.content) {
-      const weight = blockWeight(block);
-      chars += weight.chars;
-      images += weight.images;
+  for (const item of request.input) {
+    tokens += ITEM_TOKEN_OVERHEAD;
+    if ("role" in item) {
+      tokens += estimateContentTokens(item.content);
+    } else if (item.type === "function_call") {
+      tokens += estimateTextTokens(item.call_id) + estimateTextTokens(item.name) + estimateTextTokens(item.arguments);
+    } else if (item.type === "function_call_output") {
+      tokens += estimateTextTokens(item.call_id) + estimateContentTokens(item.output);
+    } else {
+      tokens += item.summary.reduce((total, part) => total + estimateTextTokens(part.text), 0);
     }
   }
-  return Math.ceil(chars / CHARS_PER_TOKEN) + images * IMAGE_TOKEN_ESTIMATE;
+  if (typeof request.tool_choice === "object") {
+    tokens += ITEM_TOKEN_OVERHEAD + estimateTextTokens(request.tool_choice.name);
+  }
+  return tokens;
 }
 
 export type OpenAIUsage = { input_tokens?: number; output_tokens?: number; input_tokens_details?: { cached_tokens?: number } };
@@ -366,6 +373,8 @@ export type OpenAIEvent = {
     arguments?: string;
     summary?: Array<{ type?: string; text?: string }>;
     encrypted_content?: string;
+    /** Opaque provider-scoped reasoning state supplied by another protocol adapter. */
+    signature?: string;
   };
   delta?: string;
   arguments?: string;
@@ -489,12 +498,12 @@ export class AnthropicStream {
 
   /** Ends the reasoning item; its encrypted content becomes the signature Claude Code sends back. */
   private reasoningDone(item: OpenAIEvent["item"]): void {
-    const signature = item?.encrypted_content ? encodeReasoningSignature(this.model, item.encrypted_content) : undefined;
+    const signature = item?.signature ?? (item?.encrypted_content ? encodeReasoningSignature(this.model, item.encrypted_content) : undefined);
     if (this.thinkingBlock !== undefined) {
       this.closeThinking(signature);
       return;
     }
-    if (signature === undefined) return;
+    if (!signature) return;
     this.start();
     this.closeText();
     const index = this.nextBlock++;
@@ -652,8 +661,8 @@ export class MessageAccumulator {
     } else if (event.type === "response.output_text.done" || event.type === "response.refusal.done") {
       this.flushText();
     } else if (event.type === "response.output_item.done" && event.item?.type === "reasoning") {
-      if (event.item.encrypted_content) {
-        const signature = encodeReasoningSignature(this.model, event.item.encrypted_content);
+      if (event.item.signature !== undefined || event.item.encrypted_content) {
+        const signature = event.item.signature ?? (event.item.encrypted_content ? encodeReasoningSignature(this.model, event.item.encrypted_content) : "");
         const thinking = summaryText(event.item);
         this.flushText();
         this.content.push(thinking.length > 0 ? { type: "thinking", thinking, signature } : { type: "redacted_thinking", data: signature });
@@ -731,27 +740,34 @@ export async function readSse(body: ReadableStream<Uint8Array>, accept: (event: 
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  for (;;) {
-    const chunk = await reader.read();
-    if (chunk.done) break;
-    buffer += decoder.decode(chunk.value, { stream: true });
+  try {
     for (;;) {
-      const match = /\r?\n\r?\n/.exec(buffer);
-      if (!match) break;
-      const frame = buffer.slice(0, match.index);
-      buffer = buffer.slice(match.index + match[0].length);
-      const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
-      if (data && data !== "[DONE]") {
-        try {
-          const parsed = z.object({ type: z.string() }).loose().safeParse(JSON.parse(data));
-          if (!parsed.success) throw new BridgeError(502, "invalid_upstream_event", "OpenAI sent an invalid SSE event.");
-          accept(parsed.data as OpenAIEvent);
-        } catch (error) {
-          if (error instanceof SyntaxError) throw new BridgeError(502, "invalid_upstream_json", "OpenAI sent malformed SSE JSON.");
-          throw error;
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      for (;;) {
+        const match = /\r?\n\r?\n/.exec(buffer);
+        if (!match) break;
+        const frame = buffer.slice(0, match.index);
+        buffer = buffer.slice(match.index + match[0].length);
+        const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+        if (data && data !== "[DONE]") {
+          try {
+            const parsed = z.object({ type: z.string() }).loose().safeParse(JSON.parse(data));
+            if (!parsed.success) throw new BridgeError(502, "invalid_upstream_event", "OpenAI sent an invalid SSE event.");
+            accept(parsed.data as OpenAIEvent);
+          } catch (error) {
+            if (error instanceof SyntaxError) throw new BridgeError(502, "invalid_upstream_json", "OpenAI sent malformed SSE JSON.");
+            throw error;
+          }
         }
       }
     }
+    if (buffer.trim()) throw new BridgeError(502, "truncated_upstream_event", "OpenAI SSE stream ended inside an event.");
+  } catch (error) {
+    await reader.cancel();
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
-  if (buffer.trim()) throw new BridgeError(502, "truncated_upstream_event", "OpenAI SSE stream ended inside an event.");
 }

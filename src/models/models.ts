@@ -1,4 +1,11 @@
-export type ProviderType = "codex" | "antigravity";
+export const PROVIDERS = ["codex", "antigravity", "openrouter", "openai", "opencode"] as const;
+export type ProviderType = typeof PROVIDERS[number];
+export const PROVIDER_LABELS: Readonly<Record<ProviderType, string>> = {
+  codex: "ChatGPT", antigravity: "Google Antigravity", openrouter: "OpenRouter", openai: "OpenAI API", opencode: "OpenCode",
+};
+export function isProviderType(value: string): value is ProviderType {
+  return PROVIDERS.some((provider) => provider === value);
+}
 
 export type Tier = "fable" | "opus" | "sonnet" | "haiku";
 export type TierModels = Readonly<Record<Tier, string>>;
