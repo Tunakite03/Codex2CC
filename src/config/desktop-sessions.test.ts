@@ -391,6 +391,26 @@ test("an ambiguous scope reaches setup/reset callers as a failed sync, not a cra
   }
 });
 
+test("an ambiguous scope error lists each scope's session count and last activity", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    writeSession(scopeDir(paths.profiles.claude, "acct", "org"), "c1", "cli-c1", 1_000);
+    writeTranscript(paths, "cli-c1");
+    const active = scopeDir(paths.profiles.thirdParty, "a", "org");
+    writeSession(active, "a1", "cli-a1", Date.parse("2026-10-05T12:11:00.000Z"));
+    writeSession(active, "a2", "cli-a2", Date.parse("2026-10-23T17:59:42.000Z"));
+    scopeDir(paths.profiles.thirdParty, "b", "org");
+    assert.throws(
+      () => planDesktopSessionSync(TO_GATEWAY_PROFILE, paths),
+      (error: unknown) => error instanceof BridgeError && error.code === "ambiguous_desktop_scope"
+        && error.message.includes("a/org (2 session(s), last active 2026-10-23 17:59 UTC)")
+        && error.message.includes("b/org (no sessions)"),
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test("desktopSyncReport tells clients when history was left hidden", () => {
   assert.deepEqual(desktopSyncReport({ status: "skipped", desktop: "running" }).level, "warning");
   assert.deepEqual(desktopSyncReport({ status: "failed", error: "boom", entries: [], manifestPath: undefined }), { status: "failed", level: "error", messages: ["boom"] });
