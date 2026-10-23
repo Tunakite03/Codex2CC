@@ -39,6 +39,7 @@ function dashboardActions(initialReport: DesktopSyncReport | null) {
     isProviderSwitching: false,
     isProviderConfigSaving: false,
     providerConfigDirty: false,
+    hasUnsavedTierChanges: () => false,
     selectedProvider: "codex",
     currentActiveProvider: "codex",
     fetch: async (url: string) => {

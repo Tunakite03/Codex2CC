@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import test from 'node:test';
+import { runInNewContext } from 'node:vm';
 import { CODEX2CC_DESKTOP_CONFIG_ID, resolveDefaultPaths, setupConfig } from '../config/config-setup.js';
 import { createGatewayServer, listenOnLoopback, type GatewayOptions } from '../gateway/gateway.js';
 import { BridgeError } from '../bridge/bridge.js';
@@ -609,6 +610,46 @@ test('switching provider updates tier mapping and saves per-provider independent
      }
 });
 
+test('a staged provider mapping is listed, saved and reset without switching the active provider', async () => {
+     const directory = mkdtempSync(join(tmpdir(), 'codex2cc-staged-tiers-'));
+     const tierStore = TierModelStore.open(join(directory, 'settings.json'), {});
+     const options: GatewayOptions = { ...mockOptions, tierStore };
+     const statusMappings = () => (getStatus(options, 3456) as unknown as StatusResponse & { tierMapping: { providers: Record<string, StatusResponse['tierMapping']> } }).tierMapping.providers;
+     const post = async (path: string, body: object) => {
+          const output = createMockResponse();
+          await handleUiRoute(options, createMockRequest('POST', path, body), output.response, path, 3456);
+          return output.getOutput();
+     };
+
+     try {
+          const initial = statusMappings();
+          assert.deepEqual(initial.codex!.current, DEFAULT_TIER_MODELS);
+          assert.deepEqual(initial.antigravity!.current, ANTIGRAVITY_TIER_MODELS);
+          assert.ok(initial.antigravity!.models.some((model) => model.slug === ANTIGRAVITY_TIER_MODELS.opus));
+
+          const staged = { ...ANTIGRAVITY_TIER_MODELS, haiku: ANTIGRAVITY_TIER_MODELS.sonnet };
+          const saved = await post('/api/ui/tiers', { provider: 'antigravity', tiers: staged });
+          assert.equal(saved.statusCode, 200, saved.body);
+          assert.equal(JSON.parse(saved.body).desktopLabelsUpdated, false, 'Desktop labels follow the active provider only');
+          assert.equal(tierStore.getProvider(), 'codex');
+          assert.equal(tierStore.isCustom('codex'), false);
+          assert.deepEqual(statusMappings().antigravity!.current, staged);
+          assert.equal(statusMappings().antigravity!.custom, true);
+
+          const rejected = await post('/api/ui/tiers', { provider: 'antigravity', tiers: DEFAULT_TIER_MODELS });
+          assert.equal(rejected.statusCode, 400, 'models are validated against the staged provider catalog');
+          const unknown = await post('/api/ui/tiers', { provider: 'nope', tiers: DEFAULT_TIER_MODELS });
+          assert.equal(unknown.statusCode, 400);
+
+          const reset = await post('/api/ui/tiers/reset', { provider: 'antigravity' });
+          assert.equal(reset.statusCode, 200, reset.body);
+          assert.equal(tierStore.isCustom('antigravity'), false);
+          assert.equal(tierStore.getProvider(), 'codex');
+     } finally {
+          rmSync(directory, { recursive: true, force: true });
+     }
+});
+
 test('unified settings.json persists provider, effort, and per-provider model mappings together', async () => {
      const directory = mkdtempSync(join(tmpdir(), 'codex2cc-unified-settings-'));
      const filePath = join(directory, 'settings.json');
@@ -993,4 +1034,24 @@ test("API setup uses its catalog and does not carry another provider's model ove
      } finally {
           rmSync(directory, { recursive: true, force: true });
      }
+});
+
+test('sidebar pill reports whether Claude clients route through the gateway, not just that it runs', () => {
+     const script = renderDashboardHtml().match(/<script>([\s\S]*?)<\/script>/i)?.[1];
+     assert.ok(script);
+     const from = script.indexOf('    function gatewayBadgeState(');
+     const to = script.indexOf('    function renderGatewayBadge(', from);
+     assert.ok(from >= 0 && to > from);
+     const badge = runInNewContext(script.slice(from, to) + 'gatewayBadgeState;', {}) as (status: object) => { tone: string; text: string; title: string };
+     const client = (configured: boolean, inSync: boolean) => ({ configured, inSync });
+
+     const official = badge({ cli: client(false, false), desktop: client(false, false) });
+     assert.equal(official.tone, 'idle');
+     assert.match(official.text, /official Claude/);
+     assert.equal(badge({ cli: client(true, true), desktop: client(true, true) }).text, 'Via gateway · CLI + Desktop');
+     const partial = badge({ cli: client(true, true), desktop: client(true, false) });
+     assert.equal(partial.tone, 'warn');
+     assert.match(partial.title, /Desktop config is out of sync/);
+     assert.equal(badge({ cli: client(true, false), desktop: client(false, false) }).text, 'Gateway out of sync');
+     assert.ok(!renderDashboardHtml().includes('Server running'));
 });

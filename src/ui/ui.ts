@@ -17,7 +17,7 @@ import {
   type SetupTarget,
 } from "../config/config-setup.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
-import { ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, PROVIDERS, PROVIDER_LABELS, isProviderType, routedModels, smallestContextWindow, type ProviderType } from "../models/models.js";
+import { ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, PROVIDERS, PROVIDER_LABELS, isProviderType, routedModels, smallestContextWindow, type ProviderType, type TierModels } from "../models/models.js";
 import { API_PROVIDERS, MODEL_CATALOG_LIMIT, apiProviderTiers, hasApiKey, isApiProvider, parseApiProviderConfig } from "../providers/config.js";
 import { currentProvider, getProviderConfig, providerDefaultModel, providerModels } from "../providers/runtime.js";
 import { discoverApiModels, mergeDiscoveredModels } from "../providers/discovery.js";
@@ -109,6 +109,34 @@ function parseSetupTarget(value: unknown): SetupTarget {
   throw new BridgeError(400, "invalid_target", "Setup target must be one of: cli, desktop, all.");
 }
 
+type ProviderTierMapping = {
+  readonly current: TierModels;
+  readonly defaults: TierModels;
+  readonly custom: boolean;
+  readonly models: ReadonlyArray<{ readonly slug: string; readonly displayName: string }>;
+};
+
+/** The tier mapping, its defaults and the selectable models of one provider, whether or not it is active. */
+function providerTierMapping(options: GatewayOptions, provider: ProviderType): ProviderTierMapping {
+  const apiConfig = isApiProvider(provider) ? getProviderConfig(options, provider) : undefined;
+  return {
+    current: activeTierModels({ ...options, provider }),
+    defaults: options.tierStore?.defaults(provider)
+      ?? (apiConfig ? apiProviderTiers(apiConfig) : provider === "antigravity" ? ANTIGRAVITY_TIER_MODELS : (options.tiers ?? DEFAULT_TIER_MODELS)),
+    custom: options.tierStore?.isCustom(provider) ?? false,
+    models: providerModels(options, provider).map(({ slug, displayName }) => ({ slug, displayName })),
+  };
+}
+
+/** Tier routes edit the provider named in the body, so a staged provider can be mapped before it is activated. */
+function tierRouteProvider(body: Record<string, unknown>, options: GatewayOptions): ProviderType {
+  if (body.provider === undefined) return currentProvider(options);
+  if (typeof body.provider !== "string" || !isProviderType(body.provider)) {
+    throw new BridgeError(400, "invalid_provider", `Provider must be one of: ${PROVIDERS.join(", ")}.`);
+  }
+  return body.provider;
+}
+
 export function getStatus(options: GatewayOptions, port: number, pathsInput?: SetupPaths): Record<string, unknown> {
   const paths = resolvePaths(pathsInput);
   const gatewayUrl = `http://127.0.0.1:${port}`;
@@ -116,9 +144,6 @@ export function getStatus(options: GatewayOptions, port: number, pathsInput?: Se
   const currentTiers = activeTierModels(options);
   const activeProvider = currentProvider(options);
   const apiConfig = isApiProvider(activeProvider) ? getProviderConfig(options, activeProvider) : undefined;
-  const activeModels = providerModels(options, activeProvider);
-  const defaults = options.tierStore?.defaults(activeProvider)
-    ?? (apiConfig ? apiProviderTiers(apiConfig) : activeProvider === "antigravity" ? ANTIGRAVITY_TIER_MODELS : (options.tiers ?? DEFAULT_TIER_MODELS));
   // A stored config only works when it points at this gateway and carries its current token.
   const inSync = (baseUrl: string, storedToken: string): boolean =>
     baseUrl.replace(/\/+$/, "") === gatewayUrl && (options.policy.mode === "open" || storedToken === token);
@@ -211,11 +236,9 @@ export function getStatus(options: GatewayOptions, port: number, pathsInput?: Se
       deploymentMode: desktopDeploymentMode ?? null,
     },
     tierMapping: {
-      current: currentTiers,
-      defaults,
-      custom: options.tierStore?.isCustom(activeProvider) ?? false,
-      models: activeModels.map(({ slug, displayName }) => ({ slug, displayName })),
+      ...providerTierMapping(options, activeProvider),
       effort: options.tierStore?.getEffort() ?? "",
+      providers: Object.fromEntries(PROVIDERS.map((provider) => [provider, providerTierMapping(options, provider)])),
     },
   };
 }
@@ -530,7 +553,7 @@ export async function handleUiRoute(
     try {
       const body = await readJsonBody(request);
       const tiers = parseTierModels(body.tiers);
-      const provider = currentProvider(options);
+      const provider = tierRouteProvider(body, options);
       const modelCatalog = providerModels(options, provider);
       const availableModels = new Set(modelCatalog.map((model) => model.slug));
       const unavailable = Object.entries(tiers).find(([, model]) => !availableModels.has(model));
@@ -555,7 +578,8 @@ export async function handleUiRoute(
         message: `Saved Claude tier to ${PROVIDER_LABELS[provider]} model mapping`,
         details: { provider, fable: tiers.fable, opus: tiers.opus, sonnet: tiers.sonnet, haiku: tiers.haiku },
       });
-      const desktopLabelsUpdated = refreshDesktopLabels(options);
+      // Desktop labels show the active mapping, so a staged provider's mapping leaves them alone.
+      const desktopLabelsUpdated = provider === currentProvider(options) && refreshDesktopLabels(options);
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ ok: true, tiers: store.current(provider), custom: store.isCustom(provider), effort: store.getEffort() ?? "", desktopLabelsUpdated }));
     } catch (error) {
@@ -581,14 +605,14 @@ export async function handleUiRoute(
       return true;
     }
     try {
-      const provider = currentProvider(options);
+      const provider = tierRouteProvider(await readJsonBody(request), options);
       store.reset(provider);
       recordLog({
         level: "info",
         operation: "tier_mapping_reset",
         message: `Reset Claude tier mapping to ${PROVIDER_LABELS[provider]} environment or built-in defaults`,
       });
-      const desktopLabelsUpdated = refreshDesktopLabels(options);
+      const desktopLabelsUpdated = provider === currentProvider(options) && refreshDesktopLabels(options);
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ ok: true, tiers: store.current(provider), custom: store.isCustom(provider), desktopLabelsUpdated }));
     } catch (error) {
@@ -870,9 +894,12 @@ export function renderDashboardHtml(): string {
       width: 0.5rem;
       height: 0.5rem;
       border-radius: 50%;
-      background: var(--teal);
+      background: var(--ink-faint);
       border: 1.5px solid var(--line);
     }
+    .status-badge[data-tone="routed"] .pulse-dot { background: var(--primary); }
+    .status-badge[data-tone="warn"] .pulse-dot { background: var(--yellow); }
+    .status-badge[data-tone="error"] .pulse-dot { background: var(--destructive); }
     /* Provider Switcher Dropdown */
     .provider-bar {
       display: flex;
@@ -2240,8 +2267,8 @@ export function renderDashboardHtml(): string {
 
 
     <div class="sidebar-footer">
-      <div class="status-badge" id="gateway-badge">
-        <span class="pulse-dot"></span>
+      <div class="status-badge" id="gateway-badge" role="status">
+        <span class="pulse-dot" aria-hidden="true"></span>
         <span id="gateway-status-text">Checking gateway...</span>
       </div>
     </div>
@@ -2870,15 +2897,35 @@ export function renderDashboardHtml(): string {
       }
     }
 
+    /* The sidebar pill says whether Claude traffic goes through this gateway, not merely that the gateway process is up. */
+    function gatewayBadgeState(s) {
+      const routed = [s.cli.configured && s.cli.inSync ? "CLI" : null, s.desktop.configured && s.desktop.inSync ? "Desktop" : null].filter(Boolean);
+      const stale = [s.cli.configured && !s.cli.inSync ? "CLI" : null, s.desktop.configured && !s.desktop.inSync ? "Desktop" : null].filter(Boolean);
+      const staleNote = stale.length > 0 ? " " + stale.join(" and ") + " config is out of sync; click Apply configuration." : "";
+      if (routed.length > 0) {
+        return { tone: stale.length > 0 ? "warn" : "routed", text: "Via gateway · " + routed.join(" + "), title: "Claude " + routed.join(" and ") + " send requests through this gateway." + staleNote };
+      }
+      if (stale.length > 0) {
+        return { tone: "warn", text: "Gateway out of sync", title: "Gateway is running, but no Claude client uses its current settings." + staleNote };
+      }
+      return { tone: "idle", text: "Gateway idle · official Claude", title: "Gateway is running, but Claude Code and Claude Desktop use their own Claude account. Apply configuration to route them here." };
+    }
+
+    function renderGatewayBadge(state) {
+      const badge = document.getElementById("gateway-badge");
+      badge.dataset.tone = state.tone;
+      badge.title = state.title;
+      document.getElementById("gateway-status-text").textContent = state.text;
+    }
+
     async function fetchStatus() {
       try {
         const res = await fetch("/api/ui/status");
         if (!res.ok) throw new Error("HTTP " + res.status);
         currentStatus = await res.json();
         renderStatus(currentStatus);
-        document.getElementById("gateway-status-text").textContent = "Server running";
       } catch (err) {
-        document.getElementById("gateway-status-text").textContent = "Gateway Unavailable";
+        renderGatewayBadge({ tone: "error", text: "Gateway unavailable", title: "The control panel cannot reach the gateway." });
         showToast("Failed to fetch gateway status: " + err.message, "error");
       }
     }
@@ -3179,9 +3226,13 @@ export function renderDashboardHtml(): string {
         if (!confirm("Discard unsaved API provider settings?")) return;
         providerConfigDirty = false;
       }
+      if (target !== selectedProvider && hasUnsavedTierChanges()) {
+        if (!confirm("Discard unsaved model routing edits?")) return;
+      }
       selectedProvider = target;
       closeProviderDropdown();
       updateProviderControls();
+      renderSelectedTierMapping();
     }
 
     const pTrigger = document.getElementById("provider-select-trigger");
@@ -3260,10 +3311,6 @@ export function renderDashboardHtml(): string {
           selectedProvider = selectedProvider === previousActiveProvider ? currentActiveProvider : selectedProvider;
         }
         updateProviderControls(s.provider.available);
-        const descElem = document.getElementById("tier-mapping-desc");
-        if (descElem) {
-          descElem.textContent = "Map each Claude tier to a " + providerLabels[currentActiveProvider] + " model. Changes apply immediately upon saving.";
-        }
       }
 
       function applyBadge(badge, client) {
@@ -3280,10 +3327,11 @@ export function renderDashboardHtml(): string {
       }
       applyBadge(document.getElementById("badge-cli"), s.cli);
       applyBadge(document.getElementById("badge-desktop"), s.desktop);
+      renderGatewayBadge(gatewayBadgeState(s));
 
       document.getElementById("input-url").value = s.gateway.url;
       document.getElementById("input-token").value = s.gateway.token;
-      renderTierMapping(s.tierMapping);
+      renderSelectedTierMapping();
 
       updateRunCommand();
     }
@@ -3317,9 +3365,16 @@ export function renderDashboardHtml(): string {
     document.getElementById("btn-provider-antigravity")?.addEventListener("click", () => selectProvider("antigravity"));
     ${API_PROVIDERS.map((provider) => `document.getElementById("btn-provider-${provider}")?.addEventListener("click", () => selectProvider("${provider}"));`).join("\n    ")}
 
+    /* The model routing card edits the provider chosen in the dropdown, which may still be staged. */
+    function selectedTierMapping() {
+      const mapping = currentStatus?.tierMapping;
+      if (!mapping) return null;
+      return { ...mapping.providers[selectedProvider], effort: mapping.effort };
+    }
+
     /* True when the model map holds selections that differ from the mapping saved on the server. */
     function hasUnsavedTierChanges() {
-      const saved = currentStatus?.tierMapping;
+      const saved = selectedTierMapping();
       if (!saved) return false;
       const tiersChanged = ["fable", "opus", "sonnet", "haiku"].some((tier) => document.getElementById("tier-" + tier).value !== saved.current[tier]);
       return tiersChanged || document.getElementById("select-effort").value !== (saved.effort || "");
@@ -3460,6 +3515,13 @@ export function renderDashboardHtml(): string {
 
     for (const select of document.querySelectorAll("select[data-model-picker]")) mountModelCombobox(select);
 
+    function renderSelectedTierMapping() {
+      const mapping = selectedTierMapping();
+      if (!mapping) return;
+      document.getElementById("tier-mapping-desc").textContent = "Map each Claude tier to a " + providerLabels[selectedProvider] + " model. Changes apply immediately upon saving.";
+      renderTierMapping(mapping);
+    }
+
     function renderTierMapping(mapping) {
       const tiers = ["fable", "opus", "sonnet", "haiku"];
       const models = Array.isArray(mapping.models) ? mapping.models : [];
@@ -3552,9 +3614,9 @@ export function renderDashboardHtml(): string {
       btnApply.disabled = true;
       try {
         if (providerConfigDirty && !confirm("Unsaved API provider settings will not be applied. Apply anyway?")) return;
+        if (hasUnsavedTierChanges() && !confirm("Unsaved model routing edits will not be applied. Apply anyway?")) return;
         // Client setup is built from the gateway's active provider, so activate the selected one first.
         if (selectedProvider !== currentActiveProvider) {
-          if (hasUnsavedTierChanges() && !confirm("You have unsaved model routing edits for the current provider. Switch anyway?")) return;
           isProviderSwitching = true;
           updateProviderControls();
           try {
@@ -3586,15 +3648,16 @@ export function renderDashboardHtml(): string {
         document.getElementById("tier-" + tier).value,
       ]));
       const effort = document.getElementById("select-effort")?.value || "";
+      const provider = selectedProvider;
       try {
         const res = await fetch("/api/ui/tiers", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ tiers, effort }),
+          body: JSON.stringify({ provider, tiers, effort }),
         });
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
-        showToast("Settings and model mapping saved.");
+        showToast("Settings and " + providerLabels[provider] + " model mapping saved.");
         await fetchStatus();
       } catch (err) {
         showToast("Failed to save settings: " + err.message, "error");
@@ -3602,9 +3665,14 @@ export function renderDashboardHtml(): string {
     });
 
     document.getElementById("btn-reset-tier-mapping").addEventListener("click", async () => {
-      if (!confirm("Reset the tier mapping to environment or built-in defaults?")) return;
+      const provider = selectedProvider;
+      if (!confirm("Reset the " + providerLabels[provider] + " tier mapping to environment or built-in defaults?")) return;
       try {
-        const res = await fetch("/api/ui/tiers/reset", { method: "POST" });
+        const res = await fetch("/api/ui/tiers/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider }),
+        });
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
         showToast("Tier mapping reset to defaults.");
