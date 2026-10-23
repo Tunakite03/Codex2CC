@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { syncBuiltinESMExports } from "node:module";
@@ -14,10 +14,14 @@ import {
   desktopProcessState,
   desktopSyncReport,
   DRY_RUN_TENSE,
+  planAddMissingSessionSync,
   planAllAccountsSessionSync,
   planDesktopSessionSync,
+  planMirrorNewestSessionSync,
+  syncPlanWhenClosed,
   requireDesktopClosed,
   resolveDesktopSessionPaths,
+  summarizePlans,
   runAllAccountsSessionSync,
   runDesktopSessionSync,
   syncAllAccountsWhenClosed,
@@ -202,7 +206,7 @@ test("session sync can still target a legacy-only gateway scope", () => {
   }
 });
 
-test("plan copies only missing sessions with a transcript into the explicitly selected destination scope", () => {
+test("plan copies only missing sessions with a transcript into every destination scope, or only the selected one", () => {
   const { paths, cleanup } = createSandbox();
   try {
     const claudeA = scopeDir(paths.profiles.claude, "acct-a", "org-1");
@@ -224,13 +228,17 @@ test("plan copies only missing sessions with a transcript into the explicitly se
     writeFileSync(join(activeScope, "deleted_bbbb-3"), "1791955599380");
     for (const id of ["cli-1", "cli-2", "cli-3", "cli-4", "cli-shared"]) writeTranscript(paths, id);
 
-    assert.throws(
-      () => planDesktopSessionSync(TO_GATEWAY_PROFILE, paths),
-      (error: unknown) => error instanceof BridgeError && error.code === "ambiguous_desktop_scope"
-        && /CODEX2CC_GATEWAY_SESSION_SCOPE/.test(error.message) && /gw\/org-new/.test(error.message) && /gw\/org-old/.test(error.message),
-      "two destination scopes are never resolved by guessing",
-    );
-    const [plan] = planDesktopSessionSync(TO_GATEWAY_PROFILE, { ...paths, selectedScopes: { thirdParty: "gw/org-new" } });
+    const unselected = planDesktopSessionSync(TO_GATEWAY_PROFILE, paths);
+    assert.deepEqual(unselected.map((plan) => plan.destinationScopeId).sort(), ["gw/org-new", "gw/org-old"], "two destination scopes each get a plan, none is guessed");
+    const intoOld = unselected.find((plan) => plan.destinationScopeId === "gw/org-old")!;
+    const intoNew = unselected.find((plan) => plan.destinationScopeId === "gw/org-new")!;
+    assert.deepEqual(intoOld.copies.map((copy) => copy.sessionId).sort(), ["local_aaaa-1", "local_aaaa-2", "local_bbbb-3", "local_bbbb-4", "local_bbbb-6"]);
+    assert.ok(intoOld.copies.every((copy) => copy.destination.startsWith(oldScope)));
+    assert.deepEqual(intoNew.copies.map((copy) => copy.sessionId).sort(), ["local_aaaa-1", "local_bbbb-4"]);
+    assert.equal(unselected.reduce((sum, plan) => sum + plan.skipped.invalid, 0), 1, "an unreadable source entry is counted once");
+
+    const [plan, ...others] = planDesktopSessionSync(TO_GATEWAY_PROFILE, { ...paths, selectedScopes: { thirdParty: "gw/org-new" } });
+    assert.deepEqual(others, []);
     assert.ok(plan);
     assert.equal(plan.destinationScope, activeScope);
     assert.deepEqual(plan.copies.map((copy) => copy.sessionId).sort(), ["local_aaaa-1", "local_bbbb-4"]);
@@ -385,39 +393,24 @@ test("a scope selection must name an existing account/org and cannot escape the 
   }
 });
 
-test("an ambiguous scope reaches setup/reset callers as a failed sync, not a crash", () => {
+test("reset copies gateway sessions into every claude.ai account/org when no scope is selected", () => {
   const { paths, cleanup } = createSandbox();
   try {
-    writeSession(scopeDir(paths.profiles.claude, "acct", "org"), "c1", "cli-c1", 1_000);
-    writeTranscript(paths, "cli-c1");
-    scopeDir(paths.profiles.thirdParty, "a", "org");
-    scopeDir(paths.profiles.thirdParty, "b", "org");
-    const report = desktopSyncReport(syncDesktopSessionsWhenClosed(TO_GATEWAY_PROFILE, paths, "not_running", NOW));
-    assert.equal(report.status, "failed");
-    assert.equal(report.level, "error");
-    assert.match(report.headline, /CODEX2CC_GATEWAY_SESSION_SCOPE/);
-    assert.deepEqual(report.messages, [], "the error is the headline, not repeated as a detail");
-    assert.equal(existsSync(paths.manifestDir), false, "nothing was written");
-  } finally {
-    cleanup();
-  }
-});
+    writeSession(scopeDir(paths.profiles.thirdParty, "gw", "org"), "g1", "cli-g1", 1_000);
+    writeTranscript(paths, "cli-g1");
+    const accountA = scopeDir(paths.profiles.claude, "acct-a", "org-1");
+    const accountB = scopeDir(paths.profiles.claude, "acct-b", "org-1");
+    const accountBOther = scopeDir(paths.profiles.claude, "acct-b", "org-2");
+    writeSession(accountB, "g1", "cli-g1", 500);
 
-test("an ambiguous scope error lists each scope's session count and last activity", () => {
-  const { paths, cleanup } = createSandbox();
-  try {
-    writeSession(scopeDir(paths.profiles.claude, "acct", "org"), "c1", "cli-c1", 1_000);
-    writeTranscript(paths, "cli-c1");
-    const active = scopeDir(paths.profiles.thirdParty, "a", "org");
-    writeSession(active, "a1", "cli-a1", Date.parse("2026-10-05T12:11:00.000Z"));
-    writeSession(active, "a2", "cli-a2", Date.parse("2026-10-23T17:59:42.000Z"));
-    scopeDir(paths.profiles.thirdParty, "b", "org");
-    assert.throws(
-      () => planDesktopSessionSync(TO_GATEWAY_PROFILE, paths),
-      (error: unknown) => error instanceof BridgeError && error.code === "ambiguous_desktop_scope"
-        && error.message.includes("a/org (2 session(s), last active 2026-10-23 17:59 UTC)")
-        && error.message.includes("b/org (no sessions)"),
-    );
+    const outcome = syncDesktopSessionsWhenClosed(TO_CLAUDE_PROFILE, paths, "not_running", NOW);
+    assert.equal(outcome.status, "applied");
+    assert.deepEqual(sessionFiles(accountA), ["local_g1.json"]);
+    assert.deepEqual(sessionFiles(accountBOther), ["local_g1.json"]);
+    assert.deepEqual(sessionFiles(accountB), ["local_g1.json"], "an entry Desktop already has is left alone");
+    assert.equal(desktopSyncReport(outcome).level, "success");
+    const routes = describeOutcome(outcome).filter((line) => line.startsWith("Claude-3p (gateway) -> Claude (claude.ai) ["));
+    assert.equal(routes.length, 3, "each account/org gets its own labelled line");
   } finally {
     cleanup();
   }
@@ -442,52 +435,85 @@ function setActivity(file: string, lastActivityAt: number, title: string): void 
   writeFileSync(file, JSON.stringify({ ...data, lastActivityAt, title }));
 }
 
-test("a copy codex2cc made is refreshed when its original has newer activity, and only then", () => {
+test("a session present in both profiles takes the version from the profile that updated it last", () => {
   const { paths, cleanup } = createSandbox();
   try {
     const claude = scopeDir(paths.profiles.claude, "acct", "org");
     const gateway = scopeDir(paths.profiles.thirdParty, "gw", "org-gw");
-    const newerOriginal = writeSession(claude, "c1", "cli-c1", 1_000);
-    const continuedInCopy = writeSession(claude, "c2", "cli-c2", 1_000);
-    const deletedCopy = writeSession(claude, "c3", "cli-c3", 1_000);
+    const continuedInClaude = writeSession(claude, "c1", "cli-c1", 1_000);
+    const continuedInGateway = writeSession(claude, "c2", "cli-c2", 1_000);
+    const deletedInGateway = writeSession(claude, "c3", "cli-c3", 1_000);
     writeSession(gateway, "g1", "cli-g1", 500);
     for (const id of ["cli-c1", "cli-c2", "cli-c3", "cli-g1"]) writeTranscript(paths, id);
     applyDesktopSessionSync(planDesktopSessionSync(TO_GATEWAY_PROFILE, paths), paths.manifestDir, NOW);
 
-    // Desktop's own entry with the same id as a newer original must never be replaced.
-    const desktopsOwn = writeSession(claude, "c4", "cli-c4", 9_000);
+    // An entry Desktop created in both profiles is refreshed too: the newest version wins, not the oldest file.
+    const newestClaudeEntry = writeSession(claude, "c4", "cli-c4", 9_000);
     writeTranscript(paths, "cli-c4");
     writeSession(gateway, "c4", "cli-c4", 100);
+    // Equal contents never trade places, even when only file times tell them apart.
+    for (const [dir, seconds] of [[claude, 1_000], [gateway, 2_000]] as const) {
+      const file = join(dir, "local_c5.json");
+      writeFileSync(file, JSON.stringify({ sessionId: "local_c5", cliSessionId: "cli-c5" }));
+      utimesSync(file, seconds, seconds);
+    }
+    writeTranscript(paths, "cli-c5");
 
-    setActivity(newerOriginal, 5_000, "continued in claude.ai");
+    setActivity(continuedInClaude, 5_000, "continued in claude.ai");
     setActivity(join(gateway, "local_c2.json"), 6_000, "continued through the gateway");
-    setActivity(continuedInCopy, 4_000, "older claude.ai activity");
+    setActivity(continuedInGateway, 4_000, "older claude.ai activity");
     rmSync(join(gateway, "local_c3.json"));
     writeFileSync(join(gateway, "deleted_c3"), "1");
-    setActivity(deletedCopy, 7_000, "newer but deleted in the gateway profile");
+    setActivity(deletedInGateway, 7_000, "newer but deleted in the gateway profile");
 
-    const [plan] = planDesktopSessionSync(TO_GATEWAY_PROFILE, paths);
-    assert.deepEqual(plan?.refreshes, [{ sessionId: "local_c1", source: newerOriginal, destination: join(gateway, "local_c1.json") }]);
-    assert.deepEqual(plan?.copies, []);
-    assert.match(describePlans([plan!], DRY_RUN_TENSE)[0] ?? "", /would refresh 1 earlier cop\(ies\)/);
+    const [toGateway, toClaude, ...others] = planDesktopSessionSync(BOTH_PROFILES, paths);
+    assert.deepEqual(others, []);
+    assert.deepEqual([...(toGateway?.refreshes ?? [])].sort((a, b) => a.sessionId.localeCompare(b.sessionId)), [
+      { sessionId: "local_c1", source: continuedInClaude, destination: join(gateway, "local_c1.json") },
+      { sessionId: "local_c4", source: newestClaudeEntry, destination: join(gateway, "local_c4.json") },
+    ]);
+    assert.deepEqual(toClaude?.refreshes, [{ sessionId: "local_c2", source: join(gateway, "local_c2.json"), destination: continuedInGateway }]);
+    assert.deepEqual(toGateway?.copies, []);
+    assert.deepEqual(toClaude?.copies.map((copy) => copy.sessionId), ["local_g1"]);
+    assert.match(describePlans([toGateway!], DRY_RUN_TENSE)[0] ?? "", /would refresh 2 older session\(s\)/);
 
     const beforeRefresh = readFileSync(join(gateway, "local_c1.json"), "utf8");
-    const applied = applyDesktopSessionSync([plan!], paths.manifestDir, new Date(NOW.getTime() + 1_000));
-    assert.deepEqual(applied.entries.map((entry) => entry.action), ["refreshed"]);
-    const [refreshed] = applied.entries;
-    assert.ok(refreshed?.backupPath, "every refresh records a backup of what it replaced");
-    assert.equal(readFileSync(refreshed.backupPath, "utf8"), beforeRefresh);
-    assert.equal((JSON.parse(readFileSync(`${refreshed.backupPath}.json`, "utf8")) as { destination: string }).destination, join(gateway, "local_c1.json"));
+    const olderC2 = readFileSync(continuedInGateway, "utf8");
+    const applied = applyDesktopSessionSync([toGateway!, toClaude!], paths.manifestDir, new Date(NOW.getTime() + 1_000));
+    assert.deepEqual(applied.entries.map((entry) => entry.action).sort(), ["added", "refreshed", "refreshed", "refreshed"]);
+    const refreshed = applied.entries.find((entry) => entry.sessionId === "local_c1");
+    const refreshedC2 = applied.entries.find((entry) => entry.sessionId === "local_c2");
+    assert.ok(applied.entries.every((entry) => (entry.action === "refreshed") === (entry.backupPath !== undefined)), "every refresh records a backup of what it replaced");
+    assert.equal(readFileSync(refreshed!.backupPath!, "utf8"), beforeRefresh);
+    assert.equal(readFileSync(refreshedC2!.backupPath!, "utf8"), olderC2);
+    assert.equal((JSON.parse(readFileSync(`${refreshed!.backupPath!}.json`, "utf8")) as { destination: string }).destination, join(gateway, "local_c1.json"));
     const manifest = JSON.parse(readFileSync(applied.manifestPath!, "utf8")) as { entries: Array<{ backupPath?: string }> };
-    assert.equal(manifest.entries[0]?.backupPath, refreshed.backupPath);
-    assert.equal(readFileSync(join(gateway, "local_c1.json"), "utf8"), readFileSync(newerOriginal, "utf8"));
-    assert.match(readFileSync(join(gateway, "local_c2.json"), "utf8"), /continued through the gateway/);
-    assert.match(readFileSync(join(gateway, "local_c4.json"), "utf8"), /"lastActivityAt":100/);
+    assert.deepEqual(manifest.entries.map((entry) => entry.backupPath), applied.entries.map((entry) => entry.backupPath));
+    assert.equal(readFileSync(join(gateway, "local_c1.json"), "utf8"), readFileSync(continuedInClaude, "utf8"));
+    assert.equal(readFileSync(continuedInGateway, "utf8"), readFileSync(join(gateway, "local_c2.json"), "utf8"));
+    assert.match(readFileSync(continuedInGateway, "utf8"), /continued through the gateway/);
+    assert.equal(readFileSync(join(gateway, "local_c4.json"), "utf8"), readFileSync(newestClaudeEntry, "utf8"));
     assert.equal(existsSync(join(gateway, "local_c3.json")), false);
-    assert.ok(readdirSync(gateway).every((name) => !name.endsWith(".tmp")), "no temporary file left behind");
-    assert.equal(readFileSync(desktopsOwn, "utf8").includes("9000"), true);
+    assert.ok([...readdirSync(gateway), ...readdirSync(claude)].every((name) => !name.endsWith(".tmp")), "no temporary file left behind");
 
-    assert.deepEqual(planDesktopSessionSync(TO_GATEWAY_PROFILE, paths)[0]?.refreshes, [], "a refreshed copy is current until the original changes again");
+    const again = planDesktopSessionSync(BOTH_PROFILES, paths);
+    assert.deepEqual(again.flatMap((plan) => plan.refreshes), [], "both profiles hold the newest version until one changes again");
+  } finally {
+    cleanup();
+  }
+});
+
+test("when several source accounts hold a session, the most recently active one is copied", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    const older = scopeDir(paths.profiles.claude, "acct-a", "org-1");
+    const newer = scopeDir(paths.profiles.claude, "acct-b", "org-1");
+    const gateway = scopeDir(paths.profiles.thirdParty, "gw", "org-gw");
+    writeSession(older, "s1", "cli-s1", 1_000);
+    const newest = writeSession(newer, "s1", "cli-s1", 2_000);
+    writeTranscript(paths, "cli-s1");
+    const [plan] = planDesktopSessionSync(TO_GATEWAY_PROFILE, paths);
+    assert.deepEqual(plan?.copies, [{ sessionId: "local_s1", source: newest, destination: join(gateway, "local_s1.json") }]);
   } finally {
     cleanup();
   }
@@ -537,10 +563,9 @@ test("runDesktopSessionSync turns sync failures into an outcome that lists what 
     assert.match(lines[1] ?? "", new RegExp(`added ${join(gateway, "local_c1.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 
     restoreWrites();
-    writeFileSync(join(paths.manifestDir, "broken.json"), "{");
-    const badManifest = runDesktopSessionSync(TO_GATEWAY_PROFILE, paths, NOW);
-    assert.deepEqual(badManifest.status, "failed");
-    assert.match(describeOutcome(badManifest)[0] ?? "", /broken\.json is not valid JSON/);
+    const badScope = runDesktopSessionSync(TO_GATEWAY_PROFILE, { ...paths, selectedScopes: { thirdParty: "gw/missing" } }, NOW);
+    assert.deepEqual(badScope.status, "failed");
+    assert.match(describeOutcome(badScope)[0] ?? "", /CODEX2CC_GATEWAY_SESSION_SCOPE names an unknown scope/);
   } finally {
     cleanup();
   }
@@ -615,11 +640,12 @@ test("Windows process detection fails closed on errors, timeouts, or unexpected 
   assert.equal(desktopProcessState("win32", () => { throw new Error("query failed"); }), "unknown");
 });
 
-test("macOS process detection preserves pgrep exit semantics", () => {
+test("macOS process detection matches Desktop even when it is an ancestor, and preserves pgrep exit semantics", () => {
   for (const [status, expected] of [[0, "running"], [1, "not_running"], [2, "unknown"], [null, "unknown"]] as const) {
     assert.equal(desktopProcessState("darwin", (command, args) => {
       assert.equal(command, "pgrep");
-      assert.deepEqual(args, ["-x", "Claude"]);
+      // Without -a, BSD pgrep never reports Desktop to a codex2cc started from its Code tab.
+      assert.deepEqual(args, ["-a", "-x", "Claude"]);
       return { status };
     }), expected);
   }
@@ -698,7 +724,7 @@ test("the all-accounts sync gives every scope of both profiles every session, ig
   }
 });
 
-test("the all-accounts sync refreshes its earlier copies from the newest original and never touches files while Desktop is open", () => {
+test("the all-accounts sync refreshes older entries from the newest version and never touches files while Desktop is open", () => {
   const { paths, cleanup } = createSandbox();
   try {
     const personal = scopeDir(paths.profiles.claude, "acct-a", "org-1");
@@ -730,6 +756,86 @@ test("the all-accounts sync reports a profile without a session list instead of 
     const plans = planAllAccountsSessionSync(paths);
     assert.deepEqual(plans.map((plan) => [plan.to, plan.blocked]), [["claude", undefined], ["thirdParty", "no_destination_scope"]]);
     assert.equal(desktopSyncReport(runAllAccountsSessionSync(paths, NOW)).level, "warning");
+  } finally {
+    cleanup();
+  }
+});
+
+test("the add-only sync copies what a list lacks and never replaces an older entry", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    const claude = scopeDir(paths.profiles.claude, "acct", "org");
+    const gateway = scopeDir(paths.profiles.thirdParty, "gw", "org-gw");
+    writeSession(claude, "shared", "cli-shared", 5_000);
+    const olderCopy = writeSession(gateway, "shared", "cli-shared", 1_000);
+    writeSession(gateway, "g1", "cli-g1", 2_000);
+    for (const id of ["cli-shared", "cli-g1"]) writeTranscript(paths, id);
+    assert.equal(planAllAccountsSessionSync(paths).flatMap((plan) => plan.refreshes).length, 1, "the pooled sync would refresh it");
+
+    const plans = planAddMissingSessionSync(paths);
+    assert.deepEqual(plans.flatMap((plan) => plan.refreshes), []);
+    assert.deepEqual(plans.flatMap((plan) => plan.copies.map((copy) => copy.sessionId)), ["local_g1"]);
+    const outcome = syncPlanWhenClosed(() => planAddMissingSessionSync(paths), paths.manifestDir, "not_running", NOW);
+    assert.equal(outcome.status, "applied");
+    assert.deepEqual(sessionFiles(claude), ["local_g1.json", "local_shared.json"]);
+    assert.match(readFileSync(olderCopy, "utf8"), /"lastActivityAt":1000/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("the mirror sync makes every list a copy of the most recently active one, backing up what it replaces or removes", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    const newest = scopeDir(paths.profiles.thirdParty, "gw", "org-gw");
+    const claude = scopeDir(paths.profiles.claude, "acct-a", "org-1");
+    const other = scopeDir(paths.profiles.claude, "acct-b", "org-2");
+    const kept = writeSession(newest, "n1", "cli-n1", 9_000);
+    writeSession(newest, "shared", "cli-shared", 1_000);
+    writeSession(newest, "gone", "cli-gone", 1_000);
+    const newerElsewhere = writeSession(claude, "shared", "cli-shared", 8_000);
+    const onlyInClaude = writeSession(claude, "c1", "cli-c1", 7_000);
+    writeSession(claude, "same-transcript", "cli-n1", 1_000);
+    writeFileSync(join(other, "deleted_gone"), "1");
+    for (const id of ["cli-n1", "cli-shared", "cli-gone", "cli-c1"]) writeTranscript(paths, id);
+
+    const plans = planMirrorNewestSessionSync(paths);
+    assert.deepEqual(plans.map((plan) => [plan.from, plan.sourceScopeId, plan.to, plan.destinationScopeId]), [
+      ["thirdParty", "gw/org-gw", "claude", "acct-a/org-1"],
+      ["thirdParty", "gw/org-gw", "claude", "acct-b/org-2"],
+    ], "the newest list itself gets no plan");
+    const [intoClaude, intoOther] = plans;
+    assert.deepEqual(intoClaude!.copies.map((copy) => copy.sessionId), ["local_gone"]);
+    assert.deepEqual(intoClaude!.refreshes, [{ sessionId: "local_shared", source: join(newest, "local_shared.json"), destination: newerElsewhere }], "the newest list wins even over a newer entry");
+    assert.deepEqual(intoClaude!.removals, [{ sessionId: "local_c1", destination: onlyInClaude }], "an entry sharing a transcript with the newest list is kept");
+    assert.deepEqual(intoOther!.copies.map((copy) => copy.sessionId).sort(), ["local_n1", "local_shared"]);
+    assert.equal(intoOther!.skipped.deletedInDestination, 1, "a tombstone still blocks re-adding a deleted session");
+    assert.match(describePlans(plans, DRY_RUN_TENSE)[0]!, /^Claude-3p \(gateway\) \[gw\/org\] -> Claude \(claude\.ai\) \[acct\/org\]: would copy 1 session\(s\), would refresh 1 older session\(s\), would remove 1 session\(s\)/);
+    assert.equal(summarizePlans(plans, DRY_RUN_TENSE), "Would copy 3 session(s), would refresh 1 and would remove 1 across 2 account(s).");
+
+    const removedBefore = readFileSync(onlyInClaude, "utf8");
+    const outcome = syncPlanWhenClosed(() => planMirrorNewestSessionSync(paths), paths.manifestDir, "not_running", NOW);
+    assert.equal(outcome.status, "applied");
+    const removed = outcome.status === "applied" ? outcome.sync.entries.find((entry) => entry.action === "removed") : undefined;
+    assert.ok(removed);
+    assert.equal(existsSync(onlyInClaude), false);
+    assert.equal(readFileSync(removed.backupPath, "utf8"), removedBefore);
+    assert.equal((JSON.parse(readFileSync(`${removed.backupPath}.json`, "utf8")) as { destination: string }).destination, onlyInClaude);
+    assert.ok(existsSync(join(paths.projectsDir, "-work", "cli-c1.jsonl")), "its transcript is untouched");
+    assert.deepEqual(sessionFiles(claude), ["local_gone.json", "local_same-transcript.json", "local_shared.json"]);
+    assert.equal(readFileSync(newerElsewhere, "utf8"), readFileSync(join(newest, "local_shared.json"), "utf8"));
+    assert.equal(readFileSync(kept, "utf8").includes("9000"), true);
+    assert.equal(planMirrorNewestSessionSync(paths).reduce((sum, plan) => sum + plan.copies.length + plan.refreshes.length + plan.removals.length, 0), 0, "a second mirror changes nothing");
+  } finally {
+    cleanup();
+  }
+});
+
+test("the mirror sync reports when no list has a session", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    scopeDir(paths.profiles.claude, "acct", "org");
+    assert.deepEqual(planMirrorNewestSessionSync(paths).map((plan) => [plan.to, plan.blocked]), [["claude", "no_source_sessions"], ["thirdParty", "no_source_sessions"]]);
   } finally {
     cleanup();
   }

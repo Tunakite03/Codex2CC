@@ -74,6 +74,20 @@ test("tool choices map none, auto and required without inventing tools", () => {
   }
 });
 
+test("OpenRouter requests omit default tool parameters that require_parameters would route on", () => {
+  const openrouter: ChatStreamScope = { provider: "openrouter", model: "nvidia/nemotron-test:free" };
+  const defaults = toChatCompletionsRequest(MessageRequest.parse({ ...basic(), tools: [tool] }), openrouter.model, "openrouter", undefined, openrouter);
+  assert.deepEqual(defaults.provider, { require_parameters: true });
+  assert.equal("parallel_tool_calls" in defaults, false);
+  assert.equal("tool_choice" in defaults, false);
+  const auto = toChatCompletionsRequest(MessageRequest.parse({ ...basic(), tools: [tool], tool_choice: { type: "auto" } }), openrouter.model, "openrouter", undefined, openrouter);
+  assert.equal("tool_choice" in auto, false);
+  assert.equal("parallel_tool_calls" in auto, false);
+  const explicit = toChatCompletionsRequest(MessageRequest.parse({ ...basic(), tools: [tool], tool_choice: { type: "any", disable_parallel_tool_use: true } }), openrouter.model, "openrouter", undefined, openrouter);
+  assert.equal(explicit.tool_choice, "required");
+  assert.equal(explicit.parallel_tool_calls, false);
+});
+
 test("reasoning policies normalize effort, respect precedence and omit fields for none", () => {
   const request = MessageRequest.parse({ ...basic(), output_config: { effort: "max" }, reasoning_effort: "low" });
   assert.equal(toChatCompletionsRequest(request, scope.model, "openai", "medium", scope).reasoning_effort, "high");

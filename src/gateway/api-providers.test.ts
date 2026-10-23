@@ -176,6 +176,114 @@ test("provider temporary failures retry a bounded number of times before reading
   });
 });
 
+const OVERLOAD = sse([{ error: { code: 502, message: "Upstream error from Nvidia: ResourceExhausted: Worker local total request limit reached (16/16)" } }]);
+const PARTIAL = sse([{ choices: [{ index: 0, delta: { content: "discarded attempt" }, finish_reason: null }] }]);
+
+test("OpenRouter retries stream overloads before output and resets buffered attempts", async () => {
+  for (const stream of [false, true]) {
+    await withProvider("openrouter", "chat-completions", (_request, response, attempt) => {
+      response.writeHead(200, { "Content-Type": "text/event-stream" }).end(attempt < 3 ? (stream ? "" : PARTIAL) + OVERLOAD : CHAT);
+    }, async (fixture) => {
+      const response = await post(fixture, { ...REQUEST, stream });
+      const body = await response.text();
+      assert.equal(response.status, 200, body);
+      assert.equal(fixture.requests.length, 3);
+      assert.ok(fixture.requests.every((request) => request.body === fixture.requests[0]!.body));
+      assert.doesNotMatch(body, /discarded attempt|event: error/);
+      assert.equal(body.match(/Hello API/g)?.length, 1);
+      if (stream) {
+        assert.equal(body.match(/event: message_start/g)?.length, 1);
+        assert.equal(body.match(/event: message_stop/g)?.length, 1);
+      } else {
+        assert.deepEqual(JSON.parse(body).content, [{ type: "text", text: "Hello API" }]);
+      }
+      assert.ok(getLogs({}).some((entry) => entry.operation === "provider_stream_retry" && entry.details?.attempt === 2));
+    });
+  }
+});
+
+test("OpenRouter stream overload retries stop after three attempts with the terminal error", async () => {
+  for (const stream of [false, true]) {
+    await withProvider("openrouter", "chat-completions", reply(OVERLOAD), async (fixture) => {
+      const response = await post(fixture, { ...REQUEST, stream });
+      assert.equal(response.status, 502);
+      assert.match(response.headers.get("content-type")!, /application\/json/);
+      assert.match(await response.text(), /ResourceExhausted/);
+      assert.equal(fixture.requests.length, 3);
+    });
+  }
+});
+
+test("OpenRouter does not retry overloads after client text or keep-alive output", async () => {
+  await withProvider("openrouter", "chat-completions", reply(PARTIAL + OVERLOAD), async (fixture) => {
+    const response = await post(fixture, { ...REQUEST, stream: true });
+    const body = await response.text();
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(body.match(/discarded attempt/g)?.length, 1);
+    assert.match(body, /event: error/);
+    assert.doesNotMatch(body, /event: message_stop/);
+  });
+  let finish: (() => void) | undefined;
+  await withProvider("openrouter", "chat-completions", (_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.flushHeaders();
+    finish = () => response.end(OVERLOAD);
+  }, async (fixture) => {
+    const response = await post(fixture, { ...REQUEST, stream: true });
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    let body = new TextDecoder().decode(first.value);
+    assert.match(body, /event: ping/);
+    finish!();
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      body += new TextDecoder().decode(chunk.value);
+    }
+    assert.match(body, /event: error/);
+    assert.equal(body.match(/event: message_start/g)?.length, 1);
+    assert.doesNotMatch(body, /event: message_stop/);
+    assert.equal(fixture.requests.length, 1);
+  });
+});
+
+test("stream retries exclude other providers, quota, authentication and unrelated failures", async () => {
+  for (const [provider, body, status] of [
+    ["custom", OVERLOAD, 502],
+    ["openrouter", sse([{ error: { code: 429, message: "ResourceExhausted: quota exhausted" } }]), 429],
+    ["openrouter", sse([{ error: { code: 401, message: "invalid API key" } }]), 401],
+    ["openrouter", sse([{ error: { code: 502, message: "unrelated failure" } }]), 502],
+  ] as const) {
+    await withProvider(provider, "chat-completions", reply(body), async (fixture) => {
+      const response = await post(fixture);
+      assert.equal(response.status, status);
+      await response.text();
+      assert.equal(fixture.requests.length, 1);
+    });
+  }
+});
+
+test("client cancellation during OpenRouter overload backoff prevents another attempt", async () => {
+  await withProvider("openrouter", "chat-completions", reply(OVERLOAD), async (fixture) => {
+    const lastId = Math.max(0, ...getLogs({}).map((entry) => entry.id));
+    const controller = new AbortController();
+    const pending = fetch(`${fixture.base}/v1/messages`, {
+      method: "POST", headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify(REQUEST), signal: controller.signal,
+    });
+    const rejected = assert.rejects(pending, { name: "AbortError" });
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (getLogs({ sinceId: lastId }).some((entry) => entry.operation === "provider_stream_retry")) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 2));
+    }
+    assert.ok(getLogs({ sinceId: lastId }).some((entry) => entry.operation === "provider_stream_retry"));
+    controller.abort();
+    await rejected;
+    await new Promise<void>((resolve) => setTimeout(resolve, 400));
+    assert.equal(fixture.requests.length, 1);
+  });
+});
+
 test("redirects do not forward API credentials to another endpoint", async () => {
   await withProvider("openai", "responses", (_request, response) => response.writeHead(307, { Location: "/credential-sink" }).end(), async (fixture) => {
     assert.equal((await post(fixture)).status, 502);

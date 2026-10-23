@@ -239,11 +239,13 @@ export function toChatCompletionsRequest(request: MessageRequest, model: string,
     result.tool_choice = { type: "function", function: { name: choice.name } };
   } else if (choice !== undefined) {
     if (choice === "required" && !result.tools?.length) invalidRequest("invalid_tool_choice", "Required tool choice needs at least one function tool.");
-    result.tool_choice = choice;
+    // "auto" is the default; under require_parameters OpenRouter drops every endpoint that cannot honour an explicit tool_choice.
+    if (!(scope.provider === "openrouter" && choice === "auto")) result.tool_choice = choice;
   }
   // DeepSeek rejects forced tool selection while thinking is enabled.
   if (scope.provider === "deepseek" && (source.thinking?.type === "disabled" || choice === "required" || typeof choice === "object")) result.thinking = { type: "disabled" };
-  if (converted.parallel_tool_calls !== undefined) result.parallel_tool_calls = converted.parallel_tool_calls;
+  // Parallel calls are the default; only an explicit opt-out is a parameter OpenRouter endpoints must support.
+  if (converted.parallel_tool_calls !== undefined && !(scope.provider === "openrouter" && converted.parallel_tool_calls)) result.parallel_tool_calls = converted.parallel_tool_calls;
   const effort = source.output_config?.effort ?? source.reasoning_effort ?? defaultEffort;
   if (reasoning === "openai" && effort !== undefined) result.reasoning_effort = effort === "max" || effort === "xhigh" ? "high" : effort;
   if (reasoning === "openrouter") result.reasoning = source.thinking?.type === "disabled"

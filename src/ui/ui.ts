@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
+import { z } from "zod";
 import { BridgeError } from "../bridge/bridge.js";
 import {
   CODEX2CC_DESKTOP_CONFIG_ID,
@@ -24,19 +25,23 @@ import { discoverApiModels, mergeDiscoveredModels } from "../providers/discovery
 import { probeApiProvider } from "../providers/probe.js";
 import { isAntigravityAvailable } from "../bridge/antigravity.js";
 import {
+  describeMirrorSource,
   describePlans,
   desktopProcessState,
   desktopSyncReport,
   DRY_RUN_TENSE,
-  planAllAccountsSessionSync,
+  planAddMissingSessionSync,
+  planMirrorNewestSessionSync,
   resolveDesktopSessionPaths,
   summarizePlans,
-  syncAllAccountsWhenClosed,
   syncDesktopSessionsWhenClosed,
+  syncPlanWhenClosed,
   TO_CLAUDE_PROFILE,
   TO_GATEWAY_PROFILE,
+  type DesktopSessionPaths,
   type DesktopSyncOutcome,
   type DesktopSyncReport,
+  type DirectionPlan,
   type SyncDirection,
 } from "../config/desktop-sessions.js";
 import { activeTierModels, parseTierModels, EffortLevel } from "../models/tier-store.js";
@@ -283,22 +288,47 @@ function syncDesktopSessionsAfterSwitch(directions: readonly SyncDirection[]): D
 
 const SYNC_BUTTON_RETRY_HINT = "click Sync all sessions again.";
 
-/** What the Sync all sessions button would change; Desktop may stay open while previewing. */
+/** The Sync all sessions dialog's choices: add what a list lacks, or make every list the newest one. */
+const SESSION_SYNC_PLANNERS = {
+  add_only: planAddMissingSessionSync,
+  mirror_newest: planMirrorNewestSessionSync,
+} as const satisfies Record<string, (paths: DesktopSessionPaths) => DirectionPlan[]>;
+type SessionSyncMode = keyof typeof SESSION_SYNC_PLANNERS;
+const SessionSyncRequest = z.object({ mode: z.enum(["add_only", "mirror_newest"]) });
+
+function changeCount(plans: readonly DirectionPlan[]): number {
+  return plans.reduce((sum, plan) => sum + plan.copies.length + plan.refreshes.length + plan.removals.length, 0);
+}
+
+/** What each Sync all sessions mode would change; Desktop may stay open while previewing. */
 function previewAllAccountsSync(): Record<string, unknown> {
-  const plans = planAllAccountsSessionSync(resolveDesktopSessionPaths());
-  const { level } = desktopSyncReport({ status: "applied", sync: { plans, entries: [], manifestPath: undefined } });
-  const changes = plans.reduce((sum, plan) => sum + plan.copies.length + plan.refreshes.length, 0);
-  return { ok: true, desktop: desktopProcessState(), changes, level, headline: summarizePlans(plans, DRY_RUN_TENSE), messages: describePlans(plans, DRY_RUN_TENSE) };
+  const paths = resolveDesktopSessionPaths();
+  const preview = (plans: readonly DirectionPlan[]) => ({
+    changes: changeCount(plans),
+    level: desktopSyncReport({ status: "applied", sync: { plans, entries: [], manifestPath: undefined } }).level,
+    headline: summarizePlans(plans, DRY_RUN_TENSE),
+    messages: describePlans(plans, DRY_RUN_TENSE),
+  });
+  const mirror = planMirrorNewestSessionSync(paths);
+  return {
+    ok: true,
+    desktop: desktopProcessState(),
+    modes: {
+      add_only: preview(planAddMissingSessionSync(paths)),
+      mirror_newest: { ...preview(mirror), source: describeMirrorSource(mirror) ?? null },
+    },
+  };
 }
 
 /** The Sync all sessions button: a skipped sync also lists what it would have changed. */
-function syncAllAccounts(): DesktopSyncReport {
+function syncAllAccounts(mode: SessionSyncMode): DesktopSyncReport {
   const paths = resolveDesktopSessionPaths();
-  const outcome = syncAllAccountsWhenClosed(paths, desktopProcessState(), new Date());
+  const plan = (): DirectionPlan[] => SESSION_SYNC_PLANNERS[mode](paths);
+  const outcome = syncPlanWhenClosed(plan, paths.manifestDir, desktopProcessState(), new Date());
   const report = desktopSyncReport(outcome, SYNC_BUTTON_RETRY_HINT);
   if (outcome.status !== "skipped") return logDesktopSync(outcome, report);
-  const pending = planAllAccountsSessionSync(paths);
-  const waiting = pending.reduce((sum, plan) => sum + plan.copies.length + plan.refreshes.length, 0);
+  const pending = plan();
+  const waiting = changeCount(pending);
   const headline = waiting === 0 ? report.headline : `${report.headline} ${waiting} session(s) waiting to copy.`;
   return logDesktopSync(outcome, { ...report, headline, messages: [...report.messages, ...describePlans(pending, DRY_RUN_TENSE)] });
 }
@@ -717,7 +747,14 @@ export async function handleUiRoute(
   }
 
   if (pathname === "/api/ui/desktop-sessions/sync" && request.method === "POST") {
-    const desktopSessionSync = syncAllAccounts();
+    // The mode is required: a missing one must never default to a sync that removes sessions.
+    const body = SessionSyncRequest.safeParse(await readJsonBody(request));
+    if (!body.success) {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: false, error: "Session sync mode must be one of: add_only, mirror_newest." }));
+      return true;
+    }
+    const desktopSessionSync = syncAllAccounts(body.data.mode);
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ ok: true, desktopSessionSync }));
     return true;
@@ -1567,6 +1604,21 @@ export function renderDashboardHtml(): string {
       padding: 1rem 1.5rem; border-top: 1px solid var(--border); background: var(--surface-soft);
     }
     .usage-reset-actions .btn { min-height: 2.75rem; }
+    .session-sync-modes { display: grid; gap: 0.6rem; margin: 1rem 0 0; padding: 0; border: 0; }
+    .session-sync-modes legend { margin-bottom: 0.5rem; font-size: 0.85rem; font-weight: 600; }
+    .session-sync-mode {
+      display: grid; grid-template-columns: auto 1fr; gap: 0.6rem; align-items: start;
+      padding: 0.75rem; border: 1px solid var(--line-soft); border-radius: var(--radius); background: var(--surface-soft); cursor: pointer;
+    }
+    .session-sync-mode:has(input:checked) { border-color: var(--line); background: var(--accent); }
+    .session-sync-mode input { margin-top: 0.2rem; }
+    /* The text-field focus shadow does not suit a radio; keyboard focus outlines the whole option instead. */
+    .session-sync-mode input:focus, .session-sync-mode input:focus-visible { box-shadow: none; outline: none; }
+    .session-sync-mode:has(input:focus-visible) { outline: 3px solid var(--ring); outline-offset: 2px; }
+    .session-sync-mode strong { display: block; font-size: 0.875rem; }
+    .session-sync-detail { display: block; font-size: 0.8rem; line-height: 1.5; color: var(--muted-foreground); }
+    .session-sync-detail.session-sync-summary { margin-top: 0.35rem; color: var(--foreground); font-weight: 600; }
+    .usage-reset-body .session-sync-desktop { margin-top: 1rem; color: var(--destructive); font-weight: 600; }
     .btn-sm {
       padding: 0.35rem 0.6rem;
       font-size: 0.75rem;
@@ -2605,7 +2657,7 @@ export function renderDashboardHtml(): string {
               </select>
             </div>
             <div class="setup-toolbar-actions">
-              <button class="btn btn-secondary" id="btn-sync-sessions" type="button" title="Copy missing Code-tab sessions between every Claude Desktop account, claude.ai and gateway">Sync all sessions</button>
+              <button class="btn btn-secondary" id="btn-sync-sessions" type="button" title="Sync Code-tab sessions between every Claude Desktop account, claude.ai and gateway">Sync all sessions</button>
               <button class="btn btn-primary" id="btn-apply" type="button">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
                 Apply configuration
@@ -2875,6 +2927,40 @@ export function renderDashboardHtml(): string {
         <svg class="usage-reset-icon" aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10a9 9 0 1 1 2.6 8.4M3 4v6h6"/></svg>
         <span id="usage-reset-label">Reset counters</span>
       </button>
+    </div>
+  </dialog>
+
+  <dialog class="usage-reset-dialog" id="session-sync-dialog" aria-labelledby="session-sync-title" aria-describedby="session-sync-description">
+    <div class="usage-reset-body">
+      <div class="usage-reset-heading">
+        <h2 id="session-sync-title">Sync Desktop sessions</h2>
+      </div>
+      <p id="session-sync-description">Applies to every Claude Desktop account, claude.ai and gateway. Transcripts are never deleted, and every replaced or removed entry is backed up.</p>
+      <fieldset class="session-sync-modes">
+        <legend>How to sync</legend>
+        <label class="session-sync-mode">
+          <input type="radio" name="session-sync-mode" id="session-sync-mode-add_only" value="add_only" checked>
+          <span>
+            <strong>Add only</strong>
+            <span class="session-sync-detail">Copy each session into every list that lacks it. Nothing is replaced or removed.</span>
+            <span class="session-sync-detail session-sync-summary" id="session-sync-summary-add_only"></span>
+          </span>
+        </label>
+        <label class="session-sync-mode">
+          <input type="radio" name="session-sync-mode" id="session-sync-mode-mirror_newest" value="mirror_newest">
+          <span>
+            <strong>Mirror the newest list</strong>
+            <span class="session-sync-detail">Every list becomes a copy of the most recently used one<span id="session-sync-source"></span>. Sessions it lacks are removed from the other lists, and their entries are replaced by its version.</span>
+            <span class="session-sync-detail session-sync-summary" id="session-sync-summary-mirror_newest"></span>
+          </span>
+        </label>
+      </fieldset>
+      <p class="session-sync-desktop" id="session-sync-desktop" hidden>Claude Desktop is not confirmed closed: quit it first, or the sync is skipped.</p>
+      <div class="usage-reset-error" id="session-sync-error" role="alert" hidden></div>
+    </div>
+    <div class="usage-reset-actions">
+      <button class="btn btn-secondary" id="btn-cancel-session-sync" type="button" autofocus>Cancel</button>
+      <button class="btn btn-primary" id="btn-confirm-session-sync" type="button">Sync</button>
     </div>
   </dialog>
 
@@ -3673,23 +3759,78 @@ export function renderDashboardHtml(): string {
       document.getElementById("btn-apply").click();
     });
 
-    /* Every Desktop account gets every session: preview, confirm, then copy (Desktop must be closed). */
+    /* Every Desktop account gets every session: preview both modes, let the person pick one, then sync (Desktop must be closed). */
+    const SESSION_SYNC_MODES = ["add_only", "mirror_newest"];
+    const sessionSyncDialog = document.getElementById("session-sync-dialog");
+    const sessionSyncError = document.getElementById("session-sync-error");
+    let sessionSyncPreview = null;
+    let sessionSyncPending = false;
+
+    function selectedSessionSyncMode() {
+      return SESSION_SYNC_MODES.find((mode) => document.getElementById("session-sync-mode-" + mode).checked);
+    }
+
+    /* Mirroring can remove sessions, so its button reads as destructive; a mode with nothing to do cannot run. */
+    function updateSessionSyncDialog() {
+      const mode = selectedSessionSyncMode();
+      const button = document.getElementById("btn-confirm-session-sync");
+      button.disabled = sessionSyncPending || sessionSyncPreview === null || sessionSyncPreview.modes[mode].changes === 0;
+      button.className = "btn " + (mode === "mirror_newest" ? "btn-danger" : "btn-primary");
+      button.textContent = mode === "mirror_newest" ? "Mirror newest list" : "Add sessions";
+    }
+
     document.getElementById("btn-sync-sessions")?.addEventListener("click", async () => {
+      if (sessionSyncDialog.open) return;
       try {
         const preview = await (await fetch("/api/ui/desktop-sessions/plan")).json();
         if (!preview.ok) throw new Error(preview.error);
-        if (preview.changes === 0) {
-          showConfigurationResult("", { status: "applied", level: preview.level, headline: preview.headline, messages: preview.messages });
+        if (SESSION_SYNC_MODES.every((mode) => preview.modes[mode].changes === 0)) {
+          const addOnly = preview.modes.add_only;
+          showConfigurationResult("", { status: "applied", level: addOnly.level, headline: addOnly.headline, messages: addOnly.messages });
           return;
         }
-        const closed = preview.desktop === "not_running";
-        if (closed && !confirm("Copy sessions between all Claude Desktop accounts?\\n\\n" + preview.headline)) return;
-        const res = await fetch("/api/ui/desktop-sessions/sync", { method: "POST" });
-        const data = await res.json();
-        if (!data.ok) throw new Error(data.error);
-        showConfigurationResult("", data.desktopSessionSync);
+        sessionSyncPreview = preview;
+        for (const mode of SESSION_SYNC_MODES) {
+          document.getElementById("session-sync-summary-" + mode).textContent = preview.modes[mode].headline;
+        }
+        const source = preview.modes.mirror_newest.source;
+        document.getElementById("session-sync-source").textContent = source ? " (" + source + ")" : "";
+        document.getElementById("session-sync-desktop").hidden = preview.desktop === "not_running";
+        document.getElementById("session-sync-mode-add_only").checked = true;
+        sessionSyncError.hidden = true;
+        sessionSyncError.textContent = "";
+        updateSessionSyncDialog();
+        sessionSyncDialog.showModal();
       } catch (err) {
         showToast("Session sync failed: " + err.message, "error");
+      }
+    });
+    for (const mode of SESSION_SYNC_MODES) {
+      document.getElementById("session-sync-mode-" + mode).addEventListener("change", updateSessionSyncDialog);
+    }
+    document.getElementById("btn-cancel-session-sync").addEventListener("click", () => {
+      if (!sessionSyncPending) sessionSyncDialog.close();
+    });
+    sessionSyncDialog.addEventListener("cancel", (event) => {
+      if (sessionSyncPending) event.preventDefault();
+    });
+    document.getElementById("btn-confirm-session-sync").addEventListener("click", async () => {
+      const mode = selectedSessionSyncMode();
+      if (!sessionSyncDialog.open || sessionSyncPending || mode === undefined) return;
+      sessionSyncPending = true;
+      updateSessionSyncDialog();
+      try {
+        const res = await fetch("/api/ui/desktop-sessions/sync", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode }) });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error);
+        sessionSyncDialog.close();
+        showConfigurationResult("", data.desktopSessionSync);
+      } catch (err) {
+        sessionSyncError.textContent = "Session sync failed: " + err.message;
+        sessionSyncError.hidden = false;
+      } finally {
+        sessionSyncPending = false;
+        updateSessionSyncDialog();
       }
     });
 

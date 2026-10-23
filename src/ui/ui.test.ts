@@ -1055,3 +1055,14 @@ test('sidebar pill reports whether Claude clients route through the gateway, not
      assert.equal(badge({ cli: client(true, false), desktop: client(false, false) }).text, 'Gateway out of sync');
      assert.ok(!renderDashboardHtml().includes('Server running'));
 });
+
+test('session sync requires an explicit mode and never falls back to one that removes sessions', async () => {
+     for (const body of [undefined, {}, { mode: 'mirror' }]) {
+          const { response, getOutput } = createMockResponse();
+          const req = createMockRequest('POST', '/api/ui/desktop-sessions/sync', body);
+          assert.equal(await handleUiRoute(mockOptions, req, response, '/api/ui/desktop-sessions/sync', 3456), true);
+          const out = getOutput();
+          assert.equal(out.statusCode, 400);
+          assert.deepEqual(JSON.parse(out.body), { ok: false, error: 'Session sync mode must be one of: add_only, mirror_newest.' });
+     }
+});
