@@ -14,7 +14,9 @@ import {
   type SetupTarget,
 } from "../config/config-setup.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
-import { ANTIGRAVITY_MODELS, ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, routedModels, smallestContextWindow, type ProviderType } from "../models/models.js";
+import { ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, PROVIDERS, PROVIDER_LABELS, isProviderType, routedModels, smallestContextWindow, type ProviderType } from "../models/models.js";
+import { apiProviderTiers, hasApiKey, isApiProvider, parseApiProviderConfig } from "../providers/config.js";
+import { currentProvider, getProviderConfig, providerDefaultModel, providerModels } from "../providers/runtime.js";
 import { isAntigravityAvailable } from "../bridge/antigravity.js";
 import {
   desktopProcessState,
@@ -107,13 +109,11 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
   const gatewayUrl = `http://127.0.0.1:${port}`;
   const token = options.policy.mode === "token" ? options.policy.token : "";
   const currentTiers = activeTierModels(options);
-  const activeProvider: ProviderType = options.provider ?? "codex";
-  const isAntigravity = activeProvider === "antigravity";
-  const activeModels = isAntigravity
-    ? (options.antigravityModels ?? ANTIGRAVITY_MODELS)
-    : options.availableModels;
+  const activeProvider = currentProvider(options);
+  const apiConfig = isApiProvider(activeProvider) ? getProviderConfig(options, activeProvider) : undefined;
+  const activeModels = providerModels(options, activeProvider);
   const defaults = options.tierStore?.defaults(activeProvider)
-    ?? (isAntigravity ? ANTIGRAVITY_TIER_MODELS : (options.tiers ?? DEFAULT_TIER_MODELS));
+    ?? (apiConfig ? apiProviderTiers(apiConfig) : activeProvider === "antigravity" ? ANTIGRAVITY_TIER_MODELS : (options.tiers ?? DEFAULT_TIER_MODELS));
   // A stored config only works when it points at this gateway and carries its current token.
   const inSync = (baseUrl: string, storedToken: string): boolean =>
     baseUrl.replace(/\/+$/, "") === gatewayUrl && (options.policy.mode === "open" || storedToken === token);
@@ -163,10 +163,16 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
   return {
     provider: {
       active: activeProvider,
-      available: [
-        { id: "codex", name: "ChatGPT (Codex)", available: true },
-        { id: "antigravity", name: "Google Antigravity (agy)", available: isAntigravityAvailable() },
-      ],
+      ...(apiConfig ? { config: apiConfig, keyConfigured: hasApiKey(apiConfig, options.providerEnv ?? process.env) } : {}),
+      available: PROVIDERS.map((provider) => {
+        const config = isApiProvider(provider) ? getProviderConfig(options, provider) : undefined;
+        return {
+          id: provider,
+          name: PROVIDER_LABELS[provider],
+          available: provider !== "antigravity" || isAntigravityAvailable(),
+          ...(config ? { config, keyConfigured: hasApiKey(config, options.providerEnv ?? process.env) } : {}),
+        };
+      }),
     },
     gateway: {
       port,
@@ -216,7 +222,7 @@ function refreshDesktopLabels(options: GatewayOptions): boolean {
       level: "info",
       operation: "desktop_labels_refreshed",
       message: "Updated Claude Desktop model picker labels to the active tier mapping; restart Claude Desktop to see them",
-      details: { provider: options.provider ?? "codex" },
+      details: { provider: currentProvider(options) },
     });
   }
   return files.length > 0;
@@ -337,7 +343,7 @@ export async function handleUiRoute(
 
     const unsubscribeUsage = onUsageUpdated((summary) => {
       try {
-        response.write(`event: usage\ndata: ${JSON.stringify({ ...summary, provider: options.provider ?? "codex", antigravity: { available: isAntigravityAvailable() } })}\n\n`);
+        response.write(`event: usage\ndata: ${JSON.stringify({ ...summary, provider: currentProvider(options), antigravity: { available: isAntigravityAvailable() } })}\n\n`);
       } catch {
         cleanup();
       }
@@ -360,8 +366,8 @@ export async function handleUiRoute(
     const forceRefresh = parsedUrl.searchParams.get("refresh") === "true";
     const usage = getTokenUsageStats();
     let limits: AccountUsageLimits | null = null;
-    const currentProvider = options.provider ?? "codex";
-    if (currentProvider === "codex" && typeof options.session.getUsageLimits === "function") {
+    const provider = currentProvider(options);
+    if (provider === "codex" && typeof options.session.getUsageLimits === "function") {
       try {
         limits = await options.session.getUsageLimits(forceRefresh);
       } catch (error) {
@@ -376,11 +382,11 @@ export async function handleUiRoute(
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({
       ...usage,
-      provider: currentProvider,
+      provider,
       antigravity: {
         available: isAntigravityAvailable(),
       },
-      limits: currentProvider === "codex" ? limits : null,
+      limits: provider === "codex" ? limits : null,
     }));
     return true;
   }
@@ -411,14 +417,12 @@ export async function handleUiRoute(
 
   if (pathname === "/api/ui/provider" && request.method === "POST") {
     const body = await readJsonBody(request);
-    if (body.provider !== "antigravity" && body.provider !== "codex") {
-      throw new BridgeError(400, "invalid_provider", 'Provider must be "codex" or "antigravity".');
+    if (typeof body.provider !== "string" || !isProviderType(body.provider)) {
+      throw new BridgeError(400, "invalid_provider", `Provider must be one of: ${PROVIDERS.join(", ")}.`);
     }
     const target: ProviderType = body.provider;
+    options.tierStore?.setProvider(target);
     options.provider = target;
-    if (options.tierStore) {
-      options.tierStore.setProvider(target);
-    }
     recordLog({
       level: "info",
       operation: "provider_switch",
@@ -428,6 +432,20 @@ export async function handleUiRoute(
     const desktopLabelsUpdated = refreshDesktopLabels(options);
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ ok: true, provider: target, desktopLabelsUpdated }));
+    return true;
+  }
+
+  if (pathname === "/api/ui/provider-config" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    if (typeof body.provider !== "string" || !isProviderType(body.provider) || !isApiProvider(body.provider)) {
+      throw new BridgeError(400, "invalid_provider", "API provider must be openrouter, openai, or opencode.");
+    }
+    const config = parseApiProviderConfig(body.config);
+    if (!options.tierStore) throw new BridgeError(503, "settings_unavailable", "Provider configuration storage is unavailable in this gateway mode.");
+    options.tierStore.saveApiProviderConfig(body.provider, config);
+    recordLog({ level: "info", operation: "provider_config_saved", message: "Saved API provider configuration", details: { provider: body.provider } });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ ok: true, provider: body.provider, config, keyConfigured: hasApiKey(config, options.providerEnv ?? process.env) }));
     return true;
   }
 
@@ -441,15 +459,14 @@ export async function handleUiRoute(
     try {
       const body = await readJsonBody(request);
       const tiers = parseTierModels(body.tiers);
-      const currentProvider = options.provider ?? "codex";
-      const isAnt = currentProvider === "antigravity";
-      const modelCatalog = isAnt ? (options.antigravityModels ?? ANTIGRAVITY_MODELS) : options.availableModels;
+      const provider = currentProvider(options);
+      const modelCatalog = providerModels(options, provider);
       const availableModels = new Set(modelCatalog.map((model) => model.slug));
       const unavailable = Object.entries(tiers).find(([, model]) => !availableModels.has(model));
       if (unavailable) {
-        throw new BridgeError(400, "model_unavailable", `Tier mapping model "${unavailable[1]}" is not in the current ${isAnt ? "Antigravity" : "ChatGPT"} model catalog.`);
+        throw new BridgeError(400, "model_unavailable", `Tier mapping model "${unavailable[1]}" is not in the current ${PROVIDER_LABELS[provider]} model catalog.`);
       }
-      store.save(tiers, currentProvider);
+      store.save(tiers, provider);
       if (typeof body.effort === "string") {
         const cleanEffort = body.effort.trim();
         if (cleanEffort === "") {
@@ -464,12 +481,12 @@ export async function handleUiRoute(
       recordLog({
         level: "info",
         operation: "tier_mapping_saved",
-        message: `Saved Claude tier to ${isAnt ? "Antigravity" : "ChatGPT"} model mapping`,
-        details: { provider: currentProvider, fable: tiers.fable, opus: tiers.opus, sonnet: tiers.sonnet, haiku: tiers.haiku },
+        message: `Saved Claude tier to ${PROVIDER_LABELS[provider]} model mapping`,
+        details: { provider, fable: tiers.fable, opus: tiers.opus, sonnet: tiers.sonnet, haiku: tiers.haiku },
       });
       const desktopLabelsUpdated = refreshDesktopLabels(options);
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, tiers: store.current(currentProvider), custom: store.isCustom(currentProvider), effort: store.getEffort() ?? "", desktopLabelsUpdated }));
+      response.end(JSON.stringify({ ok: true, tiers: store.current(provider), custom: store.isCustom(provider), effort: store.getEffort() ?? "", desktopLabelsUpdated }));
     } catch (error) {
       const failure = error instanceof BridgeError
         ? error
@@ -493,16 +510,16 @@ export async function handleUiRoute(
       return true;
     }
     try {
-      const currentProvider = options.provider ?? "codex";
-      store.reset(currentProvider);
+      const provider = currentProvider(options);
+      store.reset(provider);
       recordLog({
         level: "info",
         operation: "tier_mapping_reset",
-        message: `Reset Claude tier mapping to ${currentProvider === "antigravity" ? "Antigravity" : "ChatGPT"} environment or built-in defaults`,
+        message: `Reset Claude tier mapping to ${PROVIDER_LABELS[provider]} environment or built-in defaults`,
       });
       const desktopLabelsUpdated = refreshDesktopLabels(options);
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, tiers: store.current(currentProvider), custom: store.isCustom(currentProvider), desktopLabelsUpdated }));
+      response.end(JSON.stringify({ ok: true, tiers: store.current(provider), custom: store.isCustom(provider), desktopLabelsUpdated }));
     } catch (error) {
       const failure = error instanceof BridgeError
         ? error
@@ -531,14 +548,17 @@ export async function handleUiRoute(
         ? body.effort.trim()
         : options.tierStore?.getEffort();
       const tiers = activeTierModels(options);
-      const catalog = (options.provider ?? "codex") === "antigravity" ? (options.antigravityModels ?? ANTIGRAVITY_MODELS) : options.availableModels;
+      const provider = currentProvider(options);
+      const catalog = providerModels(options, provider);
+      const defaultModel = providerDefaultModel(options, provider);
       const result = setupConfig(target, {
         gatewayUrl: cleanUrl,
         token,
-        model: options.defaultModel,
+        model: defaultModel,
+        availableModels: catalog.map((model) => model.slug),
         tiers,
         effort,
-        maxContextTokens: smallestContextWindow(catalog, routedModels(tiers, options.defaultModel)),
+        maxContextTokens: smallestContextWindow(catalog, routedModels(tiers, defaultModel)),
       });
       recordLog({
         level: "info",
@@ -802,6 +822,7 @@ export function renderDashboardHtml(): string {
     }
     .provider-group {
       display: flex;
+      flex-wrap: wrap;
       gap: 0.35rem;
     }
     .provider-btn {
@@ -876,6 +897,11 @@ export function renderDashboardHtml(): string {
       transform: translate(1px, 1px);
       box-shadow: 1px 1px 0 var(--line);
     }
+    .api-provider-settings { margin-top: 1rem; padding: 1rem; border: 1px solid var(--line-soft); border-radius: var(--radius); background: var(--surface-soft); }
+    .api-provider-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 0.75rem; margin: 0.75rem 0; }
+    .api-provider-fields label { display: grid; gap: 0.3rem; font-size: 0.8rem; }
+    .api-provider-settings textarea { width: 100%; min-height: 15rem; padding: 0.65rem; border: 1px solid var(--input); border-radius: var(--radius); background: var(--surface); color: var(--ink); font-family: monospace; resize: vertical; }
+    .api-provider-settings textarea:focus-visible { outline: 3px solid var(--ring); }
     /* Navigation Tabs */
     .nav-tabs {
       display: flex;
@@ -1370,6 +1396,7 @@ export function renderDashboardHtml(): string {
       gap: 0.6rem;
       box-shadow: 2px 2px 0 var(--paper-deep);
     }
+    .quota-card[hidden] { display: none; }
     .quota-card-top {
       display: flex;
       justify-content: space-between;
@@ -1899,6 +1926,9 @@ export function renderDashboardHtml(): string {
               </span>
               <span>Antigravity (agy)</span>
             </button>
+            <button class="provider-btn" id="btn-provider-openrouter" type="button" data-provider="openrouter" role="radio" aria-checked="false">OpenRouter</button>
+            <button class="provider-btn" id="btn-provider-openai" type="button" data-provider="openai" role="radio" aria-checked="false">OpenAI API</button>
+            <button class="provider-btn" id="btn-provider-opencode" type="button" data-provider="opencode" role="radio" aria-checked="false">OpenCode</button>
           </div>
           <button class="btn btn-primary btn-provider-submit" id="btn-provider-submit" type="button" disabled title="Click to apply and switch provider">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
@@ -1907,6 +1937,36 @@ export function renderDashboardHtml(): string {
         </div>
 
         <p class="instruction-card" id="provider-hint" hidden>Antigravity needs the <code>agy</code> CLI. Put agy on the gateway's PATH, or set <code>CODEX2CC_AGY_BIN</code> to its full path, then restart the gateway.</p>
+
+        <section id="api-provider-settings" class="api-provider-settings" aria-labelledby="api-provider-title" hidden>
+          <h3 id="api-provider-title">API provider settings</h3>
+          <p id="api-key-status" role="status"></p>
+          <p class="supporting-text">Enter the environment variable name, never the API key itself. Set its value in the gateway process environment and restart. Saving settings does not select a provider; press Submit above to switch.</p>
+          <form id="api-provider-form">
+            <div class="api-provider-fields">
+              <label for="api-key-env">API key environment variable name
+                <input id="api-key-env" type="text" autocomplete="off" spellcheck="false" required pattern="[A-Z][A-Z0-9_]*_API_KEY" aria-describedby="api-key-status" />
+              </label>
+              <label for="api-default-model">Default model slug
+                <input id="api-default-model" type="text" spellcheck="false" required />
+              </label>
+              <label for="api-endpoint-chat-completions">Chat Completions endpoint URL
+                <input id="api-endpoint-chat-completions" type="url" spellcheck="false" placeholder="https://api.openai.com/v1/chat/completions" />
+              </label>
+              <label for="api-endpoint-responses">Responses endpoint URL
+                <input id="api-endpoint-responses" type="url" spellcheck="false" placeholder="https://api.openai.com/v1/responses" />
+              </label>
+              <label for="api-endpoint-anthropic-messages">Anthropic Messages endpoint URL
+                <input id="api-endpoint-anthropic-messages" type="url" spellcheck="false" placeholder="https://opencode.ai/inference/anthropic/v1/messages" />
+              </label>
+            </div>
+            <label for="api-model-catalog">Model catalog (JSON array)</label>
+            <p id="api-model-schema" class="supporting-text">Each model requires slug, displayName, and protocol: chat-completions, responses, or anthropic-messages. reasoning is none, openai, or openrouter (default: none). Anthropic Messages uses none; Responses supports openai or none. Optional contextWindow and maxOutputTokens are positive integers. Each protocol needs its complete endpoint URL. The default model must exist in this catalog. Only these adapter protocols are supported, not every model a provider offers.</p>
+            <textarea id="api-model-catalog" spellcheck="false" required aria-describedby="api-model-schema api-model-example"></textarea>
+            <p id="api-model-example" class="supporting-text">Example: [{"slug":"gpt-5.5","displayName":"GPT-5.5","protocol":"responses","reasoning":"openai","contextWindow":200000,"maxOutputTokens":8192}]. Provider defaults load automatically; edit them to match your account.</p>
+            <button class="btn btn-primary btn-sm" id="btn-save-provider-config" type="submit">Save provider settings</button>
+          </form>
+        </section>
 
         <!-- Gateway Credentials Bar -->
         <div class="gateway-bar">
@@ -2368,6 +2428,65 @@ export function renderDashboardHtml(): string {
     let currentActiveProvider = "codex";
     let selectedProvider = "codex";
     let isProviderSwitching = false;
+    let isProviderConfigSaving = false;
+    let providerConfigDirty = false;
+    let editingProvider = null;
+    const providerLabels = ${JSON.stringify(PROVIDER_LABELS)};
+    const apiProtocols = ["chat-completions", "responses", "anthropic-messages"];
+
+    function renderProviderSettings() {
+      const entry = currentStatus?.provider?.available?.find((provider) => provider.id === selectedProvider);
+      const section = document.getElementById("api-provider-settings");
+      section.hidden = !entry?.config;
+      if (!entry?.config) return;
+      document.getElementById("api-provider-title").textContent = providerLabels[selectedProvider] + " settings";
+      document.getElementById("api-key-status").textContent = entry.config.apiKeyEnv + (entry.keyConfigured ? ": configured in the gateway environment" : ": missing or invalid in the gateway environment; inference is unavailable until configured");
+      if (editingProvider === selectedProvider && providerConfigDirty) return;
+      editingProvider = selectedProvider;
+      providerConfigDirty = false;
+      document.getElementById("api-key-env").value = entry.config.apiKeyEnv;
+      document.getElementById("api-default-model").value = entry.config.defaultModel;
+      for (const protocol of apiProtocols) document.getElementById("api-endpoint-" + protocol).value = entry.config.endpoints[protocol] || "";
+      document.getElementById("api-model-catalog").value = JSON.stringify(entry.config.models, null, 2);
+    }
+
+    document.getElementById("api-provider-form").addEventListener("input", () => { providerConfigDirty = true; });
+    document.getElementById("api-provider-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (isProviderConfigSaving || isProviderSwitching) return;
+      const provider = selectedProvider;
+      const button = document.getElementById("btn-save-provider-config");
+      isProviderConfigSaving = true;
+      button.disabled = true;
+      updateProviderControls();
+      try {
+        const endpoints = {};
+        for (const protocol of apiProtocols) {
+          const value = document.getElementById("api-endpoint-" + protocol).value.trim();
+          if (value) endpoints[protocol] = value;
+        }
+        const config = {
+          apiKeyEnv: document.getElementById("api-key-env").value.trim(),
+          defaultModel: document.getElementById("api-default-model").value.trim(),
+          endpoints,
+          models: JSON.parse(document.getElementById("api-model-catalog").value),
+        };
+        const response = await fetch("/api/ui/provider-config", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider, config }),
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "Provider settings could not be saved");
+        providerConfigDirty = false;
+        showToast("Saved " + providerLabels[provider] + " settings. Re-apply client setup if models changed.");
+        await fetchStatus();
+      } catch (error) {
+        showToast(error instanceof SyntaxError ? "Model catalog must be a valid JSON array." : error.message, "error");
+      } finally {
+        isProviderConfigSaving = false;
+        button.disabled = false;
+        updateProviderControls();
+      }
+    });
 
     function updateProviderControls(availableList) {
       const btnCodex = document.getElementById("btn-provider-codex");
@@ -2382,17 +2501,19 @@ export function renderDashboardHtml(): string {
         document.getElementById("provider-hint").hidden = antigravityReady;
       }
 
-      btnCodex.classList.toggle("active", selectedProvider === "codex");
-      btnCodex.setAttribute("aria-checked", selectedProvider === "codex" ? "true" : "false");
-      btnAnt.classList.toggle("active", selectedProvider === "antigravity");
-      btnAnt.setAttribute("aria-checked", selectedProvider === "antigravity" ? "true" : "false");
+      document.querySelectorAll(".provider-btn[data-provider]").forEach((button) => {
+        const active = button.dataset.provider === selectedProvider;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-checked", active ? "true" : "false");
+      });
+      renderProviderSettings();
 
       const isPending = selectedProvider !== currentActiveProvider;
       if (btnSubmit) {
-        btnSubmit.disabled = isProviderSwitching || !isPending;
+        btnSubmit.disabled = isProviderSwitching || isProviderConfigSaving || !isPending;
         btnSubmit.classList.toggle("pending", isPending && !isProviderSwitching);
         if (isPending) {
-          btnSubmit.title = "Click to apply and switch to " + (selectedProvider === "antigravity" ? "Google Antigravity" : "ChatGPT Codex");
+          btnSubmit.title = "Click to apply and switch to " + providerLabels[selectedProvider];
         } else {
           btnSubmit.title = "Active provider already selected";
         }
@@ -2400,10 +2521,13 @@ export function renderDashboardHtml(): string {
     }
 
     function selectProvider(target) {
-      if (isProviderSwitching) return;
-      if (target !== "codex" && target !== "antigravity") return;
-      const btn = document.getElementById(target === "codex" ? "btn-provider-codex" : "btn-provider-antigravity");
+      if (isProviderSwitching || isProviderConfigSaving || !Object.hasOwn(providerLabels, target)) return;
+      const btn = document.getElementById("btn-provider-" + target);
       if (btn?.disabled) return;
+      if (target !== selectedProvider && providerConfigDirty) {
+        if (!confirm("Discard unsaved API provider settings?")) return;
+        providerConfigDirty = false;
+      }
       selectedProvider = target;
       updateProviderControls();
     }
@@ -2421,9 +2545,7 @@ export function renderDashboardHtml(): string {
         updateProviderControls(s.provider.available);
         const descElem = document.getElementById("tier-mapping-desc");
         if (descElem) {
-          descElem.textContent = currentActiveProvider === "antigravity"
-            ? "Map each Claude tier to a Google Antigravity (agy) model. Changes apply immediately upon saving."
-            : "Map each Claude tier to a ChatGPT backend model. Changes apply immediately upon saving.";
+          descElem.textContent = "Map each Claude tier to a " + providerLabels[currentActiveProvider] + " model. Changes apply immediately upon saving.";
         }
       }
 
@@ -2458,7 +2580,7 @@ export function renderDashboardHtml(): string {
         });
         const data = await res.json();
         if (data.ok) {
-          showToast("Switched active provider to " + (provider === "antigravity" ? "Google Antigravity (agy)" : "ChatGPT (Codex)"));
+          showToast("Switched active provider to " + providerLabels[provider]);
           cachedLimits = null;
           await fetchStatus();
           await fetchUsage(true);
@@ -2472,9 +2594,12 @@ export function renderDashboardHtml(): string {
 
     document.getElementById("btn-provider-codex")?.addEventListener("click", () => selectProvider("codex"));
     document.getElementById("btn-provider-antigravity")?.addEventListener("click", () => selectProvider("antigravity"));
+    document.getElementById("btn-provider-openrouter")?.addEventListener("click", () => selectProvider("openrouter"));
+    document.getElementById("btn-provider-openai")?.addEventListener("click", () => selectProvider("openai"));
+    document.getElementById("btn-provider-opencode")?.addEventListener("click", () => selectProvider("opencode"));
 
     document.getElementById("btn-provider-submit")?.addEventListener("click", async () => {
-      if (selectedProvider === currentActiveProvider || isProviderSwitching) return;
+      if (selectedProvider === currentActiveProvider || isProviderSwitching || isProviderConfigSaving) return;
       if (hasUnsavedTierChanges()) {
         if (!confirm("You have unsaved model routing edits for the current provider. Switch anyway?")) return;
       }
@@ -2511,7 +2636,7 @@ export function renderDashboardHtml(): string {
         const selectedModel = mapping.current[tier];
         const choices = [...models];
         if (!choices.some((model) => model.slug === selectedModel)) {
-          choices.push({ slug: selectedModel, displayName: selectedModel + " (not in current account catalog)" });
+          choices.push({ slug: selectedModel, displayName: selectedModel + " (not in current provider catalog)" });
         }
         select.replaceChildren();
         for (const model of choices) {
@@ -2537,7 +2662,7 @@ export function renderDashboardHtml(): string {
       let port = "3456";
       try { port = new URL(url).port || "3456"; } catch {}
       const token = document.getElementById("input-token").value || "YOUR_SECRET_TOKEN";
-      document.getElementById("text-run-cmd").textContent = 'CODEX2CC_TOKEN="' + token + '" node dist/main.js --serve --port ' + port;
+      document.getElementById("text-run-cmd").textContent = 'CODEX2CC_TOKEN="' + token + '" node dist/main.js --serve --port ' + port + ' --provider ' + currentActiveProvider;
     }
 
     /* Clipboard & Input helpers */
@@ -3031,11 +3156,19 @@ export function renderDashboardHtml(): string {
       document.getElementById("val-output-tokens").textContent = fmt(data.totalOutputTokens);
       document.getElementById("val-cached-tokens").textContent = fmt(data.totalCachedTokens);
 
-      const isAnt = (data.provider === "antigravity") || (!data.provider && currentStatus?.provider?.active === "antigravity");
+      const activeProvider = data.provider || currentStatus?.provider?.active || "codex";
+      const isAnt = activeProvider === "antigravity";
+      const isApi = !["codex", "antigravity"].includes(activeProvider);
+      document.getElementById("card-quota-5h").hidden = isApi;
+      document.getElementById("card-quota-weekly").hidden = isApi;
       const planBadge = document.getElementById("quota-plan-badge");
       const statusText = document.getElementById("quota-status-text");
 
-      if (isAnt) {
+      if (isApi) {
+        cachedLimits = null;
+        if (planBadge) planBadge.textContent = providerLabels[activeProvider];
+        if (statusText) statusText.textContent = "API billing and limits are managed by the provider. ChatGPT subscription quotas do not apply. Token totals include all providers.";
+      } else if (isAnt) {
         if (planBadge) {
           planBadge.textContent = "Google Antigravity";
           planBadge.className = "quota-plan-badge badge-active";
@@ -3153,13 +3286,8 @@ export function renderDashboardHtml(): string {
           ? ((m.totalTokens / data.grandTotalTokens) * 100).toFixed(1) + "%"
           : "0.0%";
 
-        const isAntModel = m.model.startsWith("claude-") || m.model.startsWith("gemini-") || m.model.startsWith("gpt-oss-");
-        const providerBadge = isAntModel
-          ? '<span class="badge-sub" style="margin-left:0.5rem;font-size:0.68rem;padding:0.12rem 0.45rem;border-radius:4px;background:rgba(36,123,121,0.15);color:var(--primary);font-weight:600;">Antigravity</span>'
-          : '<span class="badge-sub" style="margin-left:0.5rem;font-size:0.68rem;padding:0.12rem 0.45rem;border-radius:4px;background:rgba(217,119,6,0.15);color:#d97706;font-weight:600;">ChatGPT</span>';
-
         html += '<tr>' +
-          '<td><span class="model-tag">' + escapeHtml(m.model) + '</span>' + providerBadge + '</td>' +
+          '<td><span class="model-tag">' + escapeHtml(m.model) + '</span></td>' +
           '<td class="num-col">' + fmt(m.requests) + '</td>' +
           '<td class="num-col">' + fmt(m.inputTokens) + '</td>' +
           '<td class="num-col">' + fmt(m.outputTokens) + '</td>' +

@@ -4,7 +4,8 @@ import { z } from "zod";
 import {
   AnthropicStream,
   BridgeError,
-  estimateInputTokens,
+  estimateCodexInputTokens,
+  estimateTextTokens,
   hasReasoningItems,
   MessageAccumulator,
   MessageRequest,
@@ -15,13 +16,14 @@ import {
   withoutReasoningItems,
   type OpenAIRequest,
 } from "../bridge/bridge.js";
-import { handleAntigravityMessage, type AntigravityRunner } from "../bridge/antigravity.js";
+import { formatMessagesForAntigravity, handleAntigravityMessage, pruneToolsForAntigravity, type AntigravityRunner } from "../bridge/antigravity.js";
 import { checkClient, checkHost, checkUiOrigin, requestPathname, type GuardPolicy, type GuardResult } from "./guard.js";
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
   ANTIGRAVITY_MODELS,
   CLAUDE_GATEWAY_MODELS,
   DEFAULT_TIER_MODELS,
+  PROVIDER_LABELS,
   resolveModel,
   type ProviderType,
   type TierModels,
@@ -31,6 +33,13 @@ import { handleUiRoute } from "../ui/ui.js";
 import type { AccountUsageLimits } from "../auth/auth.js";
 import { recordLog } from "../telemetry/logger.js";
 import { recordTokenUsage } from "../telemetry/usage.js";
+import { isApiProvider, requireApiKey, type ApiProvider } from "../providers/config.js";
+import { currentProvider, getProviderConfig, providerDefaultModel, providerModels } from "../providers/runtime.js";
+import { openApiInference } from "../providers/http.js";
+import { toResponsesRequest, readResponsesSse } from "../bridge/responses.js";
+import { toAnthropicRequest, readAnthropicSse } from "../bridge/anthropic.js";
+import { toChatCompletionsRequest, readChatCompletionsSse } from "../bridge/chat-completions.js";
+import type { AnthropicUsage, OpenAIEvent } from "../bridge/bridge.js";
 
 export const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 
@@ -62,6 +71,10 @@ export type GatewayOptions = {
   /** Live, UI-editable mapping; when present it takes precedence over `tiers`. */
   readonly tierStore?: TierModelStore;
   provider?: ProviderType;
+  /** Explicit startup model overrides remain scoped when the UI switches providers. */
+  readonly defaultModels?: Partial<Record<ProviderType, string>>;
+  /** Runtime credentials, read by configured variable name and never returned by UI APIs. */
+  readonly providerEnv?: NodeJS.ProcessEnv;
   readonly antigravityRunner?: AntigravityRunner;
   readonly antigravityModels?: readonly ModelInfo[];
   /** Interval between SSE pings while a streamed response is open. */
@@ -291,11 +304,22 @@ async function handleMessage(
       details: { names: omittedTools.join(", ") },
     });
   }
-  if (options.activeProvider() === "antigravity") {
+  const provider = options.activeProvider();
+  if (isApiProvider(provider)) {
+    await routeToApi(options, provider, inbound, response, clientGone, startTime);
+    return;
+  }
+  if (provider === "antigravity") {
     await routeToAntigravity(options, inbound, requestedEffort, response, clientGone);
     return;
   }
   await routeToCodex(options, inbound, request.headers, response, clientGone, startTime);
+}
+
+function resolveRequestModel(options: ResolvedGatewayOptions, requestedModel: string): ReturnType<typeof resolveModel> {
+  const slugs = options.modelSlugs();
+  const defaultModel = providerDefaultModel(options, options.activeProvider());
+  return resolveModel(requestedModel, defaultModel, slugs, options.currentTiers());
 }
 
 async function routeToAntigravity(
@@ -305,12 +329,7 @@ async function routeToAntigravity(
   response: ServerResponse,
   clientGone: AbortSignal,
 ): Promise<void> {
-  const antModels = options.antigravityModels ?? ANTIGRAVITY_MODELS;
-  const antSlugs = new Set(antModels.map((m) => m.slug));
-  const antDefault = options.defaultModel && antSlugs.has(options.defaultModel)
-    ? options.defaultModel
-    : ANTIGRAVITY_DEFAULT_MODEL;
-  const resolution = resolveModel(inbound.model, antDefault, antSlugs, options.currentTiers());
+  const resolution = resolveRequestModel(options, inbound.model);
   const activeModel = resolution.slug;
   if (resolution.fellBack && !options.warnedModels.has(inbound.model)) {
     options.warnedModels.add(inbound.model);
@@ -359,7 +378,7 @@ async function routeToCodex(
   clientGone: AbortSignal,
   startTime: number,
 ): Promise<void> {
-  const resolution = resolveModel(inbound.model, options.defaultModel, options.modelSlugs(), options.currentTiers());
+  const resolution = resolveRequestModel(options, inbound.model);
   const activeModel = resolution.slug;
   if (resolution.fellBack && !options.warnedModels.has(inbound.model)) {
     options.warnedModels.add(inbound.model);
@@ -383,7 +402,7 @@ async function routeToCodex(
     }
   }
   const effort = outgoing.reasoning?.effort ?? "upstream_default";
-  const estimatedTokens = estimateInputTokens(inbound);
+  const estimatedTokens = estimateCodexInputTokens(outgoing);
   try {
     const upstream = await openCodexInference(options, outgoing, clientGone);
     if (inbound.stream) {
@@ -463,25 +482,97 @@ async function routeToCodex(
   }
 }
 
+async function routeToApi(
+  options: ResolvedGatewayOptions,
+  provider: ApiProvider,
+  inbound: MessageRequest,
+  response: ServerResponse,
+  clientGone: AbortSignal,
+  startTime: number,
+): Promise<void> {
+  // Capture provider configuration before the first await; a UI switch affects only subsequent requests.
+  const config = getProviderConfig(options, provider);
+  const resolution = resolveModel(inbound.model, providerDefaultModel(options, provider), new Set(config.models.map((model) => model.slug)), options.currentTiers());
+  const model = config.models.find((item) => item.slug === resolution.slug);
+  if (!model) throw new BridgeError(400, "model_unavailable", "The requested API model is not configured for this provider.");
+  const apiKey = requireApiKey(config, options.providerEnv ?? process.env);
+  const endpoint = config.endpoints[model.protocol];
+  if (!endpoint) throw new BridgeError(400, "missing_provider_endpoint", "The selected model's protocol has no configured endpoint.");
+  if (model.maxOutputTokens !== undefined && inbound.max_tokens > model.maxOutputTokens) {
+    throw new BridgeError(400, "output_limit_exceeded", `Requested max_tokens exceeds the configured output limit for model "${model.slug}".`);
+  }
+  const effort = options.tierStore?.getEffort();
+  const scope = { provider, model: model.slug };
+  const outgoing = model.protocol === "responses" ? toResponsesRequest(inbound, provider, model, effort)
+    : model.protocol === "anthropic-messages" ? toAnthropicRequest(inbound, provider, model.slug, effort)
+    : toChatCompletionsRequest(inbound, model.slug, model.reasoning, effort, scope);
+  const estimatedTokens = estimateCodexInputTokens(toOpenAIRequest(inbound, model.slug));
+  if (resolution.fellBack) recordLog({ level: "warn", operation: "model_fallback", message: "Requested model is not configured; using provider default", details: { provider, requested: inbound.model, model: model.slug } });
+  try {
+    const upstream = await openApiInference({ provider, protocol: model.protocol, url: endpoint, apiKey, body: outgoing, signal: clientGone });
+    const read = (accept: (event: OpenAIEvent) => void): Promise<void> => model.protocol === "responses"
+      ? readResponsesSse(upstream.body!, accept, provider, model.slug)
+      : model.protocol === "anthropic-messages"
+        ? readAnthropicSse(upstream.body!, accept, provider, model.slug)
+        : readChatCompletionsSse(upstream.body!, accept, scope);
+    let usage: AnthropicUsage | undefined;
+    if (inbound.stream) {
+      response.statusCode = 200;
+      response.setHeader("Content-Type", "text/event-stream");
+      response.setHeader("Cache-Control", "no-cache");
+      response.setHeader("Connection", "keep-alive");
+      const encoder = new AnthropicStream(response, model.slug, estimatedTokens);
+      const keepAlive = setInterval(() => encoder.keepAlive(), options.keepAliveMs);
+      try { await read((event) => encoder.accept(event)); }
+      finally { clearInterval(keepAlive); }
+      encoder.assertCompleted();
+      usage = encoder.getUsage();
+      response.end();
+    } else {
+      const accumulator = new MessageAccumulator(model.slug);
+      await read((event) => accumulator.accept(event));
+      accumulator.assertCompleted();
+      usage = accumulator.getUsage();
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(accumulator.buildMessage()));
+    }
+    const inputTokens = usage?.input_tokens ?? estimatedTokens;
+    const outputTokens = usage?.output_tokens ?? 0;
+    const cachedTokens = usage?.cache_read_input_tokens ?? 0;
+    recordTokenUsage({ model: model.slug, inputTokens, outputTokens, cachedTokens });
+    recordLog({ level: "info", operation: "provider_complete", message: "API provider response completed", details: { provider, protocol: model.protocol, model: model.slug, inputTokens, outputTokens, cachedTokens, durationMs: Date.now() - startTime } });
+  } catch (error) {
+    if (error instanceof BridgeError) {
+      const message = error.message.replaceAll(apiKey, "[REDACTED]");
+      if (error.code === "context_length_exceeded") throw promptTooLong(message, estimatedTokens, model.contextWindow);
+      throw new BridgeError(error.status, error.code.replaceAll(apiKey, "redacted"), message, error.retryAfterSeconds);
+    }
+    throw error;
+  }
+}
+
 async function handleCountTokens(
   options: ResolvedGatewayOptions,
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
   const inbound = parseRequest(await readBody(request, options.maxBodyBytes));
-  const count = estimateInputTokens(inbound);
+  const provider = options.activeProvider();
+  const { slug: model } = resolveRequestModel(options, inbound.model);
+  const count = provider === "antigravity"
+    ? estimateTextTokens(formatMessagesForAntigravity(pruneToolsForAntigravity(inbound)))
+    : estimateCodexInputTokens(toOpenAIRequest(inbound, model));
   recordLog({
     level: "info",
     operation: "count_tokens",
-    message: `Estimated tokens for model "${inbound.model}": ${count} tokens`,
-    details: { model: inbound.model, tokens: count },
+    message: "Estimated input tokens locally from the provider payload",
+    details: { provider, requestedModel: inbound.model, model, tokens: count, method: "local_heuristic" },
   });
   response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ input_tokens: count }));
 }
 
 function toBridgeError(error: Error): BridgeError {
   if (error instanceof BridgeError) return error;
-  if (error instanceof z.ZodError) return new BridgeError(502, "invalid_upstream_shape", "OpenAI returned data outside the documented schema.");
+  if (error instanceof z.ZodError) return new BridgeError(502, "invalid_upstream_shape", "The provider returned data outside the documented schema.");
   return new BridgeError(500, "internal_error", `Codex2CC failed while translating the request: ${error.message}`);
 }
 
@@ -496,11 +587,9 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
     maxBodyBytes: gatewayOptions.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
     keepAliveMs: gatewayOptions.keepAliveMs ?? DEFAULT_KEEP_ALIVE_MS,
     currentTiers: () => activeTierModels(gatewayOptions),
-    activeProvider: () => gatewayOptions.provider ?? "codex",
+    activeProvider: () => currentProvider(gatewayOptions),
     modelSlugs: () => {
-      const isAnt = (gatewayOptions.provider ?? "codex") === "antigravity";
-      const models = isAnt ? (gatewayOptions.antigravityModels ?? ANTIGRAVITY_MODELS) : gatewayOptions.availableModels;
-      return new Set(models.map((model) => model.slug));
+      return new Set(providerModels(gatewayOptions, currentProvider(gatewayOptions)).map((model) => model.slug));
     },
     warnedModels: new Set<string>(),
   };
@@ -570,12 +659,9 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
     }
     if (request.method === "GET" && path === "/v1/models") {
       const currentProvider = options.activeProvider();
-      const isAnt = currentProvider === "antigravity";
-      const availableModels = isAnt ? (options.antigravityModels ?? ANTIGRAVITY_MODELS) : options.availableModels;
+      const availableModels = providerModels(options, currentProvider);
       const modelSlugs = new Set(availableModels.map((model) => model.slug));
-      const defaultModel = isAnt
-        ? (options.defaultModel && modelSlugs.has(options.defaultModel) ? options.defaultModel : ANTIGRAVITY_DEFAULT_MODEL)
-        : options.defaultModel;
+      const defaultModel = providerDefaultModel(options, currentProvider);
 
       recordLog({
         level: "info",
@@ -583,7 +669,7 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
         message: `Client queried models catalog for provider "${currentProvider}" (${CLAUDE_GATEWAY_MODELS.length} models returned)`,
       });
       const tiers = options.currentTiers();
-      const providerLabel = isAnt ? "Google Antigravity" : "ChatGPT";
+      const providerLabel = PROVIDER_LABELS[currentProvider];
       const list = CLAUDE_GATEWAY_MODELS.map((model) => {
         const resolution = resolveModel(model.id, defaultModel, modelSlugs, tiers);
         const targetModel = availableModels.find((available) => available.slug === resolution.slug);

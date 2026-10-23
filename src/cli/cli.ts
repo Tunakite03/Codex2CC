@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
 import { BridgeError } from "../bridge/bridge.js";
 import { MIN_TOKEN_LENGTH, type GuardPolicy } from "../gateway/guard.js";
-import type { ProviderType } from "../models/models.js";
+import { PROVIDERS, isProviderType, type ProviderType } from "../models/models.js";
 
 export const DEFAULT_PORT = 3456;
 
@@ -18,6 +18,7 @@ export type CliCommand =
       readonly token: string | undefined;
       readonly model: string | undefined;
       readonly effort: string | undefined;
+      readonly provider?: ProviderType | undefined;
     }
   | {
       readonly kind: "reset-config";
@@ -28,7 +29,7 @@ export type CliCommand =
 
 export const USAGE = `Usage: codex2cc [options] [-- <claude arguments>]
 
-Run Claude Code on your ChatGPT (Codex) login, or serve a local Anthropic-compatible gateway.
+Run Claude Code through a subscription or API provider, or serve a local Anthropic-compatible gateway.
 
 Modes (default: launch Claude Code):
   --ui                      Launch the Web UI control panel in your default browser
@@ -41,17 +42,17 @@ Modes (default: launch Claude Code):
   --reset-desktop           Reset Claude Desktop configuration
   --sync-desktop-sessions   Copy missing Code-tab sessions between the Desktop claude.ai and
                             gateway profiles (Claude Desktop must be closed)
-  --list-models             Print the models available to your ChatGPT account
+  --list-models             Print the selected provider catalog (API providers: configured models, offline)
   -h, --help                Show this help
 
 Options:
-  --model <slug>            Model to use (default: first model of your account)
+  --model <slug>            Model to use from the selected provider catalog
   --effort <level>          Reasoning effort level: low, medium, high, xhigh, max
   --port <n>                Standalone gateway port, 0-65535 (default: ${DEFAULT_PORT})
   --no-auth                 Standalone gateway without a token (not recommended)
   --gateway-url, --url <u>  Base URL for setup (default: http://127.0.0.1:${DEFAULT_PORT})
-  --token <secret>          API key/token for setup (or CODEX2CC_TOKEN)
-  --provider <name>         Backend provider: codex (ChatGPT) or antigravity (Google agy)
+  --token <secret>          Gateway token for client setup (or CODEX2CC_TOKEN)
+  --provider <name>         Backend: codex, antigravity, openrouter, openai, opencode
   --dry-run                 With --sync-desktop-sessions: show what would be copied, change nothing
   -p, --print <prompt>      Run Claude Code non-interactively
   -c, --continue            Continue the previous Claude Code session
@@ -60,7 +61,15 @@ Options:
                             Pass --dangerously-skip-permissions to Claude Code
 
 Arguments after "--" are passed to Claude Code unchanged.
-Environment: CODEX2CC_PROVIDER, CODEX2CC_TOKEN, CODEX2CC_MODEL_FABLE/OPUS/SONNET/HAIKU, CODEX2CC_TIERS_FILE.
+Provider precedence: --provider > CODEX2CC_PROVIDER > saved settings > codex.
+Environment: CODEX2CC_PROVIDER, CODEX2CC_TOKEN, CODEX2CC_MODEL_FABLE/OPUS/SONNET/HAIKU.
+API keys: OPENROUTER_API_KEY, OPENAI_API_KEY, OPENCODE_API_KEY (environment only).
+Use --ui to configure endpoint URLs, the API key environment variable name, default model,
+and model catalog. Supported adapter protocols: chat-completions, responses, anthropic-messages.
+Settings: CODEX2CC_SETTINGS_FILE (legacy alias: CODEX2CC_TIERS_FILE), otherwise
+<data dir>/logs/settings.json. Data dir: CODEX2CC_HOME, otherwise the source checkout
+or ~/.codex2cc for an installed package. API key values are never saved in settings.
+--ui and --serve can start without an API key; launching Claude Code requires the selected key.
 `;
 
 const OPTIONS = {
@@ -121,12 +130,15 @@ export function parseCli(argv: readonly string[]): CliCommand {
   const claudeArgs = separator < 0 ? [] : argv.slice(separator + 1);
   const model = values.model || undefined;
 
-  const rawProvider = typeof values.provider === "string" ? values.provider.trim().toLowerCase() : undefined;
-  if (rawProvider !== undefined && rawProvider !== "codex" && rawProvider !== "antigravity") {
-    throw new BridgeError(400, "invalid_arguments", `--provider must be "codex" or "antigravity", got "${values.provider}".`);
-  }
+  const rawProvider = values.provider?.trim().toLowerCase();
   const envProvider = process.env.CODEX2CC_PROVIDER?.trim().toLowerCase();
-  const provider = (rawProvider ?? (envProvider === "antigravity" || envProvider === "codex" ? envProvider : undefined)) as ProviderType | undefined;
+  for (const [source, value] of [["--provider", rawProvider], ["CODEX2CC_PROVIDER", envProvider]] as const) {
+    if (value !== undefined && !isProviderType(value)) {
+      throw new BridgeError(400, "invalid_arguments", `${source} must be one of: ${PROVIDERS.join(", ")}.`);
+    }
+  }
+  const chosenProvider = rawProvider ?? envProvider;
+  const provider = chosenProvider !== undefined && isProviderType(chosenProvider) ? chosenProvider : undefined;
 
   if (values.help) return { kind: "help" };
   if (values.ui) return { kind: "ui", model, port: parsePort(values.port), ...(provider !== undefined ? { provider } : {}) };
@@ -147,7 +159,7 @@ export function parseCli(argv: readonly string[]): CliCommand {
     const gatewayUrl = values["gateway-url"] || values.url || `http://127.0.0.1:${port}`;
     const token = values.token?.trim() || undefined;
     const effort = values.effort?.trim() || undefined;
-    return { kind: "setup", target, gatewayUrl, token, model, effort };
+    return { kind: "setup", target, gatewayUrl, token, model, effort, ...(provider !== undefined ? { provider } : {}) };
   }
 
   if (values.serve) return { kind: "serve", model, port: parsePort(values.port), noAuth: values["no-auth"] === true, ...(provider !== undefined ? { provider } : {}) };

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { ServerResponse } from "node:http";
 import { z } from "zod";
-import { BridgeError, estimateInputTokens, type MessageRequest } from "./bridge.js";
+import { BridgeError, estimateTextTokens, type MessageRequest } from "./bridge.js";
 import { recordLog } from "../telemetry/logger.js";
 import { recordTokenUsage } from "../telemetry/usage.js";
 
@@ -450,10 +450,6 @@ export type AntigravityHandlerOptions = {
 
 type UsageTotals = { inputTokens: number; outputTokens: number; cachedTokens: number; reported: boolean };
 
-function estimateTextTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
-
 function newMessageId(): string {
   return `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
 }
@@ -550,7 +546,8 @@ export async function handleAntigravityMessage(
   });
 
   const msgId = newMessageId();
-  const estimatedInput = estimateInputTokens(inbound);
+  // Count the gateway-authored prompt, including protocol text; agy's hidden context remains unknown.
+  const estimatedInput = estimateTextTokens(prompt);
   const usage: UsageTotals = { inputTokens: estimatedInput, outputTokens: 0, cachedTokens: 0, reported: false };
   let text = "";
   let resultResponse = "";

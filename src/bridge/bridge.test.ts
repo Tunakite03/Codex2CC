@@ -6,7 +6,8 @@ import {
   BridgeError,
   decodeReasoningSignature,
   encodeReasoningSignature,
-  estimateInputTokens,
+  estimateCodexInputTokens,
+  estimateTextTokens,
   MessageAccumulator,
   MessageRequest,
   readSse,
@@ -308,20 +309,84 @@ test("url image sources pass through and tools without input_schema are dropped"
   assert.deepEqual(unsupportedToolNames(request), ["web_search"]);
 });
 
-test("estimateInputTokens approximates four characters per token plus a fixed cost per image", () => {
-  const text = MessageRequest.parse({ model: "m", system: "abcd", messages: [{ role: "user", content: "abcdefgh" }] });
-  assert.equal(estimateInputTokens(text), 3);
-  const withImage = MessageRequest.parse({
+test("estimateTextTokens keeps empty and ASCII estimates deterministic", () => {
+  assert.equal(estimateTextTokens(""), 0);
+  assert.equal(estimateTextTokens("abcd"), 1);
+  assert.equal(estimateTextTokens("abcde"), 2);
+  assert.equal(estimateTextTokens("const x = 1;"), 3);
+});
+
+test("estimateTextTokens weights Unicode by UTF-8 bytes rather than UTF-16 length", () => {
+  assert.equal(estimateTextTokens("é"), 1);
+  assert.equal(estimateTextTokens("漢字"), 3);
+  assert.equal(estimateTextTokens("😀"), 2);
+  assert.equal(estimateTextTokens("a😀"), 3);
+  assert.equal(estimateTextTokens("Tiếng Việt"), 5);
+  assert.equal(estimateTextTokens("漢字😀".repeat(100_000)), 500_000);
+});
+
+test("estimateCodexInputTokens counts converted text and framing without transport fields", () => {
+  const request = MessageRequest.parse({ model: "m", system: "abcd", messages: [{ role: "user", content: "abcdefgh" }] });
+  const outgoing = toOpenAIRequest(request, "gpt-model");
+  assert.equal(estimateCodexInputTokens(outgoing), 11);
+  assert.equal(estimateCodexInputTokens({ ...outgoing, prompt_cache_key: "x".repeat(1000), reasoning: { effort: "max" } }), 11);
+});
+
+test("estimateCodexInputTokens counts image allowances instead of base64 text, including tool results", () => {
+  for (const size of [4, 50_000]) {
+    const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "x".repeat(size) } };
+    const request = MessageRequest.parse({
+      model: "m",
+      messages: [
+        { role: "user", content: [image] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call", content: [image] }] },
+      ],
+    });
+    assert.equal(estimateCodexInputTokens(toOpenAIRequest(request, "gpt-model")), 3_009);
+  }
+});
+
+test("estimateCodexInputTokens excludes dropped schemas and counts omission notes, not original documents", () => {
+  const base = MessageRequest.parse({
     model: "m",
-    messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "x".repeat(50_000) } }] }],
+    messages: [{ role: "user", content: [{ type: "document", source: { data: "abcd" } }] }],
   });
-  assert.equal(estimateInputTokens(withImage), 1_500);
-  const withTool = MessageRequest.parse({
+  const expanded = MessageRequest.parse({
+    ...base,
+    tools: [{ name: "web_search", description: "x".repeat(50_000) }],
+    messages: [{ role: "user", content: [{ type: "document", source: { data: "x".repeat(50_000) } }] }],
+  });
+  const count = estimateCodexInputTokens(toOpenAIRequest(base, "gpt-model"));
+  assert.equal(count, 4 + estimateTextTokens('[Unsupported content block "document" omitted by Codex2CC]'));
+  assert.equal(estimateCodexInputTokens(toOpenAIRequest(expanded, "gpt-model")), count);
+});
+
+test("estimateCodexInputTokens counts tool schemas, call IDs, arguments and error wrappers", () => {
+  const request = MessageRequest.parse({
     model: "m",
     tools: [{ name: "Read", description: "abcd", input_schema: { type: "object" } }],
-    messages: [{ role: "assistant", content: [{ type: "tool_use", id: "c", name: "Read", input: { a: 1 } }] }],
+    tool_choice: { type: "none" },
+    messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "call", name: "Read", input: "abcd" }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call", content: "fail", is_error: true }] },
+    ],
   });
-  assert.equal(estimateInputTokens(withTool), Math.ceil((4 + 4 + 17 + 4 + 7) / 4));
+  const tool = 8 + 1 + 1 + estimateTextTokens('{"type":"object"}');
+  const call = 4 + 1 + 1 + 1;
+  const result = 4 + 1 + estimateTextTokens("Tool error: fail");
+  assert.equal(estimateCodexInputTokens(toOpenAIRequest(request, "gpt-model")), tool + call + result);
+});
+
+test("estimateCodexInputTokens respects resolved-model reasoning and never tokenizes ciphertext", () => {
+  const request = MessageRequest.parse({
+    model: "claude-sonnet",
+    messages: [
+      { role: "assistant", content: [{ type: "thinking", thinking: "abcd", signature: encodeReasoningSignature("gpt-model", "x".repeat(50_000)) }] },
+      { role: "user", content: "abcd" },
+    ],
+  });
+  assert.equal(estimateCodexInputTokens(toOpenAIRequest(request, "gpt-model")), 10);
+  assert.equal(estimateCodexInputTokens(toOpenAIRequest(request, "other-model")), 5);
 });
 
 test("AnthropicStream reports usage from the completed event and the estimate at message_start", async () => {

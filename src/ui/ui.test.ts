@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import test from "node:test";
 import { CODEX2CC_DESKTOP_CONFIG_ID, resolveDefaultPaths } from "../config/config-setup.js";
-import type { GatewayOptions } from "../gateway/gateway.js";
-import { DEFAULT_TIER_MODELS, ANTIGRAVITY_TIER_MODELS, type TierModels } from "../models/models.js";
+import { createGatewayServer, listenOnLoopback, type GatewayOptions } from "../gateway/gateway.js";
+import { BridgeError } from "../bridge/bridge.js";
+import { API_PROVIDERS, defaultApiProviderConfig, type ApiProviderConfig } from "../providers/config.js";
+import { DEFAULT_TIER_MODELS, ANTIGRAVITY_TIER_MODELS, PROVIDERS, type TierModels } from "../models/models.js";
 import { TierModelStore } from "../models/tier-store.js";
 import { clearLogs, recordLog } from "../telemetry/logger.js";
 import { recordTokenUsage } from "../telemetry/usage.js";
@@ -637,4 +639,187 @@ test("a Desktop reset reports the session-list sync it ran, separately from the 
     else process.env.HOME = previousHome;
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+
+type ApiStatus = StatusResponse & {
+  provider: { active: string; config?: ApiProviderConfig; keyConfigured?: boolean; available: { id: string; config?: ApiProviderConfig; keyConfigured?: boolean }[] };
+};
+
+test("API provider buttons stage selection and settings never request a secret", () => {
+  const html = renderDashboardHtml();
+  for (const provider of API_PROVIDERS) {
+    assert.ok(html.includes(`id="btn-provider-${provider}"`));
+    assert.ok(html.includes(`addEventListener("click", () => selectProvider("${provider}"))`));
+  }
+  for (const id of ["api-key-env", "api-default-model", "api-model-catalog", "api-endpoint-responses", "api-endpoint-chat-completions", "api-endpoint-anthropic-messages"]) assert.ok(html.includes(`id="${id}"`));
+  const panel = html.slice(html.indexOf('<section id="api-provider-settings"'), html.indexOf('<!-- Gateway Credentials Bar -->'));
+  assert.ok(!panel.includes('type="password"'));
+  assert.ok(!panel.includes('id="api-key"'));
+  assert.ok(html.includes('document.getElementById("card-quota-5h").hidden = isApi'));
+});
+
+test("API settings, key indicators and every provider mapping survive independent switches", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex2cc-api-settings-"));
+  const file = join(directory, "settings.json");
+  const store = TierModelStore.open(file, {});
+  const secret = "test-runtime-secret-never-serialize";
+  const options: GatewayOptions = { ...mockOptions, tierStore: store, providerEnv: { OPENROUTER_API_KEY: secret } };
+  const saved = new Map<string, TierModels>();
+  try {
+    for (const provider of PROVIDERS) {
+      if (API_PROVIDERS.some((candidate) => candidate === provider)) {
+        const apiProvider = API_PROVIDERS.find((candidate) => candidate === provider)!;
+        const config = defaultApiProviderConfig(apiProvider);
+        const response = createMockResponse();
+        await handleUiRoute(options, createMockRequest("POST", "/api/ui/provider-config", { provider, config: { ...config, apiKey: secret, ignored: true } }), response.response, "/api/ui/provider-config", 3456);
+        assert.equal(response.getOutput().statusCode, 200);
+        assert.deepEqual(JSON.parse(response.getOutput().body).config, config);
+        assert.ok(!response.getOutput().body.includes(secret));
+      }
+      const switched = createMockResponse();
+      await handleUiRoute(options, createMockRequest("POST", "/api/ui/provider", { provider }), switched.response, "/api/ui/provider", 3456);
+      assert.equal(switched.getOutput().statusCode, 200);
+      const status = getStatus(options, 3456) as ApiStatus;
+      assert.equal(status.provider.active, provider);
+      const model = status.tierMapping.models[0]!.slug;
+      const tiers = { fable: model, opus: model, sonnet: model, haiku: model };
+      const mapped = createMockResponse();
+      await handleUiRoute(options, createMockRequest("POST", "/api/ui/tiers", { tiers }), mapped.response, "/api/ui/tiers", 3456);
+      assert.equal(mapped.getOutput().statusCode, 200);
+      saved.set(provider, tiers);
+      if (status.provider.config) assert.equal(status.provider.keyConfigured, provider === "openrouter");
+      assert.ok(!JSON.stringify(status).includes(secret));
+    }
+    const disk = readFileSync(file, "utf8");
+    assert.ok(!disk.includes(secret));
+    assert.ok(!disk.includes('"apiKey"'));
+    const reloaded = TierModelStore.open(file, {});
+    for (const provider of PROVIDERS) assert.deepEqual(reloaded.current(provider), saved.get(provider));
+    const restarted = getStatus({ ...mockOptions, tierStore: reloaded, providerEnv: {} }, 3456) as ApiStatus;
+    assert.equal(restarted.provider.active, "opencode");
+    assert.equal(restarted.provider.keyConfigured, false);
+    assert.deepEqual(restarted.tierMapping.current, saved.get("opencode"));
+    await handleUiRoute(options, createMockRequest("POST", "/api/ui/provider", { provider: "codex" }), createMockResponse().response, "/api/ui/provider", 3456);
+    const codex = getStatus(options, 3456) as ApiStatus;
+    assert.deepEqual(codex.tierMapping.models, mockOptions.availableModels);
+    assert.deepEqual(codex.tierMapping.current, saved.get("codex"));
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("API settings reject invalid providers and catalogs without changing the store", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex2cc-invalid-api-"));
+  const store = TierModelStore.open(join(directory, "settings.json"), {});
+  const options: GatewayOptions = { ...mockOptions, tierStore: store, providerEnv: {} };
+  const config = defaultApiProviderConfig("openai");
+  try {
+    for (const provider of ["codex", "antigravity", "unknown", null]) {
+      await assert.rejects(handleUiRoute(options, createMockRequest("POST", "/api/ui/provider-config", { provider, config }), createMockResponse().response, "/api/ui/provider-config", 3456), (error: unknown) => error instanceof BridgeError && error.code === "invalid_provider");
+    }
+    for (const invalid of [{ ...config, apiKeyEnv: "a-secret-value" }, { ...config, models: [] }, { ...config, defaultModel: "missing" }, { ...config, endpoints: { responses: "https://api.example.com/responses?key=secret" } }]) {
+      await assert.rejects(handleUiRoute(options, createMockRequest("POST", "/api/ui/provider-config", { provider: "openai", config: invalid }), createMockResponse().response, "/api/ui/provider-config", 3456), (error: unknown) => error instanceof BridgeError && error.code === "invalid_provider_config");
+      assert.deepEqual(store.getApiProviderConfig("openai"), config);
+    }
+    await assert.rejects(handleUiRoute(options, createMockRequest("POST", "/api/ui/provider", { provider: "invalid" }), createMockResponse().response, "/api/ui/provider", 3456), (error: unknown) => error instanceof BridgeError && error.code === "invalid_provider");
+    assert.equal(store.getProvider(), "codex");
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("failed provider persistence leaves the active provider and API config unchanged", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex2cc-provider-failure-"));
+  const file = join(directory, "settings.json");
+  const store = TierModelStore.open(file, {});
+  const options: GatewayOptions = { ...mockOptions, tierStore: store, provider: "codex" };
+  const config = defaultApiProviderConfig("openai");
+  mkdirSync(`${file}.tmp`);
+  try {
+    await assert.rejects(handleUiRoute(options, createMockRequest("POST", "/api/ui/provider", { provider: "openai" }), createMockResponse().response, "/api/ui/provider", 3456));
+    assert.equal(options.provider, "codex");
+    assert.equal(store.getProvider(), "codex");
+    await assert.rejects(handleUiRoute(options, createMockRequest("POST", "/api/ui/provider-config", { provider: "openai", config: { ...config, apiKeyEnv: "CUSTOM_API_KEY" } }), createMockResponse().response, "/api/ui/provider-config", 3456));
+    assert.deepEqual(store.getApiProviderConfig("openai"), config);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("API usage never queries ChatGPT subscription limits", async () => {
+  for (const provider of API_PROVIDERS) {
+    const options: GatewayOptions = { ...mockOptions, provider, providerEnv: {}, session: { ...mockOptions.session, async getUsageLimits() { assert.fail("API providers must not request ChatGPT quotas"); } } };
+    const response = createMockResponse();
+    await handleUiRoute(options, createMockRequest("GET", "/api/ui/usage?refresh=true"), response.response, "/api/ui/usage", 3456);
+    const body = JSON.parse(response.getOutput().body);
+    assert.equal(body.provider, provider);
+    assert.equal(body.limits, null);
+  }
+});
+
+
+test("provider configuration HTTP route keeps host and origin guards and sanitizes secrets", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex2cc-api-http-"));
+  const store = TierModelStore.open(join(directory, "settings.json"), {});
+  const server = createGatewayServer({ ...mockOptions, tierStore: store, providerEnv: { OPENAI_API_KEY: "runtime-only-secret" } });
+  const port = await listenOnLoopback(server, 0);
+  const origin = `http://127.0.0.1:${port}`;
+  const config = defaultApiProviderConfig("openai");
+  try {
+    const denied = await fetch(`${origin}/api/ui/provider-config`, { method: "POST", headers: { "Content-Type": "application/json", Origin: "https://attacker.example" }, body: JSON.stringify({ provider: "openai", config }) });
+    assert.equal(denied.status, 403);
+    await denied.text();
+    // Fetch normalizes Host; use the HTTP client to send an actual hostile Host header.
+    const badHost = await new Promise<number | undefined>((resolve, reject) => {
+      const request = httpRequest(`${origin}/api/ui/status`, { headers: { Host: "attacker.example" } }, (response) => {
+        response.resume();
+        response.once("end", () => resolve(response.statusCode));
+      });
+      request.once("error", reject);
+      request.end();
+    });
+    assert.equal(badHost, 403);
+    const saved = await fetch(`${origin}/api/ui/provider-config`, { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify({ provider: "openai", config: { ...config, apiKey: "submitted-secret" } }) });
+    assert.equal(saved.status, 200);
+    const body = await saved.json() as { config: ApiProviderConfig; keyConfigured: boolean };
+    assert.deepEqual(body.config, config);
+    assert.equal(body.keyConfigured, true);
+    const statusResponse = await fetch(`${origin}/api/ui/status`);
+    const status = await statusResponse.text();
+    assert.ok(!status.includes("runtime-only-secret"));
+    assert.ok(!status.includes("submitted-secret"));
+    const invalid = await fetch(`${origin}/api/ui/provider-config`, { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify({ provider: "openai", config: { ...config, models: [] } }) });
+    assert.equal(invalid.status, 400);
+    await invalid.text();
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy settings keep Codex mappings when API providers are configured", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex2cc-legacy-ui-"));
+  const file = join(directory, "settings.json");
+  const tiers = { fable: "gpt-6-sol", opus: "gpt-6.1-sol", sonnet: "gpt-6-sol", haiku: "gpt-6-sol" };
+  writeFileSync(file, JSON.stringify({ version: 1, tiers }));
+  try {
+    const store = TierModelStore.open(file, {});
+    const options: GatewayOptions = { ...mockOptions, tierStore: store, providerEnv: {} };
+    assert.deepEqual((getStatus(options, 3456) as StatusResponse).tierMapping.current, tiers);
+    await handleUiRoute(options, createMockRequest("POST", "/api/ui/provider-config", { provider: "openai", config: defaultApiProviderConfig("openai") }), createMockResponse().response, "/api/ui/provider-config", 3456);
+    const reloaded = TierModelStore.open(file, {});
+    assert.deepEqual(reloaded.current("codex"), tiers);
+    assert.equal(reloaded.getProvider(), "codex");
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("API setup uses its catalog and does not carry another provider's model override", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex2cc-api-model-default-"));
+  const store = TierModelStore.open(join(directory, "settings.json"), {});
+  const config = defaultApiProviderConfig("opencode");
+  store.saveApiProviderConfig("opencode", { ...config, defaultModel: "kimi-k3" });
+  const options: GatewayOptions = { ...mockOptions, tierStore: store, provider: "opencode", providerEnv: {}, defaultModels: { openai: "gpt-5.5" } };
+  try {
+    const response = createMockResponse();
+    await handleUiRoute(options, createMockRequest("POST", "/api/ui/setup", { target: "cli" }), response.response, "/api/ui/setup", 3456);
+    assert.equal(response.getOutput().statusCode, 200);
+    assert.equal(JSON.parse(response.getOutput().body).result.model, "kimi-k3");
+    const settings = JSON.parse(readFileSync(resolveDefaultPaths().claudeSettingsPath, "utf8")) as { env: Record<string, string> };
+    assert.equal(settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL, "kimi-k3");
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });

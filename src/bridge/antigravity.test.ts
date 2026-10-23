@@ -14,7 +14,7 @@ import {
   type AntigravityRunner,
   type AntigravityStreamEvent,
 } from "./antigravity.js";
-import { BridgeError, type MessageRequest } from "./bridge.js";
+import { BridgeError, estimateTextTokens, type MessageRequest } from "./bridge.js";
 import { resetTokenUsage, getTokenUsageStats } from "../telemetry/usage.js";
 
 function createMockResponse(): { response: ServerResponse; getOutput: () => string; getStatus: () => number } {
@@ -157,6 +157,31 @@ test("handleAntigravityMessage keeps MCP tool schemas out of the prompt sent to 
   assert.equal(getStatus(), 200);
   assert.match(promptSeen, /- Read: Read a file/);
   assert.doesNotMatch(promptSeen, /mcp__supabase__execute_sql/);
+});
+
+test("handleAntigravityMessage estimates the runner prompt when upstream usage is absent", async () => {
+  let promptSeen = "";
+  const runner: AntigravityRunner = async (options, onEvent) => {
+    promptSeen = options.prompt;
+    onEvent({ event: "result", result: { status: "success", response: "Done." } });
+  };
+  const request: MessageRequest = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 4096,
+    stream: false,
+    messages: [{ role: "user", content: "Review tiếng Việt and 漢字" }],
+    tools: [
+      { name: "Read", description: "Read a file", input_schema: { type: "object" } },
+      { name: "mcp__large__tool", description: "x".repeat(50_000), input_schema: { type: "object" } },
+    ],
+  };
+  const { response, getOutput } = createMockResponse();
+  await handleAntigravityMessage({ model: request.model, runner }, request, response, new AbortController().signal);
+  const message = JSON.parse(getOutput()) as { usage: { input_tokens: number; output_tokens: number } };
+  assert.equal(message.usage.input_tokens, estimateTextTokens(promptSeen));
+  assert.equal(message.usage.output_tokens, estimateTextTokens("Done."));
+  assert.match(promptSeen, /Tool Use Protocol/);
+  assert.doesNotMatch(promptSeen, /mcp__large__tool/);
 });
 
 test("handleAntigravityMessage streams SSE events and tracks tokens", async () => {
