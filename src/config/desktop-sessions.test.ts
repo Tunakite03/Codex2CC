@@ -15,6 +15,7 @@ import {
   DRY_RUN_TENSE,
   planDesktopSessionSync,
   requireDesktopClosed,
+  resolveDesktopSessionPaths,
   runDesktopSessionSync,
   syncDesktopSessionsWhenClosed,
   TO_GATEWAY_PROFILE,
@@ -22,6 +23,14 @@ import {
 } from "./desktop-sessions.js";
 
 const NOW = new Date("2026-10-23T10:00:00.000Z");
+
+test("Windows session sync uses the LocalAppData gateway profile and the Roaming Claude profile", () => {
+  const paths = resolveDesktopSessionPaths({ APPDATA: "roaming", LOCALAPPDATA: "local" }, "win32");
+  assert.deepEqual(paths.profiles, {
+    claude: join("roaming", "Claude"),
+    thirdParty: join("local", "Claude-3p"),
+  });
+});
 
 type Sandbox = { readonly paths: DesktopSessionPaths; readonly cleanup: () => void };
 

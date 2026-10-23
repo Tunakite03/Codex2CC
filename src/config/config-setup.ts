@@ -78,12 +78,15 @@ export function resolveDefaultPaths(platformName: string = platform()): Resolved
   }
 
   if (platformName === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || join(home, "AppData", "Local");
     const appData = process.env.APPDATA || join(home, "AppData", "Roaming");
     return {
       claudeSettingsPath,
       claudeJsonPath,
-      claudeDesktopDir: join(appData, "Claude-3p", "configLibrary"),
+      claudeDesktopDir: join(localAppData, "Claude-3p", "configLibrary"),
       claudeDeveloperSettingsPaths: [
+        join(localAppData, "Claude", "developer_settings.json"),
+        join(localAppData, "Claude-3p", "developer_settings.json"),
         join(appData, "Claude", "developer_settings.json"),
         join(appData, "Claude-3p", "developer_settings.json"),
       ],
@@ -167,6 +170,22 @@ export function configuredGatewayToken(gatewayUrl: string, pathsInput?: SetupPat
     const token = desktop.inferenceGatewayApiKey;
     if (desktop.inferenceGatewayBaseUrl === gatewayUrl && token.length >= MIN_TOKEN_LENGTH) {
       return token;
+    }
+  }
+
+  if (pathsInput?.claudeDesktopDir === undefined && platform() === "win32") {
+    const roamingDir = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "Claude-3p", "configLibrary");
+    if (roamingDir.toLowerCase() !== paths.claudeDesktopDir.toLowerCase()) {
+      const meta = readSavedGatewayConfig(join(roamingDir, "_meta.json"), z.object({ appliedId: z.string() }));
+      if (meta?.appliedId === CODEX2CC_DESKTOP_CONFIG_ID) {
+        const desktop = readSavedGatewayConfig(
+          join(roamingDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`),
+          z.object({ inferenceGatewayBaseUrl: z.string(), inferenceGatewayApiKey: z.string() }),
+        );
+        if (desktop && desktop.inferenceGatewayBaseUrl === gatewayUrl && desktop.inferenceGatewayApiKey.length >= MIN_TOKEN_LENGTH) {
+          return desktop.inferenceGatewayApiKey;
+        }
+      }
     }
   }
 
@@ -367,6 +386,19 @@ export function setupClaudeDesktop(options: SetupOptions): readonly string[] {
     entries,
   });
   modified.push(metaFile);
+  modified.push(...setDesktopDeploymentMode(paths.claudeDesktopDir, "3p"));
+
+  if (options.paths?.claudeDesktopDir === undefined && platform() === "win32") {
+    const roamingDir = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "Claude-3p", "configLibrary");
+    if (roamingDir.toLowerCase() !== paths.claudeDesktopDir.toLowerCase()) {
+      const roamingConfigFile = join(roamingDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+      const roamingMetaFile = join(roamingDir, "_meta.json");
+      writeJson(roamingConfigFile, desktopConfig);
+      writeJson(roamingMetaFile, { appliedId: CODEX2CC_DESKTOP_CONFIG_ID, entries });
+      modified.push(roamingConfigFile, roamingMetaFile);
+      modified.push(...setDesktopDeploymentMode(roamingDir, "3p"));
+    }
+  }
 
   const devSettingsBody = { allowDevTools: true };
   for (const devPath of paths.claudeDeveloperSettingsPaths) {
@@ -399,6 +431,19 @@ export function refreshDesktopModelLabels(tiers: TierModels, pathsInput?: SetupP
     throw new BridgeError(500, "missing_saved_gateway_config", "Applied Claude Desktop gateway configuration file is missing.");
   }
   writeJson(configFile, { ...config, inferenceModels: desktopInferenceModels(tiers) });
+
+  if (pathsInput?.claudeDesktopDir === undefined && platform() === "win32") {
+    const roamingDir = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "Claude-3p", "configLibrary");
+    if (roamingDir.toLowerCase() !== paths.claudeDesktopDir.toLowerCase()) {
+      const roamingConfigFile = join(roamingDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+      if (existsSync(roamingConfigFile)) {
+        try {
+          writeJson(roamingConfigFile, { ...config, inferenceModels: desktopInferenceModels(tiers) });
+        } catch {}
+      }
+    }
+  }
+
   return [configFile];
 }
 
@@ -456,6 +501,14 @@ export function resetClaudeCodeCli(pathsInput?: SetupPaths | undefined): readonl
   return modified;
 }
 
+function setDesktopDeploymentMode(libraryDir: string, mode: "1p" | "3p"): readonly string[] {
+  const configFile = join(dirname(libraryDir), "claude_desktop_config.json");
+  const config = readSavedGatewayConfig(configFile, z.looseObject({ deploymentMode: z.enum(["1p", "3p"]).optional() }));
+  if (config?.deploymentMode === mode || (config === undefined && mode === "1p")) return [];
+  writeJson(configFile, { ...config, deploymentMode: mode });
+  return [configFile];
+}
+
 export function resetClaudeDesktop(pathsInput?: SetupPaths | undefined): readonly string[] {
   const paths = resolvePaths(pathsInput);
   const modified: string[] = [];
@@ -475,7 +528,10 @@ export function resetClaudeDesktop(pathsInput?: SetupPaths | undefined): readonl
     const metaData = safeReadJson(metaFile);
     if (metaData !== null) {
       let appliedId = typeof metaData.appliedId === "string" ? metaData.appliedId : "";
-      if (appliedId === CODEX2CC_DESKTOP_CONFIG_ID) appliedId = "";
+      if (appliedId === CODEX2CC_DESKTOP_CONFIG_ID) {
+        modified.push(...setDesktopDeploymentMode(paths.claudeDesktopDir, "1p"));
+        appliedId = "";
+      }
 
       const rawEntries = Array.isArray(metaData.entries) ? metaData.entries : [];
       const entries = rawEntries.filter(
@@ -484,6 +540,36 @@ export function resetClaudeDesktop(pathsInput?: SetupPaths | undefined): readonl
 
       writeJson(metaFile, { appliedId, entries });
       modified.push(metaFile);
+    }
+  }
+
+  if (pathsInput?.claudeDesktopDir === undefined && platform() === "win32") {
+    const roamingDir = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "Claude-3p", "configLibrary");
+    if (roamingDir.toLowerCase() !== paths.claudeDesktopDir.toLowerCase()) {
+      const roamingConfigFile = join(roamingDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+      if (existsSync(roamingConfigFile)) {
+        try {
+          rmSync(roamingConfigFile);
+          modified.push(roamingConfigFile);
+        } catch {}
+      }
+      const roamingMetaFile = join(roamingDir, "_meta.json");
+      if (existsSync(roamingMetaFile)) {
+        const metaData = safeReadJson(roamingMetaFile);
+        if (metaData !== null) {
+          let appliedId = typeof metaData.appliedId === "string" ? metaData.appliedId : "";
+          if (appliedId === CODEX2CC_DESKTOP_CONFIG_ID) {
+            modified.push(...setDesktopDeploymentMode(roamingDir, "1p"));
+            appliedId = "";
+          }
+          const rawEntries = Array.isArray(metaData.entries) ? metaData.entries : [];
+          const entries = rawEntries.filter(
+            (entry) => typeof entry === "object" && entry !== null && "id" in entry && (entry as { id: unknown }).id !== CODEX2CC_DESKTOP_CONFIG_ID,
+          );
+          writeJson(roamingMetaFile, { appliedId, entries });
+          modified.push(roamingMetaFile);
+        }
+      }
     }
   }
 

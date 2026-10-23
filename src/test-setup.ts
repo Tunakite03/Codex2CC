@@ -17,3 +17,5 @@ process.env.CODEX2CC_HOME = sandbox;
 // rewrite the applied Desktop config, so they must never reach the developer's real one.
 process.env.HOME = sandbox;
 process.env.USERPROFILE = sandbox;
+process.env.APPDATA = join(sandbox, "AppData", "Roaming");
+process.env.LOCALAPPDATA = join(sandbox, "AppData", "Local");

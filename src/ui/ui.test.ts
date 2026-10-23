@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -299,6 +299,9 @@ test("saving the tier mapping relabels Claude Desktop's model picker with the ro
     await handleUiRoute(options, createMockRequest("POST", "/api/ui/tiers", { tiers }), unapplied.response, "/api/ui/tiers", 3456);
     assert.equal(JSON.parse(unapplied.getOutput().body).desktopLabelsUpdated, false, "Desktop not on the gateway is left alone");
 
+    const profileConfigFile = join(resolveDefaultPaths().claudeDesktopDir, "..", "claude_desktop_config.json");
+    mkdirSync(join(profileConfigFile, ".."), { recursive: true });
+    writeFileSync(profileConfigFile, JSON.stringify({ deploymentMode: "1p" }));
     const setup = createMockResponse();
     await handleUiRoute(
       options,
@@ -309,6 +312,11 @@ test("saving the tier mapping relabels Claude Desktop's model picker with the ro
     );
     assert.equal(setup.getOutput().statusCode, 200);
     assert.equal(desktopStatus().inSync, true);
+
+    const profileConfig = JSON.parse(readFileSync(profileConfigFile, "utf8")) as { deploymentMode: string };
+    writeFileSync(profileConfigFile, JSON.stringify({ ...profileConfig, deploymentMode: "1p" }));
+    assert.equal(desktopStatus().inSync, false, "account mode must not be reported as a ready gateway");
+    writeFileSync(profileConfigFile, JSON.stringify({ ...profileConfig, deploymentMode: "3p" }));
 
     const changed = { ...tiers, opus: "gpt-6-sol", sonnet: "gpt-6.1-sol" };
     const save = createMockResponse();
