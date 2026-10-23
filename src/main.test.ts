@@ -10,7 +10,7 @@ import { API_PROVIDERS, defaultApiProviderConfig } from "./providers/config.js";
 
 function startupEnvironment(home: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home, CODEX2CC_HOME: home, CODEX2CC_SETTINGS_FILE: join(home, "settings.json"), CODEX2CC_LOG_FILE: join(home, "gateway.log"), CODEX2CC_USAGE_FILE: join(home, "usage.json") };
-  for (const name of ["CODEX2CC_PROVIDER", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENCODE_API_KEY"]) delete env[name];
+  for (const name of ["CODEX2CC_PROVIDER", ...API_PROVIDERS.map((provider) => defaultApiProviderConfig(provider).apiKeyEnv)]) delete env[name];
   return env;
 }
 

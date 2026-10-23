@@ -1,14 +1,16 @@
 import { z } from "zod";
+import type { ApiProvider } from "../providers/config.js";
 import { BridgeError, MessageRequest, toOpenAIRequest, type EffortLevel, type OpenAIEvent, type OpenAIUsage } from "./bridge.js";
 
 const Json = z.json();
 type JsonValue = z.infer<typeof Json>;
 type JsonObject = { [key: string]: JsonValue };
 export type ChatReasoning = "none" | "openai" | "openrouter";
-export type ChatStreamScope = { provider: "openai" | "openrouter" | "opencode"; model: string };
+export type ChatStreamScope = { provider: ApiProvider; model: string };
 type TextPart = { type: "text"; text: string };
 type ImagePart = { type: "image_url"; image_url: { url: string } };
-type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } };
+const GoogleToolMetadata = z.object({ google: z.object({ thought_signature: z.string().min(1).optional() }).optional() });
+type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string }; extra_content?: z.infer<typeof GoogleToolMetadata> };
 export type ChatMessage =
   | { role: "system" | "developer" | "user"; content: string | Array<TextPart | ImagePart> }
   | { role: "assistant"; content: string | null; tool_calls?: ToolCall[]; reasoning_details?: ReasoningDetail[]; reasoning_content?: string }
@@ -16,7 +18,7 @@ export type ChatMessage =
 export type ChatCompletionsRequest = {
   model: string;
   stream: true;
-  stream_options: { include_usage: true };
+  stream_options?: { include_usage: true };
   provider?: { require_parameters: true };
   messages: ChatMessage[];
   tools?: Array<{ type: "function"; function: { name: string; description: string; parameters: JsonObject } }>;
@@ -25,6 +27,7 @@ export type ChatCompletionsRequest = {
   max_completion_tokens?: number;
   max_tokens?: number;
   reasoning_effort?: "low" | "medium" | "high";
+  thinking?: { type: "disabled" };
   reasoning?: { effort?: "low" | "medium" | "high" | "xhigh"; enabled?: boolean; exclude: false };
 };
 
@@ -128,13 +131,14 @@ const ReasoningDetailSchema = z.object({
 type ReasoningDetail = z.infer<typeof ReasoningDetailSchema>;
 const REASONING_PREFIX = "codex2cc.chat.reasoning.v1:";
 const ReasoningEnvelope = z.object({
-  provider: z.enum(["openrouter", "opencode"]), model: z.string().min(1),
+  provider: z.enum(["openrouter", "opencode", "deepseek", "gemini", "custom"]), model: z.string().min(1),
   details: z.array(ReasoningDetailSchema).nonempty().optional(), content: z.string().min(1).optional(),
-}).refine((state) => state.details !== undefined || state.content !== undefined);
-type ReplayedReasoning = { details: ReasoningDetail[]; content: string };
+  toolSignatures: z.array(z.object({ id: z.string().min(1), signature: z.string().min(1) })).nonempty().optional(),
+}).refine((state) => state.details !== undefined || state.content !== undefined || state.toolSignatures !== undefined);
+type ReplayedReasoning = { details: ReasoningDetail[]; content: string; toolSignatures: Map<string, string> };
 
 function replayReasoning(content: MessageRequest["messages"][number]["content"], scope: ChatStreamScope): ReplayedReasoning {
-  const result: ReplayedReasoning = { details: [], content: "" };
+  const result: ReplayedReasoning = { details: [], content: "", toolSignatures: new Map() };
   if (typeof content === "string" || scope.provider === "openai") return result;
   for (const block of content) {
     if (block.type !== "thinking" && block.type !== "redacted_thinking") continue;
@@ -151,8 +155,11 @@ function replayReasoning(content: MessageRequest["messages"][number]["content"],
       throw error;
     }
     if (envelope.model === scope.model && envelope.provider === scope.provider) {
+      if (scope.provider === "gemini" || scope.provider === "custom") {
+        for (const tool of envelope.toolSignatures ?? []) result.toolSignatures.set(tool.id, tool.signature);
+      }
       if (scope.provider === "openrouter") result.details.push(...envelope.details ?? []);
-      if (scope.provider === "opencode") result.content += envelope.content ?? "";
+      if (scope.provider === "opencode" || scope.provider === "deepseek" || scope.provider === "custom") result.content += envelope.content ?? "";
     }
   }
   return result;
@@ -183,6 +190,7 @@ export function toChatCompletionsRequest(request: MessageRequest, model: string,
       flushToolImages();
       const text: string[] = [];
       const calls: ToolCall[] = [];
+      const replay = replayReasoning(message.content, scope);
       for (const item of input) {
         if ("role" in item && item.role === "assistant") text.push(...item.content.map((part) => part.type === "refusal" ? part.refusal : part.text));
         else if ("type" in item && item.type === "function_call") {
@@ -192,10 +200,10 @@ export function toChatCompletionsRequest(request: MessageRequest, model: string,
             throw error;
           }
           if (!z.record(z.string(), Json).safeParse(argumentsValue).success) invalidRequest("invalid_tool_arguments", `Tool "${item.name}" history requires object arguments.`);
-          calls.push({ id: item.call_id, type: "function", function: { name: item.name, arguments: item.arguments } });
+          const signature = replay.toolSignatures.get(item.call_id);
+          calls.push({ id: item.call_id, type: "function", function: { name: item.name, arguments: item.arguments }, ...(signature ? { extra_content: { google: { thought_signature: signature } } } : {}) });
         }
       }
-      const replay = replayReasoning(message.content, scope);
       if (text.length || calls.length || replay.details.length || replay.content || typeof message.content === "string") {
         messages.push({ role: "assistant", content: text.length ? text.join("") : null, ...(calls.length ? { tool_calls: calls } : {}), ...(replay.details.length ? { reasoning_details: replay.details } : {}), ...(replay.content ? { reasoning_content: replay.content } : {}) });
       }
@@ -220,9 +228,9 @@ export function toChatCompletionsRequest(request: MessageRequest, model: string,
     }
   }
   flushToolImages();
-  const result: ChatCompletionsRequest = { model, stream: true, stream_options: { include_usage: true }, messages };
+  const result: ChatCompletionsRequest = { model, stream: true, messages, ...(scope.provider !== "mistral" ? { stream_options: { include_usage: true as const } } : {}) };
   if (scope.provider === "openrouter") result.provider = { require_parameters: true };
-  if (scope.provider === "openai") result.max_completion_tokens = source.max_tokens;
+  if (scope.provider === "openai" || scope.provider === "groq" || scope.provider === "xai") result.max_completion_tokens = source.max_tokens;
   else result.max_tokens = source.max_tokens;
   if (converted.tools) result.tools = converted.tools.map((tool) => ({ type: "function", function: { name: tool.name, description: tool.description, parameters: schemaObject(tool.parameters, tool.name) } }));
   const choice = converted.tool_choice;
@@ -233,6 +241,8 @@ export function toChatCompletionsRequest(request: MessageRequest, model: string,
     if (choice === "required" && !result.tools?.length) invalidRequest("invalid_tool_choice", "Required tool choice needs at least one function tool.");
     result.tool_choice = choice;
   }
+  // DeepSeek rejects forced tool selection while thinking is enabled.
+  if (scope.provider === "deepseek" && (source.thinking?.type === "disabled" || choice === "required" || typeof choice === "object")) result.thinking = { type: "disabled" };
   if (converted.parallel_tool_calls !== undefined) result.parallel_tool_calls = converted.parallel_tool_calls;
   const effort = source.output_config?.effort ?? source.reasoning_effort ?? defaultEffort;
   if (reasoning === "openai" && effort !== undefined) result.reasoning_effort = effort === "max" || effort === "xhigh" ? "high" : effort;
@@ -243,10 +253,15 @@ export function toChatCompletionsRequest(request: MessageRequest, model: string,
 }
 
 const UpstreamError = z.union([z.string(), z.object({ message: z.string(), code: z.union([z.string(), z.number()]).optional(), type: z.string().optional() })]);
-const CallFragment = z.object({ index: z.number().int().nonnegative().optional(), id: z.string().nullable().optional(), type: z.literal("function").optional(), function: z.object({ name: z.string().optional(), arguments: z.string().optional() }).optional() });
+const CallFragment = z.object({ extra_content: GoogleToolMetadata.optional(), index: z.number().int().nonnegative().optional(), id: z.string().nullable().optional(), type: z.literal("function").optional(), function: z.object({ name: z.string().optional(), arguments: z.string().optional() }).optional() });
+const TextChunk = z.object({ type: z.literal("text"), text: z.string() });
+const ContentChunk = z.discriminatedUnion("type", [
+  TextChunk,
+  z.object({ type: z.literal("thinking"), thinking: z.array(TextChunk) }),
+]);
 const Delta = z.object({
   role: z.literal("assistant").optional(),
-  content: z.string().nullable().optional(),
+  content: z.union([z.string(), z.array(ContentChunk)]).nullable().optional(),
   refusal: z.string().nullable().optional(),
   reasoning: z.string().nullable().optional(),
   reasoning_content: z.string().nullable().optional(),
@@ -296,6 +311,7 @@ export async function readChatCompletionsSse(body: ReadableStream<Uint8Array>, a
   const reader = body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const calls = new Map<number, CallState>();
+  const toolSignatures = new Map<number, string>();
   const details = new Map<string, ReasoningDetail>();
   let buffer = "";
   let id: string | undefined;
@@ -344,7 +360,7 @@ export async function readChatCompletionsSse(body: ReadableStream<Uint8Array>, a
     const choice = chunk.choices[0];
     if (!choice) return;
     if (choice.error !== undefined) upstreamError(choice.error);
-    if (choice.finish_reason === "error") streamError("upstream_error", choice.delta?.content ?? "Chat Completions ended with an error choice.");
+    if (choice.finish_reason === "error") streamError("upstream_error", typeof choice.delta?.content === "string" ? choice.delta.content : "Chat Completions ended with an error choice.");
     if (finish) {
       // OpenRouter's final usage chunk repeats the terminal choice with an empty delta.
       const emptyDelta = choice.delta === undefined || Object.values(choice.delta).every((value) => value == null || value === "" || (Array.isArray(value) && value.length === 0));
@@ -355,7 +371,9 @@ export async function readChatCompletionsSse(body: ReadableStream<Uint8Array>, a
     const delta = choice.delta ?? choice.message;
     const full = choice.message !== undefined;
     if (delta) {
-      const explicitReasoning = delta.reasoning_content ?? delta.reasoning;
+      const content = delta.content;
+      const chunkThinking = Array.isArray(content) ? content.filter((part) => part.type === "thinking").flatMap((part) => part.thinking.map((text) => text.text)).join("") : undefined;
+      const explicitReasoning = delta.reasoning_content ?? delta.reasoning ?? chunkThinking;
       if (delta.reasoning_content) reasoningContent = full ? delta.reasoning_content : reasoningContent + delta.reasoning_content;
       reasoningText = textDelta(explicitReasoning, reasoningText, full, "response.reasoning_summary_text.delta");
       if (delta.reasoning_details?.length) {
@@ -365,12 +383,18 @@ export async function readChatCompletionsSse(body: ReadableStream<Uint8Array>, a
           reasoningText = textDelta(summary, reasoningText, full, "response.reasoning_summary_text.delta");
         }
       }
-      outputText = textDelta(delta.content, outputText, full, "response.output_text.delta");
+      outputText = textDelta(Array.isArray(content) ? content.filter((part) => part.type === "text").map((part) => part.text).join("") : content, outputText, full, "response.output_text.delta");
       refusalText = textDelta(delta.refusal, refusalText, full, "response.refusal.delta");
       delta.tool_calls?.forEach((call, position) => {
         if (!full && call.index === undefined) streamError("invalid_upstream_event", "Streaming tool calls require an index.");
         const index = call.index ?? position;
         const prior = calls.get(index) ?? { id: "", name: "", arguments: "" };
+        const signature = call.extra_content?.google?.thought_signature;
+        if (signature && (scope.provider === "gemini" || scope.provider === "custom")) {
+          const previous = toolSignatures.get(index);
+          if (previous && previous !== signature) streamError("invalid_upstream_event", "Tool thought signature changed during streaming.");
+          toolSignatures.set(index, signature);
+        }
         if (full) {
           if ((call.id && prior.id && call.id !== prior.id) || (call.function?.name && prior.name && call.function.name !== prior.name) || (call.function?.arguments !== undefined && !call.function.arguments.startsWith(prior.arguments))) streamError("invalid_upstream_event", "Final tool call conflicts with streamed fragments.");
           calls.set(index, { id: call.id ?? prior.id, name: call.function?.name ?? prior.name, arguments: call.function?.arguments ?? prior.arguments });
@@ -408,10 +432,15 @@ export async function readChatCompletionsSse(body: ReadableStream<Uint8Array>, a
     if (finish === "tool_calls" && calls.size === 0) streamError("invalid_upstream_event", "Chat Completions finished with tool_calls but returned no calls.");
     if (outputText) emit({ type: "response.output_text.done", text: outputText });
     if (refusalText) emit({ type: "response.refusal.done", text: refusalText });
-    if (reasoningText || details.size) {
-      const state = details.size && scope.provider === "openrouter"
+    const signatures = [...toolSignatures].flatMap(([index, signature]) => {
+      const call = calls.get(index);
+      return call?.id && call.name ? [{ id: call.id, signature }] : [];
+    });
+    if (reasoningText || details.size || signatures.length) {
+      const state = signatures.length ? { provider: scope.provider, model: scope.model, toolSignatures: signatures, ...(reasoningContent ? { content: reasoningContent } : {}) }
+        : details.size && scope.provider === "openrouter"
         ? { provider: scope.provider, model: scope.model, details: [...details.values()] }
-        : reasoningContent && scope.provider === "opencode" ? { provider: scope.provider, model: scope.model, content: reasoningContent } : undefined;
+        : reasoningContent && (scope.provider === "opencode" || scope.provider === "deepseek" || scope.provider === "custom") ? { provider: scope.provider, model: scope.model, content: reasoningContent } : undefined;
       const signature = state ? REASONING_PREFIX + Buffer.from(JSON.stringify(state)).toString("base64url") : undefined;
       emit({ type: "response.output_item.done", item: { type: "reasoning", summary: reasoningText ? [{ type: "summary_text", text: reasoningText }] : [], signature: signature ?? "" } });
     }

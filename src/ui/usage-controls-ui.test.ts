@@ -18,7 +18,7 @@ type Listener = (event: { preventDefault(): void }) => unknown;
 
 function usageUi() {
   const html = renderDashboardHtml();
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  const script = html.match(/<script>([\s\S]*?)<\/script>/i)?.[1];
   assert.ok(script);
   new Script(script); // Validate the whole emitted script, including template escaping.
   function section(start: string, end: string) {

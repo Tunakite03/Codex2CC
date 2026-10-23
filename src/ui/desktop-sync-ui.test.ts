@@ -7,7 +7,7 @@ import type { DesktopSyncReport } from "../config/desktop-sessions.js";
 // Execute the emitted browser helper AND actual click handlers, rather than just matching their text.
 function dashboardActions(initialReport: DesktopSyncReport | null) {
   const html = renderDashboardHtml();
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  const script = html.match(/<script>([\s\S]*?)<\/script>/i)?.[1];
   assert.ok(script);
   function section(start: string, end: string): string {
     const from = script!.indexOf(start);

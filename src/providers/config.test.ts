@@ -67,8 +67,8 @@ test("settings persist every provider independently and legacy tiers stay Codex-
     const saved = JSON.parse(readFileSync(path, "utf8")) as { tiers: typeof codex };
     assert.deepEqual(saved.tiers, codex);
     const reloaded = TierModelStore.open(path, {});
-    assert.equal(reloaded.getProvider(), "opencode");
-    assert.deepEqual(activeTierModels({ tierStore: reloaded }), reloaded.current("opencode"));
+    assert.equal(reloaded.getProvider(), API_PROVIDERS.at(-1));
+    assert.deepEqual(activeTierModels({ tierStore: reloaded }), reloaded.current(API_PROVIDERS.at(-1)!));
     assert.deepEqual(reloaded.current("codex"), codex);
     assert.deepEqual(reloaded.current("antigravity"), ANTIGRAVITY_TIER_MODELS);
     for (const provider of API_PROVIDERS) {
@@ -132,5 +132,35 @@ test("failed persistence leaves active provider, mappings, effort and API config
     assert.throws(() => broken.saveApiProviderConfig("openai", { ...config, apiKeyEnv: "CUSTOM_API_KEY" }));
     assert.equal(broken.getApiProviderConfig("openai").apiKeyEnv, "OPENAI_API_KEY");
     assert.ok(readFileSync(path, "utf8").includes("codex"));
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+
+test("custom provider persists independent endpoints and models for every supported protocol", () => {
+  const { directory, path, store } = temporaryStore();
+  try {
+    const config = parseApiProviderConfig({
+      apiKeyEnv: "MY_GATEWAY_API_KEY",
+      endpoints: {
+        "chat-completions": "https://gateway.example/v1/chat/completions",
+        responses: "https://gateway.example/v1/responses",
+        "anthropic-messages": "http://localhost:8080/v1/messages",
+      },
+      defaultModel: "my-chat-model",
+      models: [
+        { slug: "my-chat-model", displayName: "My chat model", protocol: "chat-completions" },
+        { slug: "my-responses-model", displayName: "My Responses model", protocol: "responses", reasoning: "openai" },
+        { slug: "my-native-model", displayName: "My native model", protocol: "anthropic-messages" },
+      ],
+    });
+    store.saveApiProviderConfig("custom", config);
+    store.setProvider("custom");
+    const tiers = { fable: "my-native-model", opus: "my-responses-model", sonnet: "my-chat-model", haiku: "my-chat-model" };
+    store.save(tiers, "custom");
+    const reloaded = TierModelStore.open(path, {});
+    assert.equal(reloaded.getProvider(), "custom");
+    assert.deepEqual(reloaded.getApiProviderConfig("custom"), config);
+    assert.deepEqual(reloaded.current(), tiers);
+    assert.deepEqual(reloaded.getApiProviderConfig("openai"), defaultApiProviderConfig("openai"));
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

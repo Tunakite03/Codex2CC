@@ -1,7 +1,10 @@
-export const PROVIDERS = ["codex", "antigravity", "openrouter", "openai", "opencode"] as const;
+export const API_PROVIDERS = ["openrouter", "openai", "opencode", "anthropic", "gemini", "deepseek", "groq", "xai", "mistral", "custom"] as const;
+export const PROVIDERS = ["codex", "antigravity", ...API_PROVIDERS] as const;
 export type ProviderType = typeof PROVIDERS[number];
 export const PROVIDER_LABELS: Readonly<Record<ProviderType, string>> = {
   codex: "ChatGPT", antigravity: "Google Antigravity", openrouter: "OpenRouter", openai: "OpenAI API", opencode: "OpenCode",
+  anthropic: "Anthropic", gemini: "Google Gemini", deepseek: "DeepSeek", groq: "Groq",
+  xai: "xAI", mistral: "Mistral", custom: "Custom provider",
 };
 export function isProviderType(value: string): value is ProviderType {
   return PROVIDERS.some((provider) => provider === value);

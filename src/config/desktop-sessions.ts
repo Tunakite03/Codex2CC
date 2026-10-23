@@ -251,6 +251,13 @@ const SCOPE_ENV: Readonly<Record<DesktopProfile, string>> = {
 };
 const ScopeId = z.string().regex(/^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/);
 
+/** Facts that help a person recognize their own account/org; they never pick one on their behalf. */
+function describeScope(scope: ScopeListing): string {
+  if (scope.sessions.length === 0) return `${scope.id} (no sessions)`;
+  const lastActivity = new Date(Math.max(...scope.sessions.map((session) => session.lastActivityAt)));
+  return `${scope.id} (${scope.sessions.length} session(s), last active ${lastActivity.toISOString().slice(0, 16).replace("T", " ")} UTC)`;
+}
+
 /** No timestamp can identify the signed-in account; require a selection when more than one exists. */
 function selectScope(scopes: readonly ScopeListing[], paths: DesktopSessionPaths, profile: DesktopProfile): ScopeListing | undefined {
   const id = (scope: ScopeListing): string => scope.id;
@@ -266,7 +273,7 @@ function selectScope(scopes: readonly ScopeListing[], paths: DesktopSessionPaths
     return target;
   }
   if (scopes.length > 1) {
-    throw new BridgeError(409, "ambiguous_desktop_scope", `Desktop session sync requires an explicit account/org. Set ${SCOPE_ENV[profile]} to one of: ${scopes.map(id).join(", ")}. Then rerun codex2cc --sync-desktop-sessions --dry-run.`);
+    throw new BridgeError(409, "ambiguous_desktop_scope", `Desktop session sync requires an explicit account/org. Set ${SCOPE_ENV[profile]} to one of: ${scopes.map(describeScope).join(", ")}. Then rerun codex2cc --sync-desktop-sessions --dry-run.`);
   }
   return scopes[0];
 }

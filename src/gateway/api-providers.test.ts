@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createGatewayServer, listenOnLoopback, type GatewayOptions } from "./gateway.js";
 import { TierModelStore } from "../models/tier-store.js";
-import { defaultApiProviderConfig, type ApiProtocol, type ApiProvider } from "../providers/config.js";
+import { API_PROVIDERS, defaultApiProviderConfig, type ApiProtocol, type ApiProvider } from "../providers/config.js";
 import { getLogs } from "../telemetry/logger.js";
 
 const API_KEY = "fixture-provider-secret-not-for-real-use";
@@ -74,7 +74,17 @@ async function withProvider(provider: ApiProvider, protocol: ApiProtocol, handle
 function post(fixture: Fixture, body: object = REQUEST): Promise<Response> { return fetch(`${fixture.base}/v1/messages`, { method: "POST", headers: { ...AUTH, "Content-Type": "application/json" }, body: JSON.stringify(body) }); }
 
 test("all API providers translate streaming and buffered responses without ChatGPT credentials", async () => {
-  const cases: readonly [ApiProvider, ApiProtocol, string][] = [["openrouter", "chat-completions", CHAT], ["openai", "responses", RESPONSES], ["opencode", "anthropic-messages", NATIVE], ["opencode", "responses", RESPONSES], ["opencode", "chat-completions", CHAT]];
+  const streams: Readonly<Record<ApiProtocol, string>> = { "chat-completions": CHAT, responses: RESPONSES, "anthropic-messages": NATIVE };
+  const cases: [ApiProvider, ApiProtocol, string][] = API_PROVIDERS.map((provider) => {
+    const config = defaultApiProviderConfig(provider);
+    const protocol = config.models.find((model) => model.slug === config.defaultModel)!.protocol;
+    return [provider, protocol, streams[protocol]];
+  });
+  for (const provider of ["opencode", "custom"] as const) {
+    for (const protocol of ["chat-completions", "responses", "anthropic-messages"] as const) {
+      if (!cases.some(([candidate, adapter]) => candidate === provider && adapter === protocol)) cases.push([provider, protocol, streams[protocol]]);
+    }
+  }
   for (const [provider, protocol, upstream] of cases) await withProvider(provider, protocol, reply(upstream), async (fixture) => {
     const buffered = await post(fixture);
     assert.equal(buffered.status, 200, await buffered.clone().text());
@@ -96,10 +106,10 @@ test("all API providers translate streaming and buffered responses without ChatG
         assert.equal(sent.headers["x-api-key"], API_KEY);
         assert.equal(sent.headers["anthropic-version"], "2023-06-01");
       } else assert.equal(sent.headers.authorization, `Bearer ${API_KEY}`);
-      const body = JSON.parse(sent.body) as { model: string; stream: boolean; max_tokens?: number; max_output_tokens?: number };
+      const body = JSON.parse(sent.body) as { model: string; stream: boolean; max_tokens?: number; max_completion_tokens?: number; max_output_tokens?: number };
       assert.equal(body.model, "api-model");
       assert.equal(body.stream, true);
-      assert.equal(protocol === "responses" ? body.max_output_tokens : body.max_tokens, 64);
+      assert.equal(protocol === "responses" ? body.max_output_tokens : body.max_completion_tokens ?? body.max_tokens, 64);
     }
   });
 });
@@ -235,7 +245,15 @@ test("API tool calls survive a complete HTTP tool-result round trip for every pr
     { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 2 } },
     { type: "message_stop" },
   ]);
-  const cases: readonly [ApiProvider, ApiProtocol, string, string][] = [["openai", "responses", responsesTool, RESPONSES], ["openrouter", "chat-completions", chatTool, CHAT], ["opencode", "anthropic-messages", nativeTool, NATIVE]];
+  const streams: Readonly<Record<ApiProtocol, readonly [string, string]>> = {
+    responses: [responsesTool, RESPONSES], "chat-completions": [chatTool, CHAT], "anthropic-messages": [nativeTool, NATIVE],
+  };
+  const cases: [ApiProvider, ApiProtocol, string, string][] = API_PROVIDERS.map((provider) => {
+    const config = defaultApiProviderConfig(provider);
+    const protocol = config.models.find((model) => model.slug === config.defaultModel)!.protocol;
+    return [provider, protocol, ...streams[protocol]];
+  });
+  for (const protocol of ["responses", "anthropic-messages"] as const) cases.push(["custom", protocol, ...streams[protocol]]);
   for (const [provider, protocol, first, second] of cases) await withProvider(provider, protocol, (_request, response, attempt) => {
     response.writeHead(200, { "Content-Type": "text/event-stream" }).end(attempt === 1 ? first : second);
   }, async (fixture) => {
@@ -292,5 +310,24 @@ test("a provider switch does not retarget a request already in flight", async ()
     assert.equal(fixture.requests[0]?.headers.authorization, `Bearer ${API_KEY}`);
     const after = await (await fetch(`${fixture.base}/v1/models`, { headers: AUTH })).json() as { data: Array<{ display_name: string }> };
     assert.ok(after.data.every((model) => model.display_name.includes("OpenRouter")));
+  });
+});
+
+
+test("Gemini thought signatures survive a buffered HTTP tool-result round trip", async () => {
+  const first = sse([{ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "signed-call", type: "function", function: { name: "read", arguments: "{}" }, extra_content: { google: { thought_signature: "opaque-provider-signature" } } }] }, finish_reason: "tool_calls" }] }]) + "data: [DONE]\n\n";
+  await withProvider("gemini", "chat-completions", (_request, response, attempt) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream" }).end(attempt === 1 ? first : CHAT);
+  }, async (fixture) => {
+    const tools = [{ name: "read", input_schema: { type: "object", properties: {} } }];
+    const initial = await post(fixture, { ...REQUEST, tools });
+    assert.equal(initial.status, 200);
+    const message = await initial.json() as { content: object[] };
+    const continued = await post(fixture, { ...REQUEST, tools, messages: [...REQUEST.messages, { role: "assistant", content: message.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: "signed-call", content: "file" }] }] });
+    assert.equal(continued.status, 200);
+    await continued.text();
+    const sent = JSON.parse(fixture.requests[1]!.body) as { messages: Array<{ role: string; tool_calls?: Array<{ extra_content?: { google?: { thought_signature?: string } } }> }> };
+    const assistant = sent.messages.find((message) => message.role === "assistant");
+    assert.equal(assistant?.tool_calls?.[0]?.extra_content?.google?.thought_signature, "opaque-provider-signature");
   });
 });

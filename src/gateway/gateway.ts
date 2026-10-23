@@ -36,9 +36,7 @@ import { recordTokenUsage } from "../telemetry/usage.js";
 import { isApiProvider, requireApiKey, type ApiProvider } from "../providers/config.js";
 import { currentProvider, getProviderConfig, providerDefaultModel, providerModels } from "../providers/runtime.js";
 import { openApiInference } from "../providers/http.js";
-import { toResponsesRequest, readResponsesSse } from "../bridge/responses.js";
-import { toAnthropicRequest, readAnthropicSse } from "../bridge/anthropic.js";
-import { toChatCompletionsRequest, readChatCompletionsSse } from "../bridge/chat-completions.js";
+import { readApiStream, toApiRequestBody } from "../providers/probe.js";
 import type { AnthropicUsage, OpenAIEvent } from "../bridge/bridge.js";
 
 export const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
@@ -502,19 +500,12 @@ async function routeToApi(
     throw new BridgeError(400, "output_limit_exceeded", `Requested max_tokens exceeds the configured output limit for model "${model.slug}".`);
   }
   const effort = options.tierStore?.getEffort();
-  const scope = { provider, model: model.slug };
-  const outgoing = model.protocol === "responses" ? toResponsesRequest(inbound, provider, model, effort)
-    : model.protocol === "anthropic-messages" ? toAnthropicRequest(inbound, provider, model.slug, effort)
-    : toChatCompletionsRequest(inbound, model.slug, model.reasoning, effort, scope);
+  const outgoing = toApiRequestBody(inbound, provider, model, effort);
   const estimatedTokens = estimateCodexInputTokens(toOpenAIRequest(inbound, model.slug));
   if (resolution.fellBack) recordLog({ level: "warn", operation: "model_fallback", message: "Requested model is not configured; using provider default", details: { provider, requested: inbound.model, model: model.slug } });
   try {
     const upstream = await openApiInference({ provider, protocol: model.protocol, url: endpoint, apiKey, body: outgoing, signal: clientGone });
-    const read = (accept: (event: OpenAIEvent) => void): Promise<void> => model.protocol === "responses"
-      ? readResponsesSse(upstream.body!, accept, provider, model.slug)
-      : model.protocol === "anthropic-messages"
-        ? readAnthropicSse(upstream.body!, accept, provider, model.slug)
-        : readChatCompletionsSse(upstream.body!, accept, scope);
+    const read = (accept: (event: OpenAIEvent) => void): Promise<void> => readApiStream(upstream.body!, accept, provider, model);
     let usage: AnthropicUsage | undefined;
     if (inbound.stream) {
       response.statusCode = 200;

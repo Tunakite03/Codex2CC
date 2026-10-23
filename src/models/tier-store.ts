@@ -27,13 +27,7 @@ export const SettingsSchema = z.object({
   providers: ApiProviderConfigsSchema.optional(),
   effort: EffortLevel.optional(),
   tiers: TierModelsSchema.optional(),
-  mappings: z.object({
-    codex: TierModelsSchema.optional(),
-    antigravity: TierModelsSchema.optional(),
-    openrouter: TierModelsSchema.optional(),
-    openai: TierModelsSchema.optional(),
-    opencode: TierModelsSchema.optional(),
-  }).optional(),
+  mappings: z.partialRecord(z.enum(PROVIDERS), TierModelsSchema).optional(),
 });
 export type Settings = z.infer<typeof SettingsSchema>;
 
@@ -152,7 +146,7 @@ function tryMigrateLegacyFiles(settingsPath: string): Settings | undefined {
 export class TierModelStore {
   private activeProvider: ProviderType;
   private effort: EffortLevel | undefined;
-  private readonly baselines: Record<ProviderType, TierModels>;
+  private readonly baselines: Record<"codex" | "antigravity", TierModels>;
   private readonly customMappings: Map<ProviderType, TierModels> = new Map();
   private readonly providerConfigs: Map<ApiProvider, ApiProviderConfig> = new Map();
 
@@ -165,9 +159,6 @@ export class TierModelStore {
     this.baselines = {
       codex: loadTierModels(env),
       antigravity: ANTIGRAVITY_TIER_MODELS,
-      openrouter: apiProviderTiers(defaultApiProviderConfig("openrouter")),
-      openai: apiProviderTiers(defaultApiProviderConfig("openai")),
-      opencode: apiProviderTiers(defaultApiProviderConfig("opencode")),
     };
     this.activeProvider = saved?.provider ?? initialProvider;
     this.effort = saved?.effort ?? (env.CLAUDE_CODE_EFFORT_LEVEL ? EffortLevel.safeParse(env.CLAUDE_CODE_EFFORT_LEVEL).data : undefined);

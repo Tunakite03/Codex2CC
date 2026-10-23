@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { ChatGPTSession } from "./auth/auth.js";
 import { BridgeError } from "./bridge/bridge.js";
 import { parseCli, standalonePolicy, USAGE } from "./cli/cli.js";
@@ -21,7 +23,7 @@ import {
   TO_GATEWAY_PROFILE,
   type SyncDirection,
 } from "./config/desktop-sessions.js";
-import { getActiveLogFilePath } from "./telemetry/logger.js";
+import { getActiveLogFilePath, resolveDataDir } from "./telemetry/logger.js";
 import {
   PROVIDER_LABELS,
   OFFLINE_CODEX_MODELS,
@@ -148,7 +150,17 @@ function syncDesktopSessionsAfterSwitch(directions: readonly SyncDirection[]): v
   if (outcome.status === "failed") process.exitCode = 1;
 }
 
+/**
+ * Loads `<data dir>/.env` (the project root of a source checkout) so provider keys saved there
+ * reach the gateway. Variables already set in the launching shell keep their values.
+ */
+function loadDataDirEnv(): void {
+  const path = join(resolveDataDir(process.env), ".env");
+  if (existsSync(path)) process.loadEnvFile(path);
+}
+
 async function main(): Promise<void> {
+  loadDataDirEnv();
   const command = parseCli(process.argv.slice(2));
 
   if (command.kind === "help") {
