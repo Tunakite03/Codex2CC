@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { dirname, join } from "node:path";
 import { BridgeError } from "../bridge/bridge.js";
 import {
   CODEX2CC_DESKTOP_CONFIG_ID,
@@ -141,17 +142,26 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
   let desktopConfigured = false;
   let desktopBaseUrl = "";
   let desktopInSync = false;
+  let desktopDeploymentMode: "1p" | "3p" | undefined;
   const metaFile = `${paths.claudeDesktopDir}/_meta.json`;
   if (existsSync(metaFile)) {
     try {
       const meta = JSON.parse(readFileSync(metaFile, "utf8"));
       if (meta?.appliedId === CODEX2CC_DESKTOP_CONFIG_ID) {
         desktopConfigured = true;
+        const profileFile = join(dirname(paths.claudeDesktopDir), "claude_desktop_config.json");
+        if (existsSync(profileFile)) {
+          const profile = JSON.parse(readFileSync(profileFile, "utf8"));
+          if (profile.deploymentMode === "1p" || profile.deploymentMode === "3p") {
+            desktopDeploymentMode = profile.deploymentMode;
+          }
+        }
         const configFile = `${paths.claudeDesktopDir}/${CODEX2CC_DESKTOP_CONFIG_ID}.json`;
         if (existsSync(configFile)) {
           const cfg = JSON.parse(readFileSync(configFile, "utf8"));
           desktopBaseUrl = String(cfg?.inferenceGatewayBaseUrl || "");
           desktopInSync = inSync(desktopBaseUrl, String(cfg?.inferenceGatewayApiKey ?? ""))
+            && desktopDeploymentMode === "3p"
             && JSON.stringify(cfg?.inferenceModels) === JSON.stringify(desktopInferenceModels(currentTiers));
         }
       }
@@ -185,6 +195,7 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
       inSync: desktopInSync,
       baseUrl: desktopBaseUrl,
       path: paths.claudeDesktopDir,
+      deploymentMode: desktopDeploymentMode ?? null,
     },
     tierMapping: {
       current: currentTiers,
@@ -2648,7 +2659,10 @@ export function renderDashboardHtml(): string {
         });
         const data = await res.json();
         if (!data.ok) throw new Error(data.error);
-        showToast("Reset completed for " + target + "!");
+        const restartHint = target === "cli"
+          ? "Reload your terminal or editor."
+          : "Quit and reopen Claude Desktop to return to Claude account sign-in.";
+        showToast("Reset completed for " + target + ". " + restartHint);
         fetchStatus();
       } catch (err) {
         showToast("Reset failed: " + err.message, "error");
