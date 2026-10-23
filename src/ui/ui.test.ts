@@ -156,6 +156,19 @@ test("provider buttons only stage a choice; the switch runs when Submit is press
   assert.ok(script.includes("await switchProvider(selectedProvider)"));
 });
 
+test("provider switcher renders as an accessible custom select dropdown with synchronized native select", () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="select-provider"'), "native select should be present");
+  assert.ok(html.includes('id="provider-select-trigger"'), "custom select trigger should be present");
+  assert.ok(html.includes('id="provider-select-menu"'), "custom select dropdown menu should be present");
+  assert.ok(html.includes('aria-haspopup="listbox"'));
+  assert.ok(html.includes('role="listbox"'));
+  for (const provider of PROVIDERS) {
+    assert.ok(html.includes(`data-provider="${provider}"`), `option for ${provider} should be present`);
+  }
+});
+
+
 test("getStatus provides gateway metadata and client detection without model controls", () => {
   const status = getStatus(mockOptions, 3456) as Record<string, unknown>;
   const gateway = status.gateway as Record<string, unknown>;

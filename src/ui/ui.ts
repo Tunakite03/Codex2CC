@@ -802,16 +802,16 @@ export function renderDashboardHtml(): string {
       background: var(--teal);
       border: 1.5px solid var(--line);
     }
-    /* Provider Switcher */
+    /* Provider Switcher Dropdown */
     .provider-bar {
       display: flex;
       align-items: center;
-      gap: 0.5rem;
+      gap: 0.65rem;
       flex-wrap: wrap;
       background: var(--surface-soft);
       border: 1px solid var(--line-soft);
       border-radius: var(--radius);
-      padding: 0.35rem 0.65rem;
+      padding: 0.4rem 0.75rem;
     }
     .provider-label {
       font-size: 0.72rem;
@@ -819,6 +819,237 @@ export function renderDashboardHtml(): string {
       text-transform: uppercase;
       letter-spacing: 0.05em;
       color: var(--ink-soft);
+      user-select: none;
+    }
+    .provider-select-wrapper {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+    }
+    .provider-select-trigger {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      padding: 0.35rem 0.7rem;
+      min-width: 220px;
+      border-radius: 0.45rem;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      border: 1.5px solid var(--border);
+      background: var(--surface);
+      color: var(--ink);
+      box-shadow: 1.5px 1.5px 0 var(--border);
+      cursor: pointer;
+      user-select: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+    }
+    .provider-select-trigger:hover {
+      border-color: var(--line);
+      background: #ffffff;
+      box-shadow: 2px 2px 0 var(--paper-deep);
+    }
+    .provider-select-trigger:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+      border-color: var(--line);
+    }
+    .provider-select-trigger[aria-expanded="true"] {
+      border-color: var(--line);
+      box-shadow: 2px 2px 0 var(--paper-deep);
+    }
+    .provider-select-trigger .p-trigger-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 18px;
+      height: 18px;
+      color: var(--primary);
+      flex-shrink: 0;
+    }
+    .provider-select-trigger .p-trigger-icon svg {
+      width: 15px;
+      height: 15px;
+      display: block;
+    }
+    .provider-select-trigger .p-trigger-text {
+      flex: 1;
+      text-align: left;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .provider-select-trigger .p-trigger-badge {
+      font-size: 0.625rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 0.12rem 0.45rem;
+      border-radius: 9999px;
+      background: var(--teal-soft);
+      color: var(--accent-foreground);
+      border: 1px solid rgba(36, 123, 121, 0.25);
+      flex-shrink: 0;
+    }
+    .provider-select-trigger .p-trigger-badge.staged {
+      background: #fef3c7;
+      color: #92400e;
+      border-color: #f59e0b;
+    }
+    .provider-select-trigger .p-trigger-chevron {
+      color: var(--ink-soft);
+      flex-shrink: 0;
+      transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .provider-select-trigger[aria-expanded="true"] .p-trigger-chevron {
+      transform: rotate(180deg);
+    }
+
+    .provider-select-menu {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      z-index: 100;
+      min-width: 320px;
+      max-width: 380px;
+      background: var(--surface);
+      border: 1.5px solid var(--line);
+      border-radius: 0.625rem;
+      box-shadow: 0 12px 28px -4px rgba(23, 32, 29, 0.16), 3px 3px 0 var(--paper-deep);
+      padding: 0.35rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.2rem;
+      animation: menuFadeIn 0.15s ease-out;
+    }
+    @keyframes menuFadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .provider-select-menu[hidden] {
+      display: none;
+    }
+    .provider-menu-header {
+      padding: 0.35rem 0.55rem 0.25rem;
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--ink-faint);
+      border-bottom: 1px solid var(--border-subtle);
+      margin-bottom: 0.2rem;
+    }
+    .provider-select-option {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      padding: 0.5rem 0.65rem;
+      border-radius: 0.45rem;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--ink);
+      text-align: left;
+      cursor: pointer;
+      width: 100%;
+      transition: all 0.12s ease;
+      user-select: none;
+    }
+    .provider-select-option:hover:not(:disabled) {
+      background: var(--surface-soft);
+      border-color: var(--line-soft);
+    }
+    .provider-select-option:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: -1px;
+    }
+    .provider-select-option.selected {
+      background: var(--teal-soft);
+      border-color: rgba(36, 123, 121, 0.3);
+    }
+    .provider-select-option:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      background: transparent !important;
+    }
+    .provider-select-option .p-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 0.4rem;
+      background: var(--surface-soft);
+      border: 1px solid var(--border);
+      color: var(--primary);
+      flex-shrink: 0;
+    }
+    .provider-select-option.selected .p-icon {
+      background: #ffffff;
+      border-color: var(--primary);
+    }
+    .provider-select-option .p-icon svg {
+      width: 15px;
+      height: 15px;
+      display: block;
+    }
+    .provider-select-option .p-info {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.1rem;
+    }
+    .provider-select-option .p-name {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--ink);
+    }
+    .provider-select-option .p-desc {
+      font-size: 0.7rem;
+      color: var(--ink-soft);
+      line-height: 1.25;
+      white-space: normal;
+    }
+    .provider-select-option .p-meta {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      flex-shrink: 0;
+    }
+    .provider-select-option .p-check {
+      display: none;
+      color: var(--primary);
+    }
+    .provider-select-option.selected .p-check {
+      display: block;
+    }
+    .provider-select-option .p-opt-badge {
+      font-size: 0.625rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      padding: 0.1rem 0.38rem;
+      border-radius: 0.25rem;
+    }
+    .provider-select-option .p-opt-badge.active-badge {
+      background: var(--primary);
+      color: #ffffff;
+    }
+    .provider-select-option .p-opt-badge.unavail-badge {
+      background: var(--muted);
+      color: var(--ink-faint);
+      border: 1px solid var(--line-soft);
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
     }
     .provider-group {
       display: flex;
@@ -826,50 +1057,14 @@ export function renderDashboardHtml(): string {
       gap: 0.35rem;
     }
     .provider-btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.35rem;
-      padding: 0.28rem 0.65rem;
-      border-radius: 0.4rem;
-      font-size: 0.75rem;
-      font-weight: 600;
-      border: 1.5px solid var(--border);
-      background: var(--surface-soft);
-      color: var(--ink-soft);
-      transition: all 0.15s ease;
-    }
-    .provider-btn:hover {
-      background: var(--paper-deep);
-      color: var(--ink);
-      border-color: var(--line);
-    }
-    .provider-btn.active {
-      background: var(--primary);
-      border-color: var(--line);
-      color: #ffffff;
-      box-shadow: 1.5px 1.5px 0 var(--line);
-    }
-    .provider-btn .p-icon {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 14px;
-      height: 14px;
-      flex-shrink: 0;
-      font-size: 0.85rem;
-      line-height: 1;
-    }
-    .provider-btn .p-icon svg {
-      width: 14px;
-      height: 14px;
-      display: block;
+      /* preserved for selector compatibility */
     }
     .btn-provider-submit {
       display: inline-flex;
       align-items: center;
-      gap: 0.3rem;
-      padding: 0.28rem 0.65rem;
-      border-radius: 0.4rem;
+      gap: 0.35rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 0.45rem;
       font-size: 0.75rem;
       font-weight: 700;
       border: 1.5px solid var(--border);
@@ -1912,23 +2107,96 @@ export function renderDashboardHtml(): string {
       <section class="card" aria-label="Setup and configuration">
         <!-- Top row: Provider switcher -->
         <div class="provider-bar">
-          <span class="provider-label">Provider</span>
-          <div class="provider-group" id="provider-selector" role="radiogroup" aria-label="Active LLM Provider">
-            <button class="provider-btn active" id="btn-provider-codex" type="button" data-provider="codex" role="radio" aria-checked="true" title="Use ChatGPT Codex subscription">
-              <span class="p-icon">
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
+          <label class="provider-label" for="select-provider">Provider</label>
+          <div class="provider-select-wrapper" id="provider-selector">
+            <select class="sr-only" id="select-provider" aria-label="Active LLM Provider">
+              <option value="codex">ChatGPT (Codex)</option>
+              <option value="antigravity">Antigravity (agy)</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="openai">OpenAI API</option>
+              <option value="opencode">OpenCode</option>
+            </select>
+            <button class="provider-select-trigger" id="provider-select-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="provider-select-menu" title="Click to choose LLM provider">
+              <span class="p-trigger-icon" id="provider-trigger-icon" aria-hidden="true">
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
               </span>
-              <span>ChatGPT (Codex)</span>
+              <span class="p-trigger-text" id="provider-trigger-text">ChatGPT (Codex)</span>
+              <span class="p-trigger-badge" id="provider-trigger-badge">Active</span>
+              <svg class="p-trigger-chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
             </button>
-            <button class="provider-btn" id="btn-provider-antigravity" type="button" data-provider="antigravity" role="radio" aria-checked="false" title="Use Google Antigravity (agy) session">
-              <span class="p-icon">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
-              </span>
-              <span>Antigravity (agy)</span>
-            </button>
-            <button class="provider-btn" id="btn-provider-openrouter" type="button" data-provider="openrouter" role="radio" aria-checked="false">OpenRouter</button>
-            <button class="provider-btn" id="btn-provider-openai" type="button" data-provider="openai" role="radio" aria-checked="false">OpenAI API</button>
-            <button class="provider-btn" id="btn-provider-opencode" type="button" data-provider="opencode" role="radio" aria-checked="false">OpenCode</button>
+            <div class="provider-select-menu" id="provider-select-menu" role="listbox" aria-label="Select LLM Provider" hidden>
+              <div class="provider-menu-header">Select Provider</div>
+              <button class="provider-btn provider-select-option active selected" id="btn-provider-codex" type="button" data-provider="codex" role="option" aria-selected="true" title="Use ChatGPT Codex subscription">
+                <span class="p-icon">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
+                </span>
+                <span class="p-info">
+                  <span class="p-name">ChatGPT (Codex)</span>
+                  <span class="p-desc">Official subscription & Responses API</span>
+                </span>
+                <span class="p-meta">
+                  <span class="p-opt-badge active-badge" id="badge-opt-codex">Active</span>
+                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </span>
+              </button>
+
+              <button class="provider-btn provider-select-option" id="btn-provider-antigravity" type="button" data-provider="antigravity" role="option" aria-selected="false" title="Use Google Antigravity (agy) session">
+                <span class="p-icon">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+                </span>
+                <span class="p-info">
+                  <span class="p-name">Antigravity (agy)</span>
+                  <span class="p-desc">Google Antigravity CLI session (local agy binary)</span>
+                </span>
+                <span class="p-meta">
+                  <span class="p-opt-badge active-badge" id="badge-opt-antigravity" style="display:none">Active</span>
+                  <span class="p-opt-badge unavail-badge" id="badge-unavail-antigravity" style="display:none">No agy CLI</span>
+                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </span>
+              </button>
+
+              <button class="provider-btn provider-select-option" id="btn-provider-openrouter" type="button" data-provider="openrouter" role="option" aria-selected="false">
+                <span class="p-icon">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+                </span>
+                <span class="p-info">
+                  <span class="p-name">OpenRouter</span>
+                  <span class="p-desc">Multi-model router with unified credit balance</span>
+                </span>
+                <span class="p-meta">
+                  <span class="p-opt-badge active-badge" id="badge-opt-openrouter" style="display:none">Active</span>
+                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </span>
+              </button>
+
+              <button class="provider-btn provider-select-option" id="btn-provider-openai" type="button" data-provider="openai" role="option" aria-selected="false">
+                <span class="p-icon">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3"/><path d="m18.5 4.5 2 2"/></svg>
+                </span>
+                <span class="p-info">
+                  <span class="p-name">OpenAI API</span>
+                  <span class="p-desc">Direct OpenAI platform API key</span>
+                </span>
+                <span class="p-meta">
+                  <span class="p-opt-badge active-badge" id="badge-opt-openai" style="display:none">Active</span>
+                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </span>
+              </button>
+
+              <button class="provider-btn provider-select-option" id="btn-provider-opencode" type="button" data-provider="opencode" role="option" aria-selected="false">
+                <span class="p-icon">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                </span>
+                <span class="p-info">
+                  <span class="p-name">OpenCode</span>
+                  <span class="p-desc">OpenCode inference endpoint</span>
+                </span>
+                <span class="p-meta">
+                  <span class="p-opt-badge active-badge" id="badge-opt-opencode" style="display:none">Active</span>
+                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </span>
+              </button>
+            </div>
           </div>
           <button class="btn btn-primary btn-provider-submit" id="btn-provider-submit" type="button" disabled title="Click to apply and switch provider">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
@@ -2494,18 +2762,55 @@ export function renderDashboardHtml(): string {
       const btnSubmit = document.getElementById("btn-provider-submit");
       if (!btnCodex || !btnAnt) return;
 
+      let antigravityReady = true;
       if (Array.isArray(availableList)) {
-        const antigravityReady = availableList.some((p) => p.id === "antigravity" && p.available);
+        antigravityReady = availableList.some((p) => p.id === "antigravity" && p.available);
         btnAnt.disabled = !antigravityReady && currentActiveProvider !== "antigravity";
         btnAnt.title = antigravityReady ? "Use Google Antigravity (agy) session" : "agy binary not found on PATH";
+        const badgeUnavail = document.getElementById("badge-unavail-antigravity");
+        if (badgeUnavail) badgeUnavail.style.display = antigravityReady ? "none" : "inline-block";
         document.getElementById("provider-hint").hidden = antigravityReady;
       }
 
       document.querySelectorAll(".provider-btn[data-provider]").forEach((button) => {
-        const active = button.dataset.provider === selectedProvider;
-        button.classList.toggle("active", active);
-        button.setAttribute("aria-checked", active ? "true" : "false");
+        const prov = button.dataset.provider;
+        const isSelected = prov === selectedProvider;
+        const isActive = prov === currentActiveProvider;
+        button.classList.toggle("active", isSelected);
+        button.classList.toggle("selected", isSelected);
+        button.setAttribute("aria-selected", isSelected ? "true" : "false");
+        button.setAttribute("aria-checked", isSelected ? "true" : "false");
+        const activeBadge = document.getElementById("badge-opt-" + prov);
+        if (activeBadge) {
+          activeBadge.style.display = isActive ? "inline-block" : "none";
+        }
       });
+
+      const nativeSelect = document.getElementById("select-provider");
+      if (nativeSelect && nativeSelect.value !== selectedProvider) {
+        nativeSelect.value = selectedProvider;
+      }
+
+      const triggerIcon = document.getElementById("provider-trigger-icon");
+      const triggerText = document.getElementById("provider-trigger-text");
+      const triggerBadge = document.getElementById("provider-trigger-badge");
+      if (triggerText) {
+        triggerText.textContent = providerLabels[selectedProvider] || selectedProvider;
+      }
+      if (triggerIcon) {
+        const activeOpt = document.getElementById("btn-provider-" + selectedProvider);
+        const iconSvg = activeOpt?.querySelector(".p-icon svg");
+        if (iconSvg) {
+          triggerIcon.innerHTML = iconSvg.outerHTML;
+        }
+      }
+      if (triggerBadge) {
+        const isPending = selectedProvider !== currentActiveProvider;
+        triggerBadge.textContent = isPending ? "Pending" : "Active";
+        triggerBadge.classList.toggle("staged", isPending);
+        triggerBadge.title = isPending ? "Staged: click Submit to activate" : "Currently active provider";
+      }
+
       renderProviderSettings();
 
       const isPending = selectedProvider !== currentActiveProvider;
@@ -2529,8 +2834,74 @@ export function renderDashboardHtml(): string {
         providerConfigDirty = false;
       }
       selectedProvider = target;
+      closeProviderDropdown();
       updateProviderControls();
     }
+
+    const pTrigger = document.getElementById("provider-select-trigger");
+    const pMenu = document.getElementById("provider-select-menu");
+
+    function openProviderDropdown() {
+      if (!pMenu || !pTrigger) return;
+      pMenu.hidden = false;
+      pTrigger.setAttribute("aria-expanded", "true");
+      const currentOpt = pMenu.querySelector(".provider-select-option.selected:not(:disabled)") || pMenu.querySelector(".provider-select-option:not(:disabled)");
+      currentOpt?.focus();
+    }
+
+    function closeProviderDropdown() {
+      if (!pMenu || !pTrigger) return;
+      pMenu.hidden = true;
+      pTrigger.setAttribute("aria-expanded", "false");
+    }
+
+    function toggleProviderDropdown() {
+      if (!pMenu) return;
+      if (pMenu.hidden) openProviderDropdown();
+      else closeProviderDropdown();
+    }
+
+    pTrigger?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleProviderDropdown();
+    });
+
+    pTrigger?.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        openProviderDropdown();
+      }
+    });
+
+    document.addEventListener("click", (e) => {
+      if (pMenu && !pMenu.hidden && !pMenu.contains(e.target) && !pTrigger?.contains(e.target)) {
+        closeProviderDropdown();
+      }
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (!pMenu || pMenu.hidden) return;
+      if (e.key === "Escape") {
+        closeProviderDropdown();
+        pTrigger?.focus();
+      } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const options = Array.from(pMenu.querySelectorAll(".provider-select-option:not(:disabled)"));
+        if (!options.length) return;
+        const currentIndex = options.indexOf(document.activeElement);
+        let nextIndex = 0;
+        if (e.key === "ArrowDown") {
+          nextIndex = currentIndex >= 0 && currentIndex < options.length - 1 ? currentIndex + 1 : 0;
+        } else {
+          nextIndex = currentIndex > 0 ? currentIndex - 1 : options.length - 1;
+        }
+        options[nextIndex]?.focus();
+      }
+    });
+
+    document.getElementById("select-provider")?.addEventListener("change", (e) => {
+      selectProvider(e.target.value);
+    });
 
     function renderStatus(s) {
       document.getElementById("val-gateway-url").textContent = s.gateway.url;
