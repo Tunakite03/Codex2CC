@@ -14,7 +14,7 @@
     "start": "npm run build && node dist/main.js",
     "serve": "npm run build && node dist/main.js --serve",
     "ui": "npm run build && node dist/main.js --ui",
-    "test": "npm run build && node --test --import ./dist/test-setup.js 'dist/**/*.test.js'",
+    "test": "npm run build && node --test --import ./dist/test-setup.js \"dist/**/*.test.js\"",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

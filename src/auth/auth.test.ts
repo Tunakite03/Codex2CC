@@ -136,7 +136,9 @@ test("an expired token is refreshed and the rotated tokens are saved atomically 
     assert.equal(saved.tokens.id_token, "id-token");
     assert.equal(saved.OPENAI_API_KEY, null);
     assert.notEqual(saved.last_refresh, "2026-01-01T00:00:00.000Z");
-    assert.equal((await stat(authPath)).mode & 0o777, 0o600);
+    // Windows mode bits do not represent POSIX owner/group permissions or the file's ACL.
+    // Keep all persistence assertions above on every platform; enforce POSIX privacy where supported.
+    if (process.platform !== "win32") assert.equal((await stat(authPath)).mode & 0o777, 0o600);
   });
 });
 
@@ -249,14 +251,24 @@ test("a Codex login switched to another account is refused instead of adopted or
   });
 });
 
-test("refreshed tokens are written through a symlinked auth.json without replacing the link", async () => {
+test("refreshed tokens are written through a symlinked auth.json without replacing the link", async (t) => {
   const fresh = jwt(Date.now() + HOUR_MS);
   await withFixture(undefined, async ({ options, dir, fake }) => {
     const realDir = join(dir, "dotfiles");
     await mkdir(realDir);
     const realPath = join(realDir, "auth.json");
     await writeFile(realPath, authFile({ access: jwt(Date.now() - HOUR_MS), refresh: "r1" }), { mode: 0o600 });
-    await symlink(realPath, options.authPath);
+    try {
+      await symlink(realPath, options.authPath, "file");
+    } catch (error) {
+      // Attempt the real test even on Windows; Developer Mode or symlink privilege may allow it.
+      // Only the known fixture-creation permission failure is a skip, never an auth/persistence error.
+      if (process.platform === "win32" && (error as NodeJS.ErrnoException).code === "EPERM") {
+        t.skip("Windows file symlink creation requires Developer Mode or symlink privilege");
+        return;
+      }
+      throw error;
+    }
     fake.onRefresh((response) => json(response, 200, { access_token: fresh, refresh_token: "r2" }));
     const session = await ChatGPTSession.open(options);
     assert.equal(await session.accessToken(), fresh);
