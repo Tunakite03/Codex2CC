@@ -22,3 +22,17 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+
+  # Single stable check for branch protection: matrix job names change whenever
+  # the matrix does, so require `ci-ok` instead of individual `test (...)` jobs.
+  ci-ok:
+    if: always()
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every matrix job to succeed
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          echo "test matrix result: $TEST_RESULT"
+          test "$TEST_RESULT" = "success"
