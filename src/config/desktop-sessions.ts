@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -24,6 +24,8 @@ export const BOTH_PROFILES: readonly SyncDirection[] = [...TO_GATEWAY_PROFILE, .
 
 export type DesktopSessionPaths = {
   readonly profiles: Readonly<Record<DesktopProfile, string>>;
+  /** Previous profile locations remain sources until their history has been migrated. */
+  readonly legacyProfiles?: Readonly<Partial<Record<DesktopProfile, readonly string[]>>>;
   /** Claude Code transcripts, `<projects>/<project>/<cliSessionId>.jsonl`. */
   readonly projectsDir: string;
   /** Where each applied sync records changes and stores pre-refresh backups. */
@@ -43,11 +45,11 @@ export function resolveDesktopSessionPaths(env: NodeJS.ProcessEnv = process.env,
     ? env.LOCALAPPDATA || join(home, "AppData", "Local")
     : appData;
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR?.trim() || join(home, ".claude");
-  const thirdPartyDir = platformName === "win32" && !existsSync(join(gatewayData, "Claude-3p", "claude-code-sessions")) && existsSync(join(appData, "Claude-3p", "claude-code-sessions"))
-    ? join(appData, "Claude-3p")
-    : join(gatewayData, "Claude-3p");
+  const thirdPartyDir = join(gatewayData, "Claude-3p");
+  const legacyDir = join(appData, "Claude-3p");
   return {
     profiles: { claude: join(appData, "Claude"), thirdParty: thirdPartyDir },
+    legacyProfiles: { thirdParty: platformName === "win32" && legacyDir.toLowerCase() !== thirdPartyDir.toLowerCase() ? [legacyDir] : [] },
     projectsDir: join(claudeConfigDir, "projects"),
     manifestDir: join(resolveDataDir(env), "logs", "desktop-session-sync"),
     selectedScopes: {
@@ -59,21 +61,51 @@ export function resolveDesktopSessionPaths(env: NodeJS.ProcessEnv = process.env,
 
 export type DesktopProcessState = "running" | "not_running" | "unknown";
 
-/**
- * Whether the Claude Desktop app is open. Only macOS can tell it apart from the `claude` CLI by process
- * name; elsewhere, and when the process list cannot be read, the answer is `unknown`.
- */
-export function desktopProcessState(platformName: string = platform()): DesktopProcessState {
-  if (platformName !== "darwin") return "unknown";
-  const probe = spawnSync("pgrep", ["-x", "Claude"], { stdio: ["ignore", "ignore", "ignore"], shell: false });
-  if (probe.status === 0) return "running";
-  if (probe.status === 1) return "not_running";
-  return "unknown";
+type ProcessProbe = (
+  command: string,
+  args: readonly string[],
+  options: SpawnSyncOptionsWithStringEncoding,
+) => { readonly status: number | null; readonly stdout?: string; readonly error?: Error };
+
+// Desktop and the native CLI are both claude.exe. Only a positively identified CLI may be ignored.
+const WINDOWS_PROCESS_QUERY = [
+  "$ErrorActionPreference = 'Stop'",
+  "$processes = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -ieq 'claude' })",
+  "$products = @($processes | ForEach-Object { $product = $null; try { $product = $_.MainModule.FileVersionInfo.ProductName } catch {}; [PSCustomObject]@{ productName = $product } })",
+  "ConvertTo-Json -InputObject $products -Compress",
+].join("; ");
+const WindowsProcesses = z.array(z.object({ productName: z.string().nullable() }));
+
+/** Checks Desktop without confusing the Windows CLI with the Electron app. Probe failures fail closed. */
+export function desktopProcessState(platformName: string = platform(), probe: ProcessProbe = spawnSync): DesktopProcessState {
+  if (platformName !== "darwin" && platformName !== "win32") return "unknown";
+  const options: SpawnSyncOptionsWithStringEncoding = {
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: false, windowsHide: true, timeout: 5_000,
+  };
+  try {
+    const result = platformName === "win32"
+      ? probe("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_PROCESS_QUERY], options)
+      : probe("pgrep", ["-x", "Claude"], options);
+    if (result.error) return "unknown";
+    if (platformName === "darwin") {
+      return result.status === 0 ? "running" : result.status === 1 ? "not_running" : "unknown";
+    }
+    if (result.status !== 0) return "unknown";
+    const parsed = WindowsProcesses.safeParse(JSON.parse(result.stdout ?? ""));
+    if (!parsed.success) return "unknown";
+    const products = parsed.data.map(({ productName }) => productName?.trim().toLowerCase());
+    if (products.includes("claude")) return "running";
+    return products.every((name) => name === "claude code") ? "not_running" : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 const SessionEntry = z.object({ sessionId: z.string().regex(/^local_[A-Za-z0-9-]+$/), cliSessionId: z.string().min(1) }).loose();
 
 type ScopeListing = {
+  readonly id: string;
+  readonly profileDir: string;
   readonly dir: string;
   readonly sessions: ReadonlyArray<{ readonly file: string; readonly sessionId: string; readonly cliSessionId: string; readonly lastActivityAt: number }>;
   readonly tombstones: ReadonlySet<string>;
@@ -119,7 +151,23 @@ function listScopes(profileDir: string): ScopeListing[] {
         lastActivityAt: typeof activity === "number" ? activity : statSync(file).mtimeMs,
       });
     }
-    return { dir, sessions, tombstones, invalid };
+    return { id: relative(root, dir).split(sep).join("/"), profileDir, dir, sessions, tombstones, invalid };
+  });
+}
+
+function listProfileScopes(paths: DesktopSessionPaths, profile: DesktopProfile): ScopeListing[] {
+  const roots = [...new Set([paths.profiles[profile], ...(paths.legacyProfiles?.[profile] ?? [])])];
+  const scopes = roots.flatMap(listScopes);
+  const deletedByScope = new Map<string, Set<string>>();
+  for (const scope of scopes) {
+    const deleted = deletedByScope.get(scope.id) ?? new Set<string>();
+    for (const sessionId of scope.tombstones) deleted.add(sessionId);
+    deletedByScope.set(scope.id, deleted);
+  }
+  // A deletion in either location wins over an older entry in the other location.
+  return scopes.map((scope) => {
+    const tombstones = deletedByScope.get(scope.id)!;
+    return { ...scope, tombstones, sessions: scope.sessions.filter((session) => !tombstones.has(session.sessionId.slice("local_".length))) };
   });
 }
 
@@ -205,8 +253,7 @@ const ScopeId = z.string().regex(/^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/);
 
 /** No timestamp can identify the signed-in account; require a selection when more than one exists. */
 function selectScope(scopes: readonly ScopeListing[], paths: DesktopSessionPaths, profile: DesktopProfile): ScopeListing | undefined {
-  const root = join(paths.profiles[profile], "claude-code-sessions");
-  const id = (scope: ScopeListing): string => relative(root, scope.dir).split(sep).join("/");
+  const id = (scope: ScopeListing): string => scope.id;
   const selected = paths.selectedScopes?.[profile];
   if (selected !== undefined) {
     if (!ScopeId.safeParse(selected).success) {
@@ -243,11 +290,13 @@ function planDirection(
   transcripts: ReadonlySet<string>,
   owned: ReadonlyMap<string, string>,
 ): DirectionPlan {
-  const allSourceScopes = listScopes(paths.profiles[direction.from]);
-  const sourceScopes = paths.selectedScopes?.[direction.from] === undefined
-    ? allSourceScopes
-    : [selectScope(allSourceScopes, paths, direction.from)!];
-  const destinationScopes = listScopes(paths.profiles[direction.to]);
+  const allSourceScopes = listProfileScopes(paths, direction.from);
+  const selected = paths.selectedScopes?.[direction.from];
+  if (selected !== undefined) selectScope(allSourceScopes, paths, direction.from);
+  const sourceScopes = selected === undefined ? allSourceScopes : allSourceScopes.filter((scope) => scope.id === selected);
+  const allDestinationScopes = listProfileScopes(paths, direction.to);
+  const primaryDestinationScopes = allDestinationScopes.filter((scope) => scope.profileDir === paths.profiles[direction.to]);
+  const destinationScopes = primaryDestinationScopes.length > 0 ? primaryDestinationScopes : allDestinationScopes;
   const invalid = sourceScopes.reduce((sum, scope) => sum + scope.invalid, 0);
   const sources = sourceScopes.flatMap((scope) => scope.sessions);
   const empty = { alreadyPresent: 0, deletedInDestination: 0, missingTranscript: 0, invalid };
@@ -411,7 +460,7 @@ export function describePlans(plans: readonly DirectionPlan[], tense: PlanTense)
   return plans.map((plan) => {
     const route = `${PROFILE_LABEL[plan.from]} -> ${PROFILE_LABEL[plan.to]}`;
     if (plan.blocked === "no_source_sessions") return `${route}: no sessions to copy.`;
-    if (plan.blocked === "no_destination_scope") return `${route}: skipped, open Claude Desktop once in that mode so it creates its session list.`;
+    if (plan.blocked === "no_destination_scope") return `${route}: skipped, open Claude Desktop once in that mode so it creates its session list, then quit it and rerun: codex2cc --sync-desktop-sessions`;
     const { alreadyPresent, deletedInDestination, missingTranscript, invalid } = plan.skipped;
     return `${route}: ${tense.add} ${plan.copies.length} session(s), ${tense.refresh} ${plan.refreshes.length} earlier cop(ies); skipped ${alreadyPresent} already present, ${deletedInDestination} deleted there, ${missingTranscript} without transcript, ${invalid} unreadable.`;
   });
@@ -443,7 +492,9 @@ export type DesktopSyncReport = {
 
 /** The outcome in the shape the control panel shows after a setup or reset. */
 export function desktopSyncReport(outcome: DesktopSyncOutcome): DesktopSyncReport {
-  const level = outcome.status === "applied" ? "success" : outcome.status === "skipped" ? "warning" : "error";
+  const incomplete = outcome.status === "applied" && outcome.sync.plans.some((plan) =>
+    plan.blocked === "no_destination_scope" || plan.skipped.missingTranscript > 0 || plan.skipped.invalid > 0);
+  const level = outcome.status === "failed" ? "error" : outcome.status === "skipped" || incomplete ? "warning" : "success";
   return { status: outcome.status, level, messages: describeOutcome(outcome) };
 }
 

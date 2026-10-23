@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   clearLogs,
   getActiveLogFilePath,
@@ -111,8 +113,10 @@ test("resolveLogFilePath determines project log path and respects environment ov
   const defaultPath = resolveLogFilePath({});
   assert.ok(defaultPath.endsWith("/logs/codex2cc.log") || defaultPath.endsWith("\\logs\\codex2cc.log"));
 
-  const customPath = resolveLogFilePath({ CODEX2CC_LOG_FILE: "/custom/path/gateway.log" });
-  assert.equal(customPath, "/custom/path/gateway.log");
+  const absoluteOverride = join(tmpdir(), "codex2cc-logger-override", "gateway.log");
+  assert.equal(resolveLogFilePath({ CODEX2CC_LOG_FILE: absoluteOverride }), absoluteOverride);
+  assert.equal(resolveLogFilePath({ CODEX2CC_LOG_FILE: "/custom/path/gateway.log" }), resolve("/custom/path/gateway.log"));
+  assert.equal(resolveLogFilePath({ CODEX2CC_LOG_FILE: "  logs/../custom/gateway.log  " }), resolve("custom", "gateway.log"));
 });
 
 test("recordLog writes formatted log lines to disk and clearLogs can truncate file", async () => {

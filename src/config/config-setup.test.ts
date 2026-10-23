@@ -23,6 +23,7 @@ function createSandbox(): { sandboxDir: string; paths: ResolvedSetupPaths; clean
     claudeSettingsPath: join(sandboxDir, ".claude", "settings.json"),
     claudeJsonPath: join(sandboxDir, ".claude.json"),
     claudeDesktopDir: join(sandboxDir, "Claude-3p", "configLibrary"),
+    claudeDesktopLegacyDirs: [],
     claudeDeveloperSettingsPaths: [
       join(sandboxDir, "Claude", "developer_settings.json"),
       join(sandboxDir, "Claude-3p", "developer_settings.json"),
@@ -380,6 +381,141 @@ test("setupConfig writes the routed models' context window and resetConfig remov
 
     resetConfig("cli", paths);
     assert.equal(JSON.parse(readFileSync(paths.claudeSettingsPath, "utf8")).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+function createLegacySandbox() {
+  const sandbox = createSandbox();
+  const legacyDir = join(sandbox.sandboxDir, "Roaming", "Claude-3p", "configLibrary");
+  const paths = { ...sandbox.paths, claudeDesktopLegacyDirs: [legacyDir] };
+  const options = { gatewayUrl: "http://127.0.0.1:3456", token: "persistent-token-1234567890", paths };
+  const seedLegacy = () => setupConfig("desktop", { ...options, paths: { ...paths, claudeDesktopDir: legacyDir, claudeDesktopLegacyDirs: [] } });
+  return { ...sandbox, paths, legacyDir, options, seedLegacy };
+}
+
+test("Desktop setup preserves each library's own entries and metadata", () => {
+  const { paths, legacyDir, options, seedLegacy, cleanup } = createLegacySandbox();
+  try {
+    seedLegacy();
+    const localEntry = { id: "local-gateway", name: "Local" };
+    const legacyEntry = { id: "legacy-gateway", name: "Legacy" };
+    mkdirSync(paths.claudeDesktopDir, { recursive: true });
+    writeFileSync(join(paths.claudeDesktopDir, "_meta.json"), JSON.stringify({ appliedId: "local-gateway", entries: [localEntry], preference: "local" }));
+    writeFileSync(join(legacyDir, "_meta.json"), JSON.stringify({ appliedId: "legacy-gateway", entries: [legacyEntry], preference: "legacy" }));
+    const legacyGateway = join(legacyDir, "legacy-gateway.json");
+    writeFileSync(legacyGateway, "{\"keep\":true}");
+    setupConfig("desktop", options);
+    for (const [dir, entry, preference] of [[paths.claudeDesktopDir, localEntry, "local"], [legacyDir, legacyEntry, "legacy"]] as const) {
+      const meta = JSON.parse(readFileSync(join(dir, "_meta.json"), "utf8"));
+      assert.deepEqual(meta.entries, [entry, { id: CODEX2CC_DESKTOP_CONFIG_ID, name: "Codex2CC Gateway" }]);
+      assert.equal(meta.preference, preference);
+    }
+    assert.equal(readFileSync(legacyGateway, "utf8"), "{\"keep\":true}");
+  } finally {
+    cleanup();
+  }
+});
+
+test("Desktop setup does not create an unused legacy library", () => {
+  const { legacyDir, options, cleanup } = createLegacySandbox();
+  try {
+    const result = setupConfig("desktop", options);
+    assert.equal(result.desktopConfigured, true);
+    assert.equal(result.filesModified.some((file) => file.startsWith(legacyDir)), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("Desktop setup succeeds when an optional legacy profile is corrupt or unwritable", () => {
+  const { paths, legacyDir, options, seedLegacy, cleanup } = createLegacySandbox();
+  try {
+    seedLegacy();
+    const profile = join(legacyDir, "..", "claude_desktop_config.json");
+    writeFileSync(profile, "{ broken");
+    assert.equal(setupConfig("desktop", options).desktopConfigured, true);
+    assert.equal(readFileSync(profile, "utf8"), "{ broken");
+    assert.equal(configuredGatewayToken(options.gatewayUrl, paths), options.token);
+    writeFileSync(profile, JSON.stringify({ deploymentMode: "3p" }));
+    const legacyConfig = join(legacyDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+    rmSync(legacyConfig);
+    mkdirSync(legacyConfig);
+    assert.equal(setupConfig("desktop", options).desktopConfigured, true, "a write failure in the optional mirror is non-fatal");
+  } finally {
+    cleanup();
+  }
+});
+
+test("Desktop setup validates the profile before replacing a working gateway", () => {
+  const { paths, options, cleanup } = createLegacySandbox();
+  try {
+    setupConfig("desktop", options);
+    const config = join(paths.claudeDesktopDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+    const before = readFileSync(config, "utf8");
+    writeFileSync(join(paths.claudeDesktopDir, "..", "claude_desktop_config.json"), "{ broken");
+    assert.throws(() => setupConfig("desktop", { ...options, token: "replacement-token-1234567890" }), BridgeError);
+    assert.equal(readFileSync(config, "utf8"), before);
+  } finally {
+    cleanup();
+  }
+});
+
+test("Desktop reset preflights all profiles before deleting any gateway config", () => {
+  const { paths, legacyDir, options, seedLegacy, cleanup } = createLegacySandbox();
+  try {
+    seedLegacy();
+    setupConfig("desktop", options);
+    for (const brokenDir of [paths.claudeDesktopDir, legacyDir]) {
+      const profile = join(brokenDir, "..", "claude_desktop_config.json");
+      const before = [paths.claudeDesktopDir, legacyDir].flatMap((dir) => [join(dir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`), join(dir, "_meta.json")]).map((file) => [file, readFileSync(file, "utf8")] as const);
+      writeFileSync(profile, "{ broken");
+      assert.throws(() => resetConfig("desktop", paths), BridgeError);
+      for (const [file, content] of before) assert.equal(readFileSync(file, "utf8"), content);
+      assert.equal(configuredGatewayToken(options.gatewayUrl, paths), options.token);
+      writeFileSync(profile, JSON.stringify({ deploymentMode: "3p" }));
+    }
+    resetConfig("desktop", paths);
+    assert.equal(configuredGatewayToken(options.gatewayUrl, paths), undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test("Desktop token loading and relabeling discover a legacy-only applied library", () => {
+  const { paths, legacyDir, options, seedLegacy, cleanup } = createLegacySandbox();
+  try {
+    seedLegacy();
+    const configFile = join(legacyDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+    assert.equal(configuredGatewayToken(options.gatewayUrl, paths), options.token);
+    const tiers = { fable: "new-fable", opus: "new-opus", sonnet: "new-sonnet", haiku: "new-haiku" };
+    assert.deepEqual(refreshDesktopModelLabels(tiers, paths), [configFile]);
+    const config = JSON.parse(readFileSync(configFile, "utf8"));
+    assert.equal(config.inferenceModels[0].labelOverride, "new-sonnet");
+    assert.equal(config.inferenceGatewayApiKey, options.token);
+  } finally {
+    cleanup();
+  }
+});
+
+test("Desktop relabeling preserves per-library credentials and skips unapplied legacy configs", () => {
+  const { paths, legacyDir, options, seedLegacy, cleanup } = createLegacySandbox();
+  try {
+    seedLegacy();
+    setupConfig("desktop", options);
+    const legacyConfigFile = join(legacyDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+    const legacyConfig = { ...JSON.parse(readFileSync(legacyConfigFile, "utf8")), inferenceGatewayBaseUrl: "http://127.0.0.1:9876", inferenceGatewayApiKey: "legacy-secret-1234567890123456", chatTabEnabled: false };
+    writeFileSync(legacyConfigFile, JSON.stringify(legacyConfig));
+    const tiers = { fable: "new-fable", opus: "new-opus", sonnet: "new-sonnet", haiku: "new-haiku" };
+    assert.equal(refreshDesktopModelLabels(tiers, paths).length, 2);
+    const after = JSON.parse(readFileSync(legacyConfigFile, "utf8"));
+    assert.deepEqual({ ...after, inferenceModels: legacyConfig.inferenceModels }, legacyConfig);
+    assert.equal(after.inferenceModels[0].labelOverride, "new-sonnet");
+    writeFileSync(join(legacyDir, "_meta.json"), JSON.stringify({ appliedId: "another-gateway", entries: [] }));
+    const before = readFileSync(legacyConfigFile, "utf8");
+    assert.equal(refreshDesktopModelLabels(tiers, paths).length, 1);
+    assert.equal(readFileSync(legacyConfigFile, "utf8"), before);
   } finally {
     cleanup();
   }
