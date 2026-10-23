@@ -18,6 +18,7 @@ import {
   resolveDesktopSessionPaths,
   runDesktopSessionSync,
   syncDesktopSessionsWhenClosed,
+  TO_CLAUDE_PROFILE,
   TO_GATEWAY_PROFILE,
   type DesktopSessionPaths,
 } from "./desktop-sessions.js";
@@ -65,6 +66,112 @@ function writeTranscript(paths: DesktopSessionPaths, cliSessionId: string): void
 function sessionFiles(dir: string): string[] {
   return readdirSync(dir).filter((name) => name.startsWith("local_")).sort();
 }
+
+for (const localState of ["empty-directory", "empty-scope", "new-sessions"] as const) {
+  test(`Windows migration includes legacy gateway history with ${localState} in LocalAppData`, () => {
+    const { paths, cleanup } = createSandbox();
+    const legacyDir = join(paths.profiles.thirdParty, "..", "Legacy-Claude-3p");
+    const migratedPaths = { ...paths, legacyProfiles: { thirdParty: [legacyDir] } };
+    try {
+      const claude = scopeDir(paths.profiles.claude, "acct", "org");
+      const legacy = scopeDir(legacyDir, "gw", "org");
+      const original = writeSession(legacy, "old", "cli-old", 1_000);
+      writeTranscript(paths, "cli-old");
+      if (localState === "empty-directory") {
+        mkdirSync(join(paths.profiles.thirdParty, "claude-code-sessions"), { recursive: true });
+      } else {
+        const local = scopeDir(paths.profiles.thirdParty, "gw", "org");
+        if (localState === "new-sessions") {
+          writeSession(local, "new", "cli-new", 2_000);
+          writeTranscript(paths, "cli-new");
+        }
+      }
+      const plans = planDesktopSessionSync(TO_CLAUDE_PROFILE, migratedPaths);
+      const expected = localState === "new-sessions" ? ["local_new", "local_old"] : ["local_old"];
+      assert.deepEqual(plans[0]!.copies.map((copy) => copy.sessionId).sort(), expected);
+      applyDesktopSessionSync(plans, paths.manifestDir, NOW);
+      assert.equal(readFileSync(join(claude, "local_old.json"), "utf8"), readFileSync(original, "utf8"));
+    } finally {
+      cleanup();
+    }
+  });
+}
+
+test("Windows session path discovery retains both stores even when the Local directory exists", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex2cc-session-paths-"));
+  try {
+    const local = join(root, "Local");
+    const roaming = join(root, "Roaming");
+    mkdirSync(join(local, "Claude-3p", "claude-code-sessions"), { recursive: true });
+    mkdirSync(join(roaming, "Claude-3p", "claude-code-sessions"), { recursive: true });
+    const paths = resolveDesktopSessionPaths({ APPDATA: roaming, LOCALAPPDATA: local }, "win32");
+    assert.equal(paths.profiles.thirdParty, join(local, "Claude-3p"));
+    assert.deepEqual(paths.legacyProfiles?.thirdParty, [join(roaming, "Claude-3p")]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a selected gateway source scope includes both stores without importing other accounts", () => {
+  const { paths, cleanup } = createSandbox();
+  const legacyDir = join(paths.profiles.thirdParty, "..", "Legacy-Claude-3p");
+  try {
+    scopeDir(paths.profiles.claude, "acct", "org");
+    const local = scopeDir(paths.profiles.thirdParty, "gw", "org");
+    const legacy = scopeDir(legacyDir, "gw", "org");
+    const other = scopeDir(legacyDir, "other", "org");
+    writeSession(local, "new", "cli-new", 2_000);
+    writeSession(legacy, "old", "cli-old", 1_000);
+    writeSession(other, "other", "cli-other", 3_000);
+    for (const id of ["cli-new", "cli-old", "cli-other"]) writeTranscript(paths, id);
+    const [plan] = planDesktopSessionSync(TO_CLAUDE_PROFILE, { ...paths, legacyProfiles: { thirdParty: [legacyDir] }, selectedScopes: { thirdParty: "gw/org" } });
+    assert.deepEqual(plan!.copies.map((copy) => copy.sessionId).sort(), ["local_new", "local_old"]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("migration honors tombstones in either store and writes to the primary gateway scope", () => {
+  const { paths, cleanup } = createSandbox();
+  const legacyDir = join(paths.profiles.thirdParty, "..", "Legacy-Claude-3p");
+  try {
+    const claude = scopeDir(paths.profiles.claude, "acct", "org");
+    const local = scopeDir(paths.profiles.thirdParty, "gw", "org");
+    const legacy = scopeDir(legacyDir, "gw", "org");
+    writeSession(claude, "deleted-in-legacy", "cli-deleted", 1_000);
+    writeSession(claude, "keep", "cli-keep", 2_000);
+    writeSession(legacy, "deleted-in-local", "cli-old", 1_000);
+    writeFileSync(join(local, "deleted_deleted-in-local"), "3000");
+    writeFileSync(join(legacy, "deleted_deleted-in-legacy"), "3000");
+    for (const id of ["cli-deleted", "cli-keep", "cli-old"]) writeTranscript(paths, id);
+    const plans = planDesktopSessionSync(BOTH_PROFILES, { ...paths, legacyProfiles: { thirdParty: [legacyDir] } });
+    assert.equal(plans[0]!.destinationScope, local);
+    assert.deepEqual(plans[0]!.copies.map((copy) => copy.sessionId), ["local_keep"]);
+    assert.equal(plans[0]!.skipped.deletedInDestination, 1);
+    assert.deepEqual(plans[1]!.copies, [], "a Local tombstone must suppress the old Roaming source");
+    applyDesktopSessionSync(plans, paths.manifestDir, NOW);
+    assert.equal(existsSync(join(local, "local_keep.json")), true);
+    assert.equal(existsSync(join(legacy, "local_keep.json")), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("session sync can still target a legacy-only gateway scope", () => {
+  const { paths, cleanup } = createSandbox();
+  const legacyDir = join(paths.profiles.thirdParty, "..", "Legacy-Claude-3p");
+  try {
+    const claude = scopeDir(paths.profiles.claude, "acct", "org");
+    const legacy = scopeDir(legacyDir, "gw", "org");
+    writeSession(claude, "keep", "cli-keep", 1_000);
+    writeTranscript(paths, "cli-keep");
+    mkdirSync(join(paths.profiles.thirdParty, "claude-code-sessions"), { recursive: true });
+    const [plan] = planDesktopSessionSync(TO_GATEWAY_PROFILE, { ...paths, legacyProfiles: { thirdParty: [legacyDir] } });
+    assert.equal(plan!.destinationScope, legacy);
+  } finally {
+    cleanup();
+  }
+});
 
 test("plan copies only missing sessions with a transcript into the explicitly selected destination scope", () => {
   const { paths, cleanup } = createSandbox();

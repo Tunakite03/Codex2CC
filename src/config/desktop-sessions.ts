@@ -24,6 +24,8 @@ export const BOTH_PROFILES: readonly SyncDirection[] = [...TO_GATEWAY_PROFILE, .
 
 export type DesktopSessionPaths = {
   readonly profiles: Readonly<Record<DesktopProfile, string>>;
+  /** Previous profile locations remain sources until their history has been migrated. */
+  readonly legacyProfiles?: Readonly<Partial<Record<DesktopProfile, readonly string[]>>>;
   /** Claude Code transcripts, `<projects>/<project>/<cliSessionId>.jsonl`. */
   readonly projectsDir: string;
   /** Where each applied sync records changes and stores pre-refresh backups. */
@@ -43,11 +45,11 @@ export function resolveDesktopSessionPaths(env: NodeJS.ProcessEnv = process.env,
     ? env.LOCALAPPDATA || join(home, "AppData", "Local")
     : appData;
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR?.trim() || join(home, ".claude");
-  const thirdPartyDir = platformName === "win32" && !existsSync(join(gatewayData, "Claude-3p", "claude-code-sessions")) && existsSync(join(appData, "Claude-3p", "claude-code-sessions"))
-    ? join(appData, "Claude-3p")
-    : join(gatewayData, "Claude-3p");
+  const thirdPartyDir = join(gatewayData, "Claude-3p");
+  const legacyDir = join(appData, "Claude-3p");
   return {
     profiles: { claude: join(appData, "Claude"), thirdParty: thirdPartyDir },
+    legacyProfiles: { thirdParty: platformName === "win32" && legacyDir.toLowerCase() !== thirdPartyDir.toLowerCase() ? [legacyDir] : [] },
     projectsDir: join(claudeConfigDir, "projects"),
     manifestDir: join(resolveDataDir(env), "logs", "desktop-session-sync"),
     selectedScopes: {
@@ -74,6 +76,8 @@ export function desktopProcessState(platformName: string = platform()): DesktopP
 const SessionEntry = z.object({ sessionId: z.string().regex(/^local_[A-Za-z0-9-]+$/), cliSessionId: z.string().min(1) }).loose();
 
 type ScopeListing = {
+  readonly id: string;
+  readonly profileDir: string;
   readonly dir: string;
   readonly sessions: ReadonlyArray<{ readonly file: string; readonly sessionId: string; readonly cliSessionId: string; readonly lastActivityAt: number }>;
   readonly tombstones: ReadonlySet<string>;
@@ -119,7 +123,23 @@ function listScopes(profileDir: string): ScopeListing[] {
         lastActivityAt: typeof activity === "number" ? activity : statSync(file).mtimeMs,
       });
     }
-    return { dir, sessions, tombstones, invalid };
+    return { id: relative(root, dir).split(sep).join("/"), profileDir, dir, sessions, tombstones, invalid };
+  });
+}
+
+function listProfileScopes(paths: DesktopSessionPaths, profile: DesktopProfile): ScopeListing[] {
+  const roots = [...new Set([paths.profiles[profile], ...(paths.legacyProfiles?.[profile] ?? [])])];
+  const scopes = roots.flatMap(listScopes);
+  const deletedByScope = new Map<string, Set<string>>();
+  for (const scope of scopes) {
+    const deleted = deletedByScope.get(scope.id) ?? new Set<string>();
+    for (const sessionId of scope.tombstones) deleted.add(sessionId);
+    deletedByScope.set(scope.id, deleted);
+  }
+  // A deletion in either location wins over an older entry in the other location.
+  return scopes.map((scope) => {
+    const tombstones = deletedByScope.get(scope.id)!;
+    return { ...scope, tombstones, sessions: scope.sessions.filter((session) => !tombstones.has(session.sessionId.slice("local_".length))) };
   });
 }
 
@@ -205,8 +225,7 @@ const ScopeId = z.string().regex(/^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/);
 
 /** No timestamp can identify the signed-in account; require a selection when more than one exists. */
 function selectScope(scopes: readonly ScopeListing[], paths: DesktopSessionPaths, profile: DesktopProfile): ScopeListing | undefined {
-  const root = join(paths.profiles[profile], "claude-code-sessions");
-  const id = (scope: ScopeListing): string => relative(root, scope.dir).split(sep).join("/");
+  const id = (scope: ScopeListing): string => scope.id;
   const selected = paths.selectedScopes?.[profile];
   if (selected !== undefined) {
     if (!ScopeId.safeParse(selected).success) {
@@ -243,11 +262,13 @@ function planDirection(
   transcripts: ReadonlySet<string>,
   owned: ReadonlyMap<string, string>,
 ): DirectionPlan {
-  const allSourceScopes = listScopes(paths.profiles[direction.from]);
-  const sourceScopes = paths.selectedScopes?.[direction.from] === undefined
-    ? allSourceScopes
-    : [selectScope(allSourceScopes, paths, direction.from)!];
-  const destinationScopes = listScopes(paths.profiles[direction.to]);
+  const allSourceScopes = listProfileScopes(paths, direction.from);
+  const selected = paths.selectedScopes?.[direction.from];
+  if (selected !== undefined) selectScope(allSourceScopes, paths, direction.from);
+  const sourceScopes = selected === undefined ? allSourceScopes : allSourceScopes.filter((scope) => scope.id === selected);
+  const allDestinationScopes = listProfileScopes(paths, direction.to);
+  const primaryDestinationScopes = allDestinationScopes.filter((scope) => scope.profileDir === paths.profiles[direction.to]);
+  const destinationScopes = primaryDestinationScopes.length > 0 ? primaryDestinationScopes : allDestinationScopes;
   const invalid = sourceScopes.reduce((sum, scope) => sum + scope.invalid, 0);
   const sources = sourceScopes.flatMap((scope) => scope.sessions);
   const empty = { alreadyPresent: 0, deletedInDestination: 0, missingTranscript: 0, invalid };

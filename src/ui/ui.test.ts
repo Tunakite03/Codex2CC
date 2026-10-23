@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import test from "node:test";
-import { CODEX2CC_DESKTOP_CONFIG_ID, resolveDefaultPaths } from "../config/config-setup.js";
+import { CODEX2CC_DESKTOP_CONFIG_ID, resolveDefaultPaths, setupConfig } from "../config/config-setup.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
 import { DEFAULT_TIER_MODELS, ANTIGRAVITY_TIER_MODELS, type TierModels } from "../models/models.js";
 import { TierModelStore } from "../models/tier-store.js";
@@ -166,6 +166,35 @@ test("getStatus provides gateway metadata and client detection without model con
   assert.equal(cli.effort, undefined);
   const tierMapping = status.tierMapping as { current: typeof DEFAULT_TIER_MODELS };
   assert.deepEqual(tierMapping.current, DEFAULT_TIER_MODELS);
+});
+
+test("getStatus discovers a legacy-only Desktop library and prefers an applied primary library", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex2cc-ui-legacy-"));
+  const primaryDir = join(root, "Local", "Claude-3p", "configLibrary");
+  const legacyDir = join(root, "Roaming", "Claude-3p", "configLibrary");
+  const paths = {
+    claudeSettingsPath: join(root, "settings.json"),
+    claudeDesktopDir: primaryDir,
+    claudeDesktopLegacyDirs: [legacyDir],
+    claudeDeveloperSettingsPaths: [],
+  };
+  try {
+    setupConfig("desktop", {
+      gatewayUrl: "http://127.0.0.1:3456", token: "test-token-1234567890123456",
+      paths: { ...paths, claudeDesktopDir: legacyDir, claudeDesktopLegacyDirs: [] },
+    });
+    const desktop = getStatus(mockOptions, 3456, paths).desktop as { configured: boolean; inSync: boolean; path: string };
+    assert.equal(desktop.configured, true);
+    assert.equal(desktop.inSync, true);
+    assert.equal(desktop.path, legacyDir);
+    mkdirSync(primaryDir, { recursive: true });
+    writeFileSync(join(primaryDir, "_meta.json"), JSON.stringify({ appliedId: "another-gateway" }));
+    assert.equal((getStatus(mockOptions, 3456, paths).desktop as { path: string }).path, legacyDir);
+    setupConfig("desktop", { gatewayUrl: "http://127.0.0.1:3456", token: "test-token-1234567890123456", paths });
+    assert.equal((getStatus(mockOptions, 3456, paths).desktop as { path: string }).path, primaryDir);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("handleUiRoute serves HTML dashboard on /ui and /", async () => {

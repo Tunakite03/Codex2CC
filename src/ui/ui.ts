@@ -7,11 +7,13 @@ import { BridgeError } from "../bridge/bridge.js";
 import {
   CODEX2CC_DESKTOP_CONFIG_ID,
   desktopInferenceModels,
+  desktopLibraryDirs,
   refreshDesktopModelLabels,
   resetConfig,
-  resolveDefaultPaths,
+  resolvePaths,
   setupConfig,
   validateGatewayUrl,
+  type SetupPaths,
   type SetupTarget,
 } from "../config/config-setup.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
@@ -103,8 +105,8 @@ function parseSetupTarget(value: unknown): SetupTarget {
   throw new BridgeError(400, "invalid_target", "Setup target must be one of: cli, desktop, all.");
 }
 
-export function getStatus(options: GatewayOptions, port: number): Record<string, unknown> {
-  const paths = resolveDefaultPaths();
+export function getStatus(options: GatewayOptions, port: number, pathsInput?: SetupPaths): Record<string, unknown> {
+  const paths = resolvePaths(pathsInput);
   const gatewayUrl = `http://127.0.0.1:${port}`;
   const token = options.policy.mode === "token" ? options.policy.token : "";
   const currentTiers = activeTierModels(options);
@@ -143,31 +145,34 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
   let desktopBaseUrl = "";
   let desktopInSync = false;
   let desktopDeploymentMode: "1p" | "3p" | undefined;
-  const metaFile = `${paths.claudeDesktopDir}/_meta.json`;
-  if (existsSync(metaFile)) {
+  let desktopPath = paths.claudeDesktopDir;
+  for (const libraryDir of desktopLibraryDirs(paths)) {
+    const metaFile = join(libraryDir, "_meta.json");
+    if (!existsSync(metaFile)) continue;
     try {
       const meta = JSON.parse(readFileSync(metaFile, "utf8"));
-      if (meta?.appliedId === CODEX2CC_DESKTOP_CONFIG_ID) {
-        desktopConfigured = true;
-        const profileFile = join(dirname(paths.claudeDesktopDir), "claude_desktop_config.json");
-        if (existsSync(profileFile)) {
-          const profile = JSON.parse(readFileSync(profileFile, "utf8"));
-          if (profile.deploymentMode === "1p" || profile.deploymentMode === "3p") {
-            desktopDeploymentMode = profile.deploymentMode;
-          }
+      if (meta?.appliedId !== CODEX2CC_DESKTOP_CONFIG_ID) continue;
+      desktopConfigured = true;
+      desktopPath = libraryDir;
+      const profileFile = join(dirname(libraryDir), "claude_desktop_config.json");
+      if (existsSync(profileFile)) {
+        const profile = JSON.parse(readFileSync(profileFile, "utf8"));
+        if (profile?.deploymentMode === "1p" || profile?.deploymentMode === "3p") {
+          desktopDeploymentMode = profile.deploymentMode;
         }
-        const configFile = `${paths.claudeDesktopDir}/${CODEX2CC_DESKTOP_CONFIG_ID}.json`;
-        if (existsSync(configFile)) {
-          const cfg = JSON.parse(readFileSync(configFile, "utf8"));
-          desktopBaseUrl = String(cfg?.inferenceGatewayBaseUrl || "");
-          desktopInSync = inSync(desktopBaseUrl, String(cfg?.inferenceGatewayApiKey ?? ""))
-            && desktopDeploymentMode === "3p"
-            && JSON.stringify(cfg?.inferenceModels) === JSON.stringify(desktopInferenceModels(currentTiers));
-        }
+      }
+      const configFile = join(libraryDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
+      if (existsSync(configFile)) {
+        const cfg = JSON.parse(readFileSync(configFile, "utf8"));
+        desktopBaseUrl = String(cfg?.inferenceGatewayBaseUrl || "");
+        desktopInSync = inSync(desktopBaseUrl, String(cfg?.inferenceGatewayApiKey ?? ""))
+          && desktopDeploymentMode === "3p"
+          && JSON.stringify(cfg?.inferenceModels) === JSON.stringify(desktopInferenceModels(currentTiers));
       }
     } catch {
       // Ignore
     }
+    if (desktopConfigured) break;
   }
 
   return {
@@ -194,7 +199,7 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
       configured: desktopConfigured,
       inSync: desktopInSync,
       baseUrl: desktopBaseUrl,
-      path: paths.claudeDesktopDir,
+      path: desktopPath,
       deploymentMode: desktopDeploymentMode ?? null,
     },
     tierMapping: {
