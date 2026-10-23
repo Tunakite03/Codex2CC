@@ -362,10 +362,13 @@ export async function readChatCompletionsSse(body: ReadableStream<Uint8Array>, a
     if (choice.error !== undefined) upstreamError(choice.error);
     if (choice.finish_reason === "error") streamError("upstream_error", typeof choice.delta?.content === "string" ? choice.delta.content : "Chat Completions ended with an error choice.");
     if (finish) {
-      // OpenRouter's final usage chunk repeats the terminal choice with an empty delta.
-      const emptyDelta = choice.delta === undefined || Object.values(choice.delta).every((value) => value == null || value === "" || (Array.isArray(value) && value.length === 0));
-      if (!choice.message && emptyDelta && (choice.finish_reason == null || choice.finish_reason === finish)) return;
-      streamError("invalid_upstream_event", "Chat Completions sent content or a conflicting finish reason after completion.");
+      // OpenRouter's final usage chunk repeats the terminal choice with an empty delta; some models
+      // (for example NVIDIA Nemotron) also repeat role "assistant", which carries no content.
+      const contentFields = Object.entries(choice.delta ?? {}).filter(([key, value]) => key !== "role" && !(value == null || value === "" || (Array.isArray(value) && value.length === 0))).map(([key]) => key);
+      if (!choice.message && contentFields.length === 0 && (choice.finish_reason == null || choice.finish_reason === finish)) return;
+      // Names only the offending fields (never their values) so provider quirks can be diagnosed.
+      const fields = choice.message ? ["message"] : contentFields;
+      streamError("invalid_upstream_event", `Chat Completions sent content or a conflicting finish reason after completion (first finish_reason: ${finish}; later finish_reason: ${choice.finish_reason ?? "none"}; later fields: ${fields.join(", ") || "none"}).`);
     }
     if (choice.delta && choice.message) streamError("invalid_upstream_event", "A completion choice cannot contain both delta and message.");
     const delta = choice.delta ?? choice.message;

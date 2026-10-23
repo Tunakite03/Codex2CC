@@ -353,6 +353,19 @@ test("OpenRouter final usage may repeat the finish reason with an empty choice",
   await assert.rejects(events(delta({}, "stop") + delta({}, "length")), errorCode("invalid_upstream_event"));
 });
 
+test("OpenRouter final usage may repeat the assistant role after the finish reason", async () => {
+  const source = delta({ role: "assistant", content: "OK" }) + delta({ role: "assistant", content: "" }, "stop") + frame({
+    id: "chat_1",
+    choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 12, completion_tokens: 1 },
+  }) + "data: [DONE]\n\n";
+  const accumulator = new MessageAccumulator(router.model);
+  await readChatCompletionsSse(body(source), (event) => accumulator.accept(event), router);
+  accumulator.assertCompleted();
+  assert.deepEqual(accumulator.getUsage(), { input_tokens: 12, output_tokens: 1 });
+  await assert.rejects(events(delta({}, "stop") + delta({ role: "assistant", content: "late" }, "stop")), (error: unknown) => errorCode("invalid_upstream_event")(error) && /later fields: content/.test((error as Error).message));
+});
+
 test("streamed provider rate, auth and context errors retain actionable status codes", async () => {
   for (const [code, status] of [[429, 429], [401, 401], ["context_length_exceeded", 400]] as const) {
     await assert.rejects(events(frame({ error: { code, message: "provider error" } })), (error: unknown) => error instanceof BridgeError && error.status === status);

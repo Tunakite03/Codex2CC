@@ -20,6 +20,8 @@ import type { GatewayOptions } from "../gateway/gateway.js";
 import { ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, PROVIDERS, PROVIDER_LABELS, isProviderType, routedModels, smallestContextWindow, type ProviderType } from "../models/models.js";
 import { API_PROVIDERS, apiProviderTiers, hasApiKey, isApiProvider, parseApiProviderConfig } from "../providers/config.js";
 import { currentProvider, getProviderConfig, providerDefaultModel, providerModels } from "../providers/runtime.js";
+import { discoverApiModels } from "../providers/discovery.js";
+import { probeApiProvider } from "../providers/probe.js";
 import { isAntigravityAvailable } from "../bridge/antigravity.js";
 import {
   desktopProcessState,
@@ -462,6 +464,58 @@ export async function handleUiRoute(
     recordLog({ level: "info", operation: "provider_config_saved", message: "Saved API provider configuration", details: { provider: body.provider } });
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ ok: true, provider: body.provider, config, keyConfigured: hasApiKey(config, options.providerEnv ?? process.env) }));
+    return true;
+  }
+
+  if (pathname === "/api/ui/provider-test" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    if (typeof body.provider !== "string" || !isProviderType(body.provider) || !isApiProvider(body.provider)) {
+      throw new BridgeError(400, "invalid_provider", `API provider must be one of: ${API_PROVIDERS.join(", ")}.`);
+    }
+    const provider = body.provider;
+    // Testing the unsaved form lets the user check settings before saving them.
+    const config = body.config === undefined ? getProviderConfig(options, provider) : parseApiProviderConfig(body.config);
+    if (body.model !== undefined && typeof body.model !== "string") throw new BridgeError(400, "invalid_model", "Test model must be a model slug string.");
+    const model = body.model?.trim() || config.defaultModel;
+    const clientGone = new AbortController();
+    response.once("close", () => clientGone.abort());
+    try {
+      const result = await probeApiProvider(provider, config, model, options.providerEnv ?? process.env, clientGone.signal);
+      recordLog({ level: "info", operation: "provider_test_passed", message: "API provider connection test passed", details: { provider, model: result.model, protocol: result.protocol, latencyMs: result.latencyMs } });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: true, ...result }));
+    } catch (error) {
+      if (!(error instanceof BridgeError)) throw error;
+      // A failed probe is a valid test result, not a failed control panel request.
+      recordLog({ level: "warn", operation: "provider_test_failed", message: `API provider connection test failed: ${error.code} (${error.status}): ${error.message}`, details: { provider, model, code: error.code, status: error.status } });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: false, provider, model, code: error.code, status: error.status, error: error.message }));
+    }
+    return true;
+  }
+
+  if (pathname === "/api/ui/provider-models" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    if (typeof body.provider !== "string" || !isProviderType(body.provider) || !isApiProvider(body.provider)) {
+      throw new BridgeError(400, "invalid_provider", `API provider must be one of: ${API_PROVIDERS.join(", ")}.`);
+    }
+    const provider = body.provider;
+    // Listing the unsaved form lets the user fetch with the endpoint and key variable they are editing.
+    const config = body.config === undefined ? getProviderConfig(options, provider) : parseApiProviderConfig(body.config);
+    const clientGone = new AbortController();
+    response.once("close", () => clientGone.abort());
+    try {
+      const models = await discoverApiModels(provider, config, options.providerEnv ?? process.env, clientGone.signal);
+      recordLog({ level: "info", operation: "provider_models_listed", message: "Listed API provider models", details: { provider, count: models.length } });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: true, provider, models }));
+    } catch (error) {
+      if (!(error instanceof BridgeError)) throw error;
+      // A failed listing is a valid result for the panel to show, not a failed control panel request.
+      recordLog({ level: "warn", operation: "provider_models_failed", message: `API provider model listing failed: ${error.code} (${error.status}): ${error.message}`, details: { provider, code: error.code, status: error.status } });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: false, provider, code: error.code, status: error.status, error: error.message }));
+    }
     return true;
   }
 
@@ -1116,6 +1170,11 @@ export function renderDashboardHtml(): string {
     .api-provider-fields label { display: grid; gap: 0.3rem; font-size: 0.8rem; }
     .api-provider-settings textarea { width: 100%; min-height: 15rem; padding: 0.65rem; border: 1px solid var(--input); border-radius: var(--radius); background: var(--surface); color: var(--ink); font-family: monospace; resize: vertical; }
     .api-provider-settings textarea:focus-visible { outline: 3px solid var(--ring); }
+    .api-provider-actions { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.6rem; margin-top: 0.75rem; }
+    .api-provider-actions label { display: grid; gap: 0.3rem; font-size: 0.8rem; min-width: min(100%, 240px); }
+    .api-test-result { margin: 0.6rem 0 0; padding: 0.55rem 0.7rem; border: 1px solid var(--line-soft); border-left-width: 4px; border-radius: var(--radius); background: var(--surface); font-size: 0.8rem; overflow-wrap: anywhere; }
+    .api-test-result[data-state="ok"] { border-left-color: var(--teal-soft); }
+    .api-test-result[data-state="error"] { border-left-color: var(--destructive); }
     /* Navigation Tabs */
     .nav-tabs {
       display: flex;
@@ -2261,7 +2320,7 @@ export function renderDashboardHtml(): string {
         <section id="api-provider-settings" class="api-provider-settings" aria-labelledby="api-provider-title" hidden>
           <h3 id="api-provider-title">API provider settings</h3>
           <p id="api-key-status" role="status"></p>
-          <p class="supporting-text">Enter the environment variable name, never the API key itself. Set its value in the gateway process environment and restart. Saving settings does not select a provider; press Submit above to switch.</p>
+          <p class="supporting-text">Enter the environment variable name, never the API key itself. Set its value in the gateway process environment or in the <code>.env</code> file beside <code>logs/</code>, then restart the gateway. Saving settings does not select a provider; press Submit above to switch.</p>
           <p id="custom-provider-help" class="supporting-text" hidden>Custom supports Chat Completions, Responses and Anthropic Messages compatible APIs. Replace the example endpoint and model with your server settings. Enter complete resource URLs, not base URLs. HTTPS is required except for localhost HTTP.</p>
           <form id="api-provider-form">
             <div class="api-provider-fields">
@@ -2284,8 +2343,17 @@ export function renderDashboardHtml(): string {
             <label for="api-model-catalog">Model catalog (JSON array)</label>
             <p id="api-model-schema" class="supporting-text">Each model requires slug, displayName, and protocol: chat-completions, responses, or anthropic-messages. reasoning is none, openai, or openrouter (default: none). Anthropic Messages uses none; Responses supports openai or none. Optional contextWindow and maxOutputTokens are positive integers. Each protocol needs its complete endpoint URL. The default model must exist in this catalog. Only these adapter protocols are supported, not every model a provider offers.</p>
             <textarea id="api-model-catalog" spellcheck="false" required aria-describedby="api-model-schema api-model-example"></textarea>
-            <p id="api-model-example" class="supporting-text">Example: [{"slug":"gpt-5.5","displayName":"GPT-5.5","protocol":"responses","reasoning":"openai","contextWindow":200000,"maxOutputTokens":8192}]. Provider defaults load automatically; edit them to match your account.</p>
-            <button class="btn btn-primary btn-sm" id="btn-save-provider-config" type="submit">Save provider settings</button>
+            <p id="api-model-example" class="supporting-text">Example: [{"slug":"gpt-5.5","displayName":"GPT-5.5","protocol":"responses","reasoning":"openai","contextWindow":200000,"maxOutputTokens":8192}]. Provider defaults load automatically; edit them to match your account. Fetch models adds the chat models your provider lists and keeps existing entries.</p>
+            <div class="api-provider-actions">
+              <button class="btn btn-primary btn-sm" id="btn-save-provider-config" type="submit">Save provider settings</button>
+              <label for="api-test-model">Model to test
+                <select id="api-test-model" data-test="provider-test-model"></select>
+              </label>
+              <button class="btn btn-secondary btn-sm" id="btn-test-provider" type="button" data-test="provider-test">Test connection</button>
+              <button class="btn btn-secondary btn-sm" id="btn-discover-models" type="button" data-test="provider-discover-models">Fetch models</button>
+            </div>
+            <p id="api-test-result" class="api-test-result" role="status" aria-live="polite" data-test="provider-test-result" hidden></p>
+            <p id="api-discover-result" class="api-test-result" role="status" aria-live="polite" data-test="provider-discover-result" hidden></p>
           </form>
         </section>
 
@@ -2797,6 +2865,8 @@ export function renderDashboardHtml(): string {
     let selectedProvider = "codex";
     let isProviderSwitching = false;
     let isProviderConfigSaving = false;
+    let isProviderTesting = false;
+    let isProviderDiscovering = false;
     let providerConfigDirty = false;
     let editingProvider = null;
     const providerLabels = ${JSON.stringify(PROVIDER_LABELS)};
@@ -2809,17 +2879,141 @@ export function renderDashboardHtml(): string {
       document.getElementById("custom-provider-help").hidden = selectedProvider !== "custom";
       if (!entry?.config) return;
       document.getElementById("api-provider-title").textContent = providerLabels[selectedProvider] + " settings";
-      document.getElementById("api-key-status").textContent = entry.config.apiKeyEnv + (entry.keyConfigured ? ": configured in the gateway environment" : ": missing or invalid in the gateway environment; inference is unavailable until configured");
+      document.getElementById("api-key-status").textContent = entry.config.apiKeyEnv + (entry.keyConfigured ? ": configured in the gateway environment" : ": missing or invalid in the gateway environment; set it in the shell or the .env file beside logs/, then restart the gateway");
       if (editingProvider === selectedProvider && providerConfigDirty) return;
+      if (editingProvider !== selectedProvider) document.getElementById("api-test-result").hidden = true;
       editingProvider = selectedProvider;
       providerConfigDirty = false;
       document.getElementById("api-key-env").value = entry.config.apiKeyEnv;
       document.getElementById("api-default-model").value = entry.config.defaultModel;
       for (const protocol of apiProtocols) document.getElementById("api-endpoint-" + protocol).value = entry.config.endpoints[protocol] || "";
       document.getElementById("api-model-catalog").value = JSON.stringify(entry.config.models, null, 2);
+      renderTestModelOptions();
     }
 
-    document.getElementById("api-provider-form").addEventListener("input", () => { providerConfigDirty = true; });
+    function readProviderForm() {
+      const endpoints = {};
+      for (const protocol of apiProtocols) {
+        const value = document.getElementById("api-endpoint-" + protocol).value.trim();
+        if (value) endpoints[protocol] = value;
+      }
+      return {
+        apiKeyEnv: document.getElementById("api-key-env").value.trim(),
+        defaultModel: document.getElementById("api-default-model").value.trim(),
+        endpoints,
+        models: JSON.parse(document.getElementById("api-model-catalog").value),
+      };
+    }
+
+    /** Lists catalog slugs from the form; tier-mapped and default models are the useful ones to test. */
+    function renderTestModelOptions() {
+      const select = document.getElementById("api-test-model");
+      const previous = select.value;
+      let slugs = [];
+      try {
+        const models = JSON.parse(document.getElementById("api-model-catalog").value);
+        if (Array.isArray(models)) slugs = models.map((model) => model && model.slug).filter((slug) => typeof slug === "string" && slug.trim());
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+      const defaultModel = document.getElementById("api-default-model").value.trim();
+      select.replaceChildren(...slugs.map((slug) => {
+        const option = document.createElement("option");
+        option.value = slug;
+        option.textContent = slug === defaultModel ? slug + " (default)" : slug;
+        return option;
+      }));
+      select.value = slugs.includes(previous) ? previous : slugs.includes(defaultModel) ? defaultModel : slugs[0] || "";
+      document.getElementById("btn-test-provider").disabled = isProviderTesting || slugs.length === 0;
+    }
+
+    function showProviderTestResult(state, text) {
+      const result = document.getElementById("api-test-result");
+      result.dataset.state = state;
+      result.textContent = text;
+      result.hidden = false;
+    }
+
+    document.getElementById("btn-test-provider").addEventListener("click", async () => {
+      if (isProviderTesting) return;
+      const provider = selectedProvider;
+      const button = document.getElementById("btn-test-provider");
+      isProviderTesting = true;
+      button.disabled = true;
+      button.textContent = "Testing...";
+      showProviderTestResult("pending", "Sending a test message to " + providerLabels[provider] + "...");
+      try {
+        const config = readProviderForm();
+        const model = document.getElementById("api-test-model").value;
+        const response = await fetch("/api/ui/provider-test", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider, config, model }),
+        });
+        const data = await response.json();
+        if (data.ok) {
+          showProviderTestResult("ok", "Connected: " + data.model + " via " + data.protocol + " answered in " + data.latencyMs + " ms" + (data.reply ? ' ("' + data.reply + '")' : "") + ".");
+        } else {
+          showProviderTestResult("error", "Failed" + (data.code ? " [" + data.code + (data.status ? " " + data.status : "") + "]" : "") + ": " + (data.error || "Unknown error"));
+        }
+      } catch (error) {
+        showProviderTestResult("error", error instanceof SyntaxError ? "Model catalog must be a valid JSON array." : "Test request failed: " + error.message);
+      } finally {
+        isProviderTesting = false;
+        button.textContent = "Test connection";
+        renderTestModelOptions();
+      }
+    });
+
+    function showDiscoverResult(state, text) {
+      const result = document.getElementById("api-discover-result");
+      result.dataset.state = state;
+      result.textContent = text;
+      result.hidden = false;
+    }
+
+    document.getElementById("btn-discover-models").addEventListener("click", async () => {
+      if (isProviderDiscovering) return;
+      const provider = selectedProvider;
+      const button = document.getElementById("btn-discover-models");
+      isProviderDiscovering = true;
+      button.disabled = true;
+      button.textContent = "Fetching...";
+      showDiscoverResult("pending", "Fetching models from " + providerLabels[provider] + "...");
+      try {
+        const config = readProviderForm();
+        const response = await fetch("/api/ui/provider-models", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider, config }),
+        });
+        const data = await response.json();
+        if (provider !== selectedProvider) {
+          showDiscoverResult("error", "The provider changed before the list arrived. Fetch again for " + providerLabels[selectedProvider] + ".");
+        } else if (!data.ok) {
+          showDiscoverResult("error", "Failed" + (data.code ? " [" + data.code + (data.status ? " " + data.status : "") + "]" : "") + ": " + (data.error || "Unknown error"));
+        } else {
+          const known = new Set(config.models.map((model) => model.slug));
+          const added = data.models.filter((model) => !known.has(model.slug));
+          const merged = config.models.concat(added);
+          if (merged.length > 200) {
+            showDiscoverResult("error", "The catalog would hold " + merged.length + " models, but the limit is 200. Remove entries, then fetch again.");
+          } else {
+            document.getElementById("api-model-catalog").value = JSON.stringify(merged, null, 2);
+            providerConfigDirty = true;
+            renderTestModelOptions();
+            showDiscoverResult("ok", "Found " + data.models.length + " chat models and added " + added.length + " new. Review the catalog, then save provider settings.");
+          }
+        }
+      } catch (error) {
+        showDiscoverResult("error", error instanceof SyntaxError ? "Model catalog must be a valid JSON array." : "Model listing request failed: " + error.message);
+      } finally {
+        isProviderDiscovering = false;
+        button.textContent = "Fetch models";
+        button.disabled = false;
+      }
+    });
+
+    document.getElementById("api-provider-form").addEventListener("input", (event) => {
+      providerConfigDirty = true;
+      if (event.target.id === "api-model-catalog" || event.target.id === "api-default-model") renderTestModelOptions();
+    });
     document.getElementById("api-provider-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       if (isProviderConfigSaving || isProviderSwitching) return;
@@ -2829,17 +3023,7 @@ export function renderDashboardHtml(): string {
       button.disabled = true;
       updateProviderControls();
       try {
-        const endpoints = {};
-        for (const protocol of apiProtocols) {
-          const value = document.getElementById("api-endpoint-" + protocol).value.trim();
-          if (value) endpoints[protocol] = value;
-        }
-        const config = {
-          apiKeyEnv: document.getElementById("api-key-env").value.trim(),
-          defaultModel: document.getElementById("api-default-model").value.trim(),
-          endpoints,
-          models: JSON.parse(document.getElementById("api-model-catalog").value),
-        };
+        const config = readProviderForm();
         const response = await fetch("/api/ui/provider-config", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider, config }),
         });

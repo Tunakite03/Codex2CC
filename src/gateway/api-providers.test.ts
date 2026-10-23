@@ -331,3 +331,95 @@ test("Gemini thought signatures survive a buffered HTTP tool-result round trip",
     assert.equal(assistant?.tool_calls?.[0]?.extra_content?.google?.thought_signature, "opaque-provider-signature");
   });
 });
+
+type ProbeBody = { ok: boolean; model?: string; protocol?: string; reply?: string; latencyMs?: number; code?: string; status?: number; error?: string };
+async function probe(fixture: Fixture, body: object): Promise<ProbeBody> {
+  const response = await fetch(`${fixture.base}/api/ui/provider-test`, { method: "POST", headers: { "Content-Type": "application/json", Origin: fixture.base }, body: JSON.stringify(body) });
+  assert.equal(response.status, 200);
+  return await response.json() as ProbeBody;
+}
+
+test("connection test sends a minimal message through each provider protocol", async () => {
+  const streams: Readonly<Record<ApiProtocol, string>> = { "chat-completions": CHAT, responses: RESPONSES, "anthropic-messages": NATIVE };
+  for (const protocol of Object.keys(streams) as ApiProtocol[]) {
+    await withProvider("opencode", protocol, reply(streams[protocol]), async (fixture) => {
+      const result = await probe(fixture, { provider: "opencode" });
+      assert.equal(result.ok, true, result.error);
+      assert.equal(result.model, "api-model");
+      assert.equal(result.protocol, protocol);
+      assert.equal(result.reply, "Hello API");
+      assert.equal(fixture.requests.length, 1);
+      const upstream = fixture.requests[0]!;
+      assert.equal(upstream.url, "/inference");
+      assert.equal(protocol === "anthropic-messages" ? upstream.headers["x-api-key"] : upstream.headers.authorization, protocol === "anthropic-messages" ? API_KEY : `Bearer ${API_KEY}`);
+      const sent = JSON.parse(upstream.body) as { model: string };
+      assert.equal(sent.model, "api-model");
+      assert.ok(getLogs({ search: "connection test passed" }).length > 0);
+    });
+  }
+});
+
+test("connection test uses the unsaved form configuration and selected model", async () => {
+  await withProvider("openrouter", "chat-completions", reply(CHAT), async (fixture) => {
+    const saved = fixture.store.getApiProviderConfig("openrouter")!;
+    const config = { ...saved, models: [...saved.models, { slug: "vendor/other:free", displayName: "Other", protocol: "chat-completions", reasoning: "openrouter" }] };
+    const result = await probe(fixture, { provider: "openrouter", config, model: "vendor/other:free" });
+    assert.equal(result.ok, true, result.error);
+    const sent = JSON.parse(fixture.requests[0]!.body) as { model: string; max_tokens: number; reasoning: { enabled: boolean } };
+    assert.equal(sent.model, "vendor/other:free");
+    assert.equal(sent.max_tokens, 64);
+    assert.equal(sent.reasoning.enabled, false);
+    assert.equal(fixture.store.getApiProviderConfig("openrouter")!.models.length, saved.models.length, "testing must not save the form");
+  });
+});
+
+test("connection test reports a missing key without contacting the provider", async () => {
+  await withProvider("openrouter", "chat-completions", reply(CHAT), async (fixture) => {
+    const config = { ...fixture.store.getApiProviderConfig("openrouter")!, apiKeyEnv: "UNSET_FIXTURE_API_KEY" };
+    const result = await probe(fixture, { provider: "openrouter", config });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "missing_provider_key");
+    assert.equal(result.status, 401);
+    assert.match(result.error!, /UNSET_FIXTURE_API_KEY/);
+    assert.equal(fixture.requests.length, 0);
+  });
+});
+
+test("connection test reports provider rejections with the key redacted", async () => {
+  const rejected: Handler = (_request, response) => response.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: { code: "invalid_api_key", message: `Rejected ${API_KEY}` } }));
+  await withProvider("openrouter", "chat-completions", rejected, async (fixture) => {
+    const result = await probe(fixture, { provider: "openrouter" });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "invalid_api_key");
+    assert.equal(result.status, 401);
+    assert.match(result.error!, /REDACTED/);
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(API_KEY));
+    assert.equal(fixture.requests.length, 1);
+  });
+});
+
+test("connection test rejects models outside the catalog", async () => {
+  await withProvider("openrouter", "chat-completions", reply(CHAT), async (fixture) => {
+    const result = await probe(fixture, { provider: "openrouter", model: "not/configured" });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "model_unavailable");
+    assert.equal(fixture.requests.length, 0);
+  });
+});
+
+type ModelListBody = { ok: boolean; models?: Array<{ slug: string }>; code?: string; status?: number; error?: string };
+async function listModels(fixture: Fixture, body: object): Promise<ModelListBody> {
+  const response = await fetch(`${fixture.base}/api/ui/provider-models`, { method: "POST", headers: { "Content-Type": "application/json", Origin: fixture.base }, body: JSON.stringify(body) });
+  assert.equal(response.status, 200);
+  return await response.json() as ModelListBody;
+}
+
+test("model listing route reports endpoints it cannot map without contacting the provider", async () => {
+  await withProvider("opencode", "responses", reply(RESPONSES), async (fixture) => {
+    const result = await listModels(fixture, { provider: "opencode" });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "model_discovery_unsupported");
+    assert.equal(fixture.requests.length, 0);
+    assert.ok(getLogs({ search: "model listing failed" }).length > 0);
+  });
+});

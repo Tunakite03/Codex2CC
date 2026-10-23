@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,6 +62,22 @@ test("Claude launch fails fast for a missing API key without trying a Codex logi
       assert.doesNotMatch(String(result.stderr), /Not logged into ChatGPT|ENOENT.*claude/);
       assert.equal(String(result.stdout), "");
     }
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("startup reads provider keys from the data directory .env without overriding the shell", () => {
+  const home = mkdtempSync(join(tmpdir(), "codex2cc-dotenv-"));
+  try {
+    writeFileSync(join(home, ".env"), "OPENROUTER_API_KEY =fixture-dotenv-key-0123456789\n");
+    // An empty PATH makes the Claude launch fail after the key check instead of starting Claude.
+    const env = { ...startupEnvironment(home), PATH: home };
+    const fromFile = launch(["--provider", "openrouter"], env);
+    assert.equal(fromFile.status, 1);
+    assert.doesNotMatch(String(fromFile.stderr), /missing_provider_key/);
+    assert.match(String(fromFile.stderr), /ENOENT/);
+    writeFileSync(join(home, ".env"), "OPENROUTER_API_KEY=fixture-dotenv-key-0123456789\n");
+    const shellWins = launch(["--provider", "openrouter"], { ...env, OPENROUTER_API_KEY: "bad key" });
+    assert.match(String(shellWins.stderr), /invalid_provider_key/);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
