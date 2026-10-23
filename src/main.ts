@@ -14,9 +14,11 @@ import {
   describePlans,
   desktopProcessState,
   DRY_RUN_TENSE,
+  planAllAccountsSessionSync,
   planDesktopSessionSync,
   requireDesktopClosed,
   resolveDesktopSessionPaths,
+  runAllAccountsSessionSync,
   runDesktopSessionSync,
   syncDesktopSessionsWhenClosed,
   TO_CLAUDE_PROFILE,
@@ -173,11 +175,12 @@ async function main(): Promise<void> {
   if (command.kind === "sync-desktop-sessions") {
     const paths = resolveDesktopSessionPaths();
     if (command.dryRun) {
-      for (const line of describePlans(planDesktopSessionSync(BOTH_PROFILES, paths), DRY_RUN_TENSE)) process.stdout.write(`${line}\n`);
+      const plans = command.allAccounts ? planAllAccountsSessionSync(paths) : planDesktopSessionSync(BOTH_PROFILES, paths);
+      for (const line of describePlans(plans, DRY_RUN_TENSE)) process.stdout.write(`${line}\n`);
       return;
     }
     requireDesktopClosed(desktopProcessState());
-    const outcome = runDesktopSessionSync(BOTH_PROFILES, paths, new Date());
+    const outcome = command.allAccounts ? runAllAccountsSessionSync(paths, new Date()) : runDesktopSessionSync(BOTH_PROFILES, paths, new Date());
     for (const line of describeOutcome(outcome)) process.stdout.write(`${line}\n`);
     if (outcome.status === "failed") process.exitCode = 1;
     return;

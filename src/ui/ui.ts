@@ -22,12 +22,17 @@ import { API_PROVIDERS, apiProviderTiers, hasApiKey, isApiProvider, parseApiProv
 import { currentProvider, getProviderConfig, providerDefaultModel, providerModels } from "../providers/runtime.js";
 import { isAntigravityAvailable } from "../bridge/antigravity.js";
 import {
+  describePlans,
   desktopProcessState,
   desktopSyncReport,
+  DRY_RUN_TENSE,
+  planAllAccountsSessionSync,
   resolveDesktopSessionPaths,
+  syncAllAccountsWhenClosed,
   syncDesktopSessionsWhenClosed,
   TO_CLAUDE_PROFILE,
   TO_GATEWAY_PROFILE,
+  type DesktopSyncOutcome,
   type DesktopSyncReport,
   type SyncDirection,
 } from "../config/desktop-sessions.js";
@@ -247,7 +252,30 @@ function refreshDesktopLabels(options: GatewayOptions): boolean {
 /** Syncs Desktop session lists after a profile switch and reports it in the activity log. */
 function syncDesktopSessionsAfterSwitch(directions: readonly SyncDirection[]): DesktopSyncReport {
   const outcome = syncDesktopSessionsWhenClosed(directions, resolveDesktopSessionPaths(), desktopProcessState(), new Date());
-  const report = desktopSyncReport(outcome);
+  return logDesktopSync(outcome, desktopSyncReport(outcome));
+}
+
+const SYNC_BUTTON_RETRY_HINT = "click Sync all sessions again.";
+
+/** What the Sync all sessions button would change; Desktop may stay open while previewing. */
+function previewAllAccountsSync(): Record<string, unknown> {
+  const plans = planAllAccountsSessionSync(resolveDesktopSessionPaths());
+  const { level } = desktopSyncReport({ status: "applied", sync: { plans, entries: [], manifestPath: undefined } });
+  const changes = plans.reduce((sum, plan) => sum + plan.copies.length + plan.refreshes.length, 0);
+  return { ok: true, desktop: desktopProcessState(), changes, level, messages: describePlans(plans, DRY_RUN_TENSE) };
+}
+
+/** The Sync all sessions button: a skipped sync also lists what it would have changed. */
+function syncAllAccounts(): DesktopSyncReport {
+  const paths = resolveDesktopSessionPaths();
+  const outcome = syncAllAccountsWhenClosed(paths, desktopProcessState(), new Date());
+  const report = desktopSyncReport(outcome, SYNC_BUTTON_RETRY_HINT);
+  const pending = outcome.status === "skipped" ? describePlans(planAllAccountsSessionSync(paths), DRY_RUN_TENSE) : [];
+  return logDesktopSync(outcome, { ...report, messages: [...report.messages, ...pending] });
+}
+
+/** Records a sync in the activity log and returns its report for the control panel. */
+function logDesktopSync(outcome: DesktopSyncOutcome, report: DesktopSyncReport): DesktopSyncReport {
   const changes = outcome.status === "applied" ? outcome.sync.entries.length : outcome.status === "failed" ? outcome.entries.length : 0;
   recordLog({
     level: report.level === "success" ? "info" : report.level === "warning" ? "warn" : "error",
@@ -596,6 +624,19 @@ export async function handleUiRoute(
       response.writeHead(400, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ ok: false, error: msg }));
     }
+    return true;
+  }
+
+  if (pathname === "/api/ui/desktop-sessions/plan" && request.method === "GET") {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(previewAllAccountsSync()));
+    return true;
+  }
+
+  if (pathname === "/api/ui/desktop-sessions/sync" && request.method === "POST") {
+    const desktopSessionSync = syncAllAccounts();
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ ok: true, desktopSessionSync }));
     return true;
   }
 
@@ -2354,6 +2395,7 @@ export function renderDashboardHtml(): string {
               <div class="client-path">Claude-3p/configLibrary</div>
               <div class="client-actions">
                 <button class="btn btn-secondary btn-sm" id="btn-quick-desktop" type="button">Sync Desktop</button>
+                <button class="btn btn-secondary btn-sm" id="btn-sync-sessions" type="button" title="Copy missing Code-tab sessions between every Claude Desktop account, claude.ai and gateway">Sync all sessions</button>
               </div>
             </div>
           </div>
@@ -3179,6 +3221,26 @@ export function renderDashboardHtml(): string {
     document.getElementById("btn-quick-desktop")?.addEventListener("click", () => {
       document.getElementById("select-target").value = "desktop";
       document.getElementById("btn-apply").click();
+    });
+
+    /* Every Desktop account gets every session: preview, confirm, then copy (Desktop must be closed). */
+    document.getElementById("btn-sync-sessions")?.addEventListener("click", async () => {
+      try {
+        const preview = await (await fetch("/api/ui/desktop-sessions/plan")).json();
+        if (!preview.ok) throw new Error(preview.error);
+        if (preview.changes === 0) {
+          showConfigurationResult("Every account already lists every session.", { status: "applied", level: preview.level, messages: preview.messages });
+          return;
+        }
+        const closed = preview.desktop === "not_running";
+        if (closed && !confirm("Copy sessions between all Claude Desktop accounts?\\n\\n" + preview.messages.join("\\n"))) return;
+        const res = await fetch("/api/ui/desktop-sessions/sync", { method: "POST" });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error);
+        showConfigurationResult("Session sync:", data.desktopSessionSync);
+      } catch (err) {
+        showToast("Session sync failed: " + err.message, "error");
+      }
     });
 
     document.getElementById("btn-apply").addEventListener("click", async () => {
