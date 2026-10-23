@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import test from 'node:test';
+import { runInNewContext } from 'node:vm';
 import { CODEX2CC_DESKTOP_CONFIG_ID, resolveDefaultPaths, setupConfig } from '../config/config-setup.js';
 import { createGatewayServer, listenOnLoopback, type GatewayOptions } from '../gateway/gateway.js';
 import { BridgeError } from '../bridge/bridge.js';
@@ -132,7 +133,7 @@ test('renderDashboardHtml generates rich HTML markup with control panel componen
      assert.ok(!html.includes('prefers-color-scheme: dark'));
      assert.ok(html.includes('family=Outfit'));
      assert.ok(html.includes('family=Plus+Jakarta+Sans'));
-     assert.ok(html.includes('id="btn-provider-submit"'));
+     assert.ok(!html.includes('id="btn-provider-submit"'), 'Apply configuration activates the provider');
      assert.ok(!html.includes('M11.04 19.32Q12 21.51'), 'sparkle icon must not be present in markup');
 });
 
@@ -142,7 +143,7 @@ test('setup section holds the provider switch, gateway endpoint, Claude clients 
      const usageStart = html.indexOf('id="tab-usage"');
      assert.ok(setupStart !== -1 && usageStart > setupStart);
      const setup = html.slice(setupStart, usageStart);
-     for (const marker of ['id="btn-provider-submit"', 'id="input-url"', 'id="btn-quick-cli"', 'id="tier-fable"', 'id="btn-save-tier-mapping"']) {
+     for (const marker of ['id="select-provider"', 'id="btn-apply"', 'id="input-url"', 'id="btn-quick-cli"', 'id="tier-fable"', 'id="btn-save-tier-mapping"']) {
           assert.ok(setup.includes(marker), `${marker} should live in the setup section`);
      }
      assert.ok(!html.includes('id="tab-routing"'), 'model routing is merged into setup');
@@ -150,7 +151,7 @@ test('setup section holds the provider switch, gateway endpoint, Claude clients 
      assert.ok(html.includes('id="btn-toggle-sidebar"'));
 });
 
-test('provider buttons only stage a choice; the switch runs when Submit is pressed', () => {
+test('provider buttons only stage a choice; the switch runs when Apply configuration is pressed', () => {
      const html = renderDashboardHtml();
      const script = html.match(/<script>([\s\S]*?)<\/script>/i)?.[1];
      assert.ok(script);
@@ -609,6 +610,46 @@ test('switching provider updates tier mapping and saves per-provider independent
      }
 });
 
+test('a staged provider mapping is listed, saved and reset without switching the active provider', async () => {
+     const directory = mkdtempSync(join(tmpdir(), 'codex2cc-staged-tiers-'));
+     const tierStore = TierModelStore.open(join(directory, 'settings.json'), {});
+     const options: GatewayOptions = { ...mockOptions, tierStore };
+     const statusMappings = () => (getStatus(options, 3456) as unknown as StatusResponse & { tierMapping: { providers: Record<string, StatusResponse['tierMapping']> } }).tierMapping.providers;
+     const post = async (path: string, body: object) => {
+          const output = createMockResponse();
+          await handleUiRoute(options, createMockRequest('POST', path, body), output.response, path, 3456);
+          return output.getOutput();
+     };
+
+     try {
+          const initial = statusMappings();
+          assert.deepEqual(initial.codex!.current, DEFAULT_TIER_MODELS);
+          assert.deepEqual(initial.antigravity!.current, ANTIGRAVITY_TIER_MODELS);
+          assert.ok(initial.antigravity!.models.some((model) => model.slug === ANTIGRAVITY_TIER_MODELS.opus));
+
+          const staged = { ...ANTIGRAVITY_TIER_MODELS, haiku: ANTIGRAVITY_TIER_MODELS.sonnet };
+          const saved = await post('/api/ui/tiers', { provider: 'antigravity', tiers: staged });
+          assert.equal(saved.statusCode, 200, saved.body);
+          assert.equal(JSON.parse(saved.body).desktopLabelsUpdated, false, 'Desktop labels follow the active provider only');
+          assert.equal(tierStore.getProvider(), 'codex');
+          assert.equal(tierStore.isCustom('codex'), false);
+          assert.deepEqual(statusMappings().antigravity!.current, staged);
+          assert.equal(statusMappings().antigravity!.custom, true);
+
+          const rejected = await post('/api/ui/tiers', { provider: 'antigravity', tiers: DEFAULT_TIER_MODELS });
+          assert.equal(rejected.statusCode, 400, 'models are validated against the staged provider catalog');
+          const unknown = await post('/api/ui/tiers', { provider: 'nope', tiers: DEFAULT_TIER_MODELS });
+          assert.equal(unknown.statusCode, 400);
+
+          const reset = await post('/api/ui/tiers/reset', { provider: 'antigravity' });
+          assert.equal(reset.statusCode, 200, reset.body);
+          assert.equal(tierStore.isCustom('antigravity'), false);
+          assert.equal(tierStore.getProvider(), 'codex');
+     } finally {
+          rmSync(directory, { recursive: true, force: true });
+     }
+});
+
 test('unified settings.json persists provider, effort, and per-provider model mappings together', async () => {
      const directory = mkdtempSync(join(tmpdir(), 'codex2cc-unified-settings-'));
      const filePath = join(directory, 'settings.json');
@@ -705,6 +746,25 @@ test('API provider buttons stage selection and settings never request a secret',
      assert.ok(!panel.includes('type="password"'));
      assert.ok(!panel.includes('id="api-key"'));
      assert.ok(html.includes('document.getElementById("card-quota-5h").hidden = isApi'));
+});
+
+test('API provider panel sets display only while it is not hidden, so the hidden attribute still hides it', () => {
+     const html = renderDashboardHtml();
+     const baseRule = /\.api-panel \{([^}]*)\}/.exec(html);
+     assert.ok(baseRule, 'api-panel base rule exists');
+     assert.doesNotMatch(baseRule[1] ?? '', /display\s*:/);
+     assert.ok(html.includes('.api-panel:not([hidden]) { display: grid; }'));
+});
+
+test('model routing tier pickers are searchable comboboxes that keep the select as the saved value', () => {
+     const html = renderDashboardHtml();
+     assert.ok(html.includes('input.setAttribute("role", "combobox")'));
+     assert.ok(html.includes('list.setAttribute("role", "listbox")'));
+     assert.ok(html.includes('function mountModelCombobox(select)'));
+     assert.ok(html.includes('refreshModelCombobox(select);'));
+     assert.ok(html.includes('for (const select of document.querySelectorAll("select[data-model-picker]")) mountModelCombobox(select);'));
+     assert.equal((html.match(/<select [^>]*data-model-picker[ >]/g) ?? []).length, 5);
+     assert.ok(html.includes('select.dispatchEvent(new Event("change", { bubbles: true }));'));
 });
 
 test('API settings, key indicators and every provider mapping survive independent switches', async () => {
@@ -974,4 +1034,24 @@ test("API setup uses its catalog and does not carry another provider's model ove
      } finally {
           rmSync(directory, { recursive: true, force: true });
      }
+});
+
+test('sidebar pill reports whether Claude clients route through the gateway, not just that it runs', () => {
+     const script = renderDashboardHtml().match(/<script>([\s\S]*?)<\/script>/i)?.[1];
+     assert.ok(script);
+     const from = script.indexOf('    function gatewayBadgeState(');
+     const to = script.indexOf('    function renderGatewayBadge(', from);
+     assert.ok(from >= 0 && to > from);
+     const badge = runInNewContext(script.slice(from, to) + 'gatewayBadgeState;', {}) as (status: object) => { tone: string; text: string; title: string };
+     const client = (configured: boolean, inSync: boolean) => ({ configured, inSync });
+
+     const official = badge({ cli: client(false, false), desktop: client(false, false) });
+     assert.equal(official.tone, 'idle');
+     assert.match(official.text, /official Claude/);
+     assert.equal(badge({ cli: client(true, true), desktop: client(true, true) }).text, 'Via gateway · CLI + Desktop');
+     const partial = badge({ cli: client(true, true), desktop: client(true, false) });
+     assert.equal(partial.tone, 'warn');
+     assert.match(partial.title, /Desktop config is out of sync/);
+     assert.equal(badge({ cli: client(true, false), desktop: client(false, false) }).text, 'Gateway out of sync');
+     assert.ok(!renderDashboardHtml().includes('Server running'));
 });

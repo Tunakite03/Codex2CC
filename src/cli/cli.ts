@@ -65,7 +65,7 @@ Options:
 Arguments after "--" are passed to Claude Code unchanged.
 Provider precedence: --provider > CODEX2CC_PROVIDER > saved settings > codex.
 Environment: CODEX2CC_PROVIDER, CODEX2CC_TOKEN, CODEX2CC_MODEL_FABLE/OPUS/SONNET/HAIKU.
-API keys: OPENROUTER_API_KEY, OPENAI_API_KEY, OPENCODE_API_KEY (environment only).
+API keys: OPENROUTER_API_KEY, OPENAI_API_KEY, OPENCODE_API_KEY, ... (shell environment or <data dir>/.env; the shell wins).
 Use --ui to configure endpoint URLs, the API key environment variable name, default model,
 and model catalog. Supported adapter protocols: chat-completions, responses, anthropic-messages.
 Settings: CODEX2CC_SETTINGS_FILE (legacy alias: CODEX2CC_TIERS_FILE), otherwise

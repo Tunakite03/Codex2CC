@@ -40,6 +40,8 @@ export const ApiModelSchema = z.object({
 });
 export type ApiModel = z.infer<typeof ApiModelSchema>;
 
+export const MODEL_CATALOG_LIMIT = 200;
+
 /** URLs are complete resource endpoints, so a provider's model protocols need not share a base URL. */
 export const ApiProviderConfigSchema = z.object({
   apiKeyEnv: z.string().regex(/^[A-Z][A-Z0-9_]*_API_KEY$/, "must name an environment variable ending in _API_KEY"),
@@ -49,7 +51,7 @@ export const ApiProviderConfigSchema = z.object({
     "anthropic-messages": EndpointSchema.optional(),
   }),
   defaultModel: ModelSlugSchema,
-  models: z.array(ApiModelSchema).min(1).max(200),
+  models: z.array(ApiModelSchema).min(1).max(MODEL_CATALOG_LIMIT),
 }).superRefine((config, context) => {
   const slugs = new Set<string>();
   for (const [index, model] of config.models.entries()) {
