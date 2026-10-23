@@ -17,6 +17,10 @@ import { resolveDataDir } from "../telemetry/logger.js";
 
 export type DesktopProfile = "claude" | "thirdParty";
 export type SyncDirection = { readonly from: DesktopProfile; readonly to: DesktopProfile };
+/** "all": every account/org of both profiles, as pooled by the all-accounts sync. */
+export type SyncSource = DesktopProfile | "all";
+
+const PROFILES: readonly DesktopProfile[] = ["claude", "thirdParty"];
 
 export const TO_GATEWAY_PROFILE: readonly SyncDirection[] = [{ from: "claude", to: "thirdParty" }];
 export const TO_CLAUDE_PROFILE: readonly SyncDirection[] = [{ from: "thirdParty", to: "claude" }];
@@ -103,11 +107,13 @@ export function desktopProcessState(platformName: string = platform(), probe: Pr
 
 const SessionEntry = z.object({ sessionId: z.string().regex(/^local_[A-Za-z0-9-]+$/), cliSessionId: z.string().min(1) }).loose();
 
+type ScopeSession = { readonly file: string; readonly sessionId: string; readonly cliSessionId: string; readonly lastActivityAt: number };
+
 type ScopeListing = {
   readonly id: string;
   readonly profileDir: string;
   readonly dir: string;
-  readonly sessions: ReadonlyArray<{ readonly file: string; readonly sessionId: string; readonly cliSessionId: string; readonly lastActivityAt: number }>;
+  readonly sessions: readonly ScopeSession[];
   readonly tombstones: ReadonlySet<string>;
   readonly invalid: number;
 };
@@ -121,7 +127,7 @@ function directories(path: string): string[] {
 function listScopes(profileDir: string): ScopeListing[] {
   const root = join(profileDir, "claude-code-sessions");
   return directories(root).flatMap(directories).map((dir): ScopeListing => {
-    const sessions: Array<ScopeListing["sessions"][number]> = [];
+    const sessions: ScopeSession[] = [];
     const tombstones = new Set<string>();
     let invalid = 0;
     for (const name of readdirSync(dir)) {
@@ -184,12 +190,14 @@ function transcriptIds(projectsDir: string): ReadonlySet<string> {
 export type PlannedCopy = { readonly sessionId: string; readonly source: string; readonly destination: string };
 
 export type DirectionPlan = {
-  readonly from: DesktopProfile;
+  readonly from: SyncSource;
   readonly to: DesktopProfile;
   /** Set when nothing can be copied in this direction. */
   readonly blocked?: "no_source_sessions" | "no_destination_scope";
   /** The explicitly selected destination scope, or its sole existing scope. */
   readonly destinationScope?: string;
+  /** Its `<account>/<org>` id, set by the all-accounts sync, which plans one scope at a time. */
+  readonly destinationScopeId?: string;
   readonly copies: readonly PlannedCopy[];
   /** Copies codex2cc made earlier whose original has newer activity; they are replaced by the original. */
   readonly refreshes: readonly PlannedCopy[];
@@ -273,7 +281,7 @@ function selectScope(scopes: readonly ScopeListing[], paths: DesktopSessionPaths
     return target;
   }
   if (scopes.length > 1) {
-    throw new BridgeError(409, "ambiguous_desktop_scope", `Desktop session sync requires an explicit account/org. Set ${SCOPE_ENV[profile]} to one of: ${scopes.map(describeScope).join(", ")}. Then rerun codex2cc --sync-desktop-sessions --dry-run.`);
+    throw new BridgeError(409, "ambiguous_desktop_scope", `Desktop session sync requires an explicit account/org. Set ${SCOPE_ENV[profile]} to one of: ${scopes.map(describeScope).join(", ")}. Then rerun codex2cc --sync-desktop-sessions --dry-run. To sync every account instead, use the control panel's Sync all sessions button or codex2cc --sync-desktop-sessions --all-accounts.`);
   }
   return scopes[0];
 }
@@ -306,16 +314,28 @@ function planDirection(
   const destinationScopes = primaryDestinationScopes.length > 0 ? primaryDestinationScopes : allDestinationScopes;
   const invalid = sourceScopes.reduce((sum, scope) => sum + scope.invalid, 0);
   const sources = sourceScopes.flatMap((scope) => scope.sessions);
-  const empty = { alreadyPresent: 0, deletedInDestination: 0, missingTranscript: 0, invalid };
-  if (sources.length === 0) return { ...direction, blocked: "no_source_sessions", copies: [], refreshes: [], skipped: empty };
+  if (sources.length === 0) return blockedPlan(direction, "no_source_sessions", invalid);
   const target = selectScope(destinationScopes, paths, direction.to);
-  if (target === undefined) return { ...direction, blocked: "no_destination_scope", copies: [], refreshes: [], skipped: empty };
+  if (target === undefined) return blockedPlan(direction, "no_destination_scope", invalid);
+  return { ...planIntoScope(target, sources, transcripts, invalid), ...direction, refreshes: planRefreshes(sourceScopes, [target], owned) };
+}
 
+function blockedPlan(route: { readonly from: SyncSource; readonly to: DesktopProfile }, blocked: NonNullable<DirectionPlan["blocked"]>, invalid: number): DirectionPlan {
+  return { ...route, blocked, copies: [], refreshes: [], skipped: { alreadyPresent: 0, deletedInDestination: 0, missingTranscript: 0, invalid } };
+}
+
+/** The sources missing from `target` that can be added: not deleted there and with a local transcript. */
+function planIntoScope(
+  target: ScopeListing,
+  sources: readonly ScopeSession[],
+  transcripts: ReadonlySet<string>,
+  invalid: number,
+): Pick<DirectionPlan, "destinationScope" | "copies" | "skipped"> {
   // A session in another account/org is not present in the selected destination.
   const presentSessions = new Set(target.sessions.map((session) => session.sessionId));
   const presentTranscripts = new Set(target.sessions.map((session) => session.cliSessionId));
   const deleted = target.tombstones;
-  const skipped = { ...empty };
+  const skipped = { alreadyPresent: 0, deletedInDestination: 0, missingTranscript: 0, invalid };
   const copies: PlannedCopy[] = [];
   for (const session of sources) {
     if (presentSessions.has(session.sessionId) || presentTranscripts.has(session.cliSessionId)) {
@@ -330,7 +350,7 @@ function planDirection(
       copies.push({ sessionId: session.sessionId, source: session.file, destination: join(target.dir, basename(session.file)) });
     }
   }
-  return { ...direction, destinationScope: target.dir, copies, refreshes: planRefreshes(sourceScopes, [target], owned), skipped };
+  return { destinationScope: target.dir, copies, skipped };
 }
 
 /** Read-only: which session entries each direction would add or refresh. */
@@ -338,6 +358,41 @@ export function planDesktopSessionSync(directions: readonly SyncDirection[], pat
   const transcripts = transcriptIds(paths.projectsDir);
   const owned = ownedCopies(paths.manifestDir);
   return directions.map((direction) => planDirection(direction, paths, transcripts, owned));
+}
+
+/**
+ * Read-only: one plan per account/org scope of both profiles, each receiving every session any other
+ * scope has. The union of all session lists is the shared pool, so there is no separate store to keep
+ * consistent; the newest entry of a session is its source. Scope selections (CODEX2CC_*_SESSION_SCOPE)
+ * narrow only the profile-switch sync: this one is explicitly for every account.
+ */
+export function planAllAccountsSessionSync(paths: DesktopSessionPaths): DirectionPlan[] {
+  const transcripts = transcriptIds(paths.projectsDir);
+  const owned = ownedCopies(paths.manifestDir);
+  const listings = PROFILES.map((profile) => ({ profile, scopes: listProfileScopes(paths, profile) }));
+  const allScopes = listings.flatMap(({ scopes }) => scopes);
+  const pool = new Map<string, ScopeSession>();
+  for (const session of allScopes.flatMap((scope) => scope.sessions)) {
+    const known = pool.get(session.sessionId);
+    if (known === undefined || session.lastActivityAt > known.lastActivityAt) pool.set(session.sessionId, session);
+  }
+  const sources = [...pool.values()];
+  return listings.flatMap(({ profile, scopes }): DirectionPlan[] => {
+    const route = { from: "all", to: profile } as const;
+    // Each scope reports its own unreadable entries, so the lines add up to the total.
+    const invalid = scopes.reduce((sum, scope) => sum + scope.invalid, 0);
+    if (sources.length === 0) return [blockedPlan(route, "no_source_sessions", invalid)];
+    // Previous locations stay sources; they receive copies only while the profile has nothing else.
+    const primary = scopes.filter((scope) => scope.profileDir === paths.profiles[profile]);
+    const targets = primary.length > 0 ? primary : scopes;
+    if (targets.length === 0) return [blockedPlan(route, "no_destination_scope", invalid)];
+    return targets.map((target) => ({
+      ...route,
+      ...planIntoScope(target, sources, transcripts, target.invalid),
+      destinationScopeId: target.id,
+      refreshes: planRefreshes(allScopes, [target], owned),
+    }));
+  });
 }
 
 export type AppliedSync = { readonly plans: readonly DirectionPlan[]; readonly entries: readonly SyncEntry[]; readonly manifestPath: string | undefined };
@@ -436,8 +491,17 @@ function isFileSystemError(error: unknown): error is NodeJS.ErrnoException {
  * anything else is a defect and propagates.
  */
 export function runDesktopSessionSync(directions: readonly SyncDirection[], paths: DesktopSessionPaths, now: Date): DesktopSyncOutcome {
+  return runPlannedSync(() => planDesktopSessionSync(directions, paths), paths.manifestDir, now);
+}
+
+/** {@link runDesktopSessionSync} for {@link planAllAccountsSessionSync}. */
+export function runAllAccountsSessionSync(paths: DesktopSessionPaths, now: Date): DesktopSyncOutcome {
+  return runPlannedSync(() => planAllAccountsSessionSync(paths), paths.manifestDir, now);
+}
+
+function runPlannedSync(plan: () => readonly DirectionPlan[], manifestDir: string, now: Date): DesktopSyncOutcome {
   try {
-    return { status: "applied", sync: applyDesktopSessionSync(planDesktopSessionSync(directions, paths), paths.manifestDir, now) };
+    return { status: "applied", sync: applyDesktopSessionSync(plan(), manifestDir, now) };
   } catch (error) {
     if (error instanceof DesktopSyncError) return { status: "failed", error: error.message, entries: error.entries, manifestPath: error.manifestPath };
     if (error instanceof BridgeError || isFileSystemError(error)) return { status: "failed", error: error.message, entries: [], manifestPath: undefined };
@@ -456,7 +520,18 @@ export function syncDesktopSessionsWhenClosed(
   return runDesktopSessionSync(directions, paths, now);
 }
 
-const PROFILE_LABEL: Readonly<Record<DesktopProfile, string>> = { claude: "Claude (claude.ai)", thirdParty: "Claude-3p (gateway)" };
+/** {@link syncDesktopSessionsWhenClosed} for every account of both profiles. */
+export function syncAllAccountsWhenClosed(paths: DesktopSessionPaths, desktop: DesktopProcessState, now: Date): DesktopSyncOutcome {
+  if (desktop !== "not_running") return { status: "skipped", desktop };
+  return runAllAccountsSessionSync(paths, now);
+}
+
+const PROFILE_LABEL: Readonly<Record<SyncSource, string>> = { claude: "Claude (claude.ai)", thirdParty: "Claude-3p (gateway)", all: "All accounts" };
+
+/** Account/org ids are UUID pairs; their first groups are enough to tell a person's scopes apart. */
+function shortScopeId(id: string): string {
+  return id.split("/").map((part) => part.split("-")[0]).join("/");
+}
 
 export type PlanTense = { readonly add: string; readonly refresh: string };
 export const DRY_RUN_TENSE: PlanTense = { add: "would copy", refresh: "would refresh" };
@@ -465,7 +540,8 @@ export const APPLIED_TENSE: PlanTense = { add: "copied", refresh: "refreshed" };
 /** Human-readable lines for a plan, in the tense of a dry run or of an applied sync. */
 export function describePlans(plans: readonly DirectionPlan[], tense: PlanTense): string[] {
   return plans.map((plan) => {
-    const route = `${PROFILE_LABEL[plan.from]} -> ${PROFILE_LABEL[plan.to]}`;
+    const scope = plan.destinationScopeId === undefined ? "" : ` [${shortScopeId(plan.destinationScopeId)}]`;
+    const route = `${PROFILE_LABEL[plan.from]} -> ${PROFILE_LABEL[plan.to]}${scope}`;
     if (plan.blocked === "no_source_sessions") return `${route}: no sessions to copy.`;
     if (plan.blocked === "no_destination_scope") return `${route}: skipped, open Claude Desktop once in that mode so it creates its session list, then quit it and rerun: codex2cc --sync-desktop-sessions`;
     const { alreadyPresent, deletedInDestination, missingTranscript, invalid } = plan.skipped;
@@ -473,7 +549,10 @@ export function describePlans(plans: readonly DirectionPlan[], tense: PlanTense)
   });
 }
 
-export function describeOutcome(outcome: DesktopSyncOutcome): string[] {
+/** How a person retries a skipped sync; the control panel's button supplies its own. */
+export const CLI_RETRY_HINT = "run: codex2cc --sync-desktop-sessions";
+
+export function describeOutcome(outcome: DesktopSyncOutcome, retryHint: string = CLI_RETRY_HINT): string[] {
   if (outcome.status === "applied") {
     const lines = describePlans(outcome.sync.plans, APPLIED_TENSE);
     return outcome.sync.manifestPath === undefined ? lines : [...lines, `Changes are listed in ${outcome.sync.manifestPath}.`];
@@ -487,7 +566,7 @@ export function describeOutcome(outcome: DesktopSyncOutcome): string[] {
     return [outcome.error, ...landed];
   }
   const reason = outcome.desktop === "running" ? "Claude Desktop is running" : "could not confirm that Claude Desktop is closed";
-  return [`Desktop session sync skipped: ${reason}. Quit Claude Desktop, then run: codex2cc --sync-desktop-sessions`];
+  return [`Desktop session sync skipped: ${reason}. Quit Claude Desktop, then ${retryHint}`];
 }
 
 export type DesktopSyncReport = {
@@ -498,11 +577,11 @@ export type DesktopSyncReport = {
 };
 
 /** The outcome in the shape the control panel shows after a setup or reset. */
-export function desktopSyncReport(outcome: DesktopSyncOutcome): DesktopSyncReport {
+export function desktopSyncReport(outcome: DesktopSyncOutcome, retryHint?: string): DesktopSyncReport {
   const incomplete = outcome.status === "applied" && outcome.sync.plans.some((plan) =>
     plan.blocked === "no_destination_scope" || plan.skipped.missingTranscript > 0 || plan.skipped.invalid > 0);
   const level = outcome.status === "failed" ? "error" : outcome.status === "skipped" || incomplete ? "warning" : "success";
-  return { status: outcome.status, level, messages: describeOutcome(outcome) };
+  return { status: outcome.status, level, messages: describeOutcome(outcome, retryHint) };
 }
 
 /** For the explicit command: refuses instead of skipping, since syncing was the whole request. */

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { syncBuiltinESMExports } from "node:module";
 import test, { type TestContext } from "node:test";
@@ -14,10 +14,13 @@ import {
   desktopProcessState,
   desktopSyncReport,
   DRY_RUN_TENSE,
+  planAllAccountsSessionSync,
   planDesktopSessionSync,
   requireDesktopClosed,
   resolveDesktopSessionPaths,
+  runAllAccountsSessionSync,
   runDesktopSessionSync,
+  syncAllAccountsWhenClosed,
   syncDesktopSessionsWhenClosed,
   TO_CLAUDE_PROFILE,
   TO_GATEWAY_PROFILE,
@@ -49,6 +52,14 @@ test("Windows session sync uses the LocalAppData gateway profile and the Roaming
     claude: join("roaming", "Claude"),
     thirdParty: join("local", "Claude-3p"),
   });
+});
+
+test("macOS session sync reads both profiles from Application Support, with no previous gateway location", () => {
+  const paths = resolveDesktopSessionPaths({ APPDATA: "ignored", LOCALAPPDATA: "ignored" }, "darwin");
+  const support = join(homedir(), "Library", "Application Support");
+  assert.deepEqual(paths.profiles, { claude: join(support, "Claude"), thirdParty: join(support, "Claude-3p") });
+  assert.deepEqual(paths.legacyProfiles, { thirdParty: [] });
+  assert.equal(paths.projectsDir, join(homedir(), ".claude", "projects"));
 });
 
 type Sandbox = { readonly paths: DesktopSessionPaths; readonly cleanup: () => void };
@@ -645,4 +656,77 @@ test("sync reports warn when a destination scope or source transcripts are missi
     assert.equal(noTranscript.level, "warning");
     assert.match(noTranscript.messages.join(" "), /1 without transcript/);
   } finally { cleanup(); }
+});
+
+test("the all-accounts sync gives every scope of both profiles every session, ignoring scope selections", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    const personal = scopeDir(paths.profiles.claude, "acct-a", "org-1");
+    const work = scopeDir(paths.profiles.claude, "acct-b", "org-2");
+    const gateway = scopeDir(paths.profiles.thirdParty, "gw", "org-gw");
+    writeSession(personal, "a1", "cli-a1", 1_000);
+    writeSession(work, "b1", "cli-b1", 2_000);
+    writeSession(work, "b2", "cli-missing", 3_000);
+    writeSession(gateway, "g1", "cli-g1", 4_000);
+    writeFileSync(join(personal, "deleted_g1"), "1");
+    for (const id of ["cli-a1", "cli-b1", "cli-g1"]) writeTranscript(paths, id);
+    const selected = { ...paths, selectedScopes: { claude: "acct-a/org-1", thirdParty: "gw/org-gw" } };
+
+    const plans = planAllAccountsSessionSync(selected);
+    assert.deepEqual(plans.map((plan) => [plan.from, plan.to, plan.destinationScopeId]), [
+      ["all", "claude", "acct-a/org-1"], ["all", "claude", "acct-b/org-2"], ["all", "thirdParty", "gw/org-gw"],
+    ]);
+    assert.deepEqual(plans.map((plan) => plan.copies.map((copy) => copy.sessionId).sort()), [
+      ["local_b1"], ["local_a1", "local_g1"], ["local_a1", "local_b1"],
+    ]);
+    assert.deepEqual(plans[0]!.skipped, { alreadyPresent: 1, deletedInDestination: 1, missingTranscript: 1, invalid: 0 });
+    assert.match(describePlans(plans, DRY_RUN_TENSE)[1]!, /^All accounts -> Claude \(claude\.ai\) \[acct\/org\]: would copy 2 session/);
+
+    const outcome = syncAllAccountsWhenClosed(selected, "not_running", NOW);
+    assert.equal(outcome.status, "applied");
+    assert.deepEqual(sessionFiles(personal), ["local_a1.json", "local_b1.json"]);
+    assert.deepEqual(sessionFiles(work), ["local_a1.json", "local_b1.json", "local_b2.json", "local_g1.json"]);
+    assert.deepEqual(sessionFiles(gateway), ["local_a1.json", "local_b1.json", "local_g1.json"]);
+    const again = planAllAccountsSessionSync(selected);
+    assert.equal(again.reduce((sum, plan) => sum + plan.copies.length + plan.refreshes.length, 0), 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("the all-accounts sync refreshes its earlier copies from the newest original and never touches files while Desktop is open", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    const personal = scopeDir(paths.profiles.claude, "acct-a", "org-1");
+    const work = scopeDir(paths.profiles.claude, "acct-b", "org-2");
+    const original = writeSession(personal, "a1", "cli-a1", 1_000);
+    writeTranscript(paths, "cli-a1");
+    for (const desktop of ["running", "unknown"] as const) {
+      const report = desktopSyncReport(syncAllAccountsWhenClosed(paths, desktop, NOW), "click Sync all sessions again.");
+      assert.equal(report.status, "skipped");
+      assert.match(report.messages[0] ?? "", /click Sync all sessions again\.$/);
+    }
+    assert.deepEqual(sessionFiles(work), []);
+    assert.equal(runAllAccountsSessionSync(paths, NOW).status, "applied");
+    setActivity(original, 5_000, "Continued");
+    const [, workPlan] = planAllAccountsSessionSync(paths);
+    assert.deepEqual(workPlan!.refreshes, [{ sessionId: "local_a1", source: original, destination: join(work, "local_a1.json") }]);
+    runAllAccountsSessionSync(paths, new Date(NOW.getTime() + 1_000));
+    assert.equal(readFileSync(join(work, "local_a1.json"), "utf8"), readFileSync(original, "utf8"));
+  } finally {
+    cleanup();
+  }
+});
+
+test("the all-accounts sync reports a profile without a session list instead of guessing one", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    writeSession(scopeDir(paths.profiles.claude, "acct", "org"), "c1", "cli-c1", 1_000);
+    writeTranscript(paths, "cli-c1");
+    const plans = planAllAccountsSessionSync(paths);
+    assert.deepEqual(plans.map((plan) => [plan.to, plan.blocked]), [["claude", undefined], ["thirdParty", "no_destination_scope"]]);
+    assert.equal(desktopSyncReport(runAllAccountsSessionSync(paths, NOW)).level, "warning");
+  } finally {
+    cleanup();
+  }
 });

@@ -24,7 +24,7 @@ export type CliCommand =
       readonly kind: "reset-config";
       readonly target: "cli" | "desktop" | "all";
     }
-  | { readonly kind: "sync-desktop-sessions"; readonly dryRun: boolean }
+  | { readonly kind: "sync-desktop-sessions"; readonly dryRun: boolean; readonly allAccounts: boolean }
   | { readonly kind: "claude"; readonly model: string | undefined; readonly claudeArgs: readonly string[]; readonly provider?: ProviderType | undefined };
 
 export const USAGE = `Usage: codex2cc [options] [-- <claude arguments>]
@@ -54,6 +54,8 @@ Options:
   --token <secret>          Gateway token for client setup (or CODEX2CC_TOKEN)
   --provider <name>         Backend: ${PROVIDERS.join(", ")}
   --dry-run                 With --sync-desktop-sessions: show what would be copied, change nothing
+  --all-accounts            With --sync-desktop-sessions: sync every account of both profiles with
+                            each other (ignores CODEX2CC_*_SESSION_SCOPE)
   -p, --print <prompt>      Run Claude Code non-interactively
   -c, --continue            Continue the previous Claude Code session
   --permission-mode <mode>  Claude Code permission mode
@@ -94,6 +96,7 @@ const OPTIONS = {
   "reset-desktop": { type: "boolean" },
   "sync-desktop-sessions": { type: "boolean" },
   "dry-run": { type: "boolean" },
+  "all-accounts": { type: "boolean" },
   "gateway-url": { type: "string" },
   url: { type: "string" },
   token: { type: "string" },
@@ -145,8 +148,10 @@ export function parseCli(argv: readonly string[]): CliCommand {
   if (values["list-models"]) return { kind: "list-models", ...(provider !== undefined ? { provider } : {}) };
 
   const dryRun = values["dry-run"] === true;
-  if (values["sync-desktop-sessions"]) return { kind: "sync-desktop-sessions", dryRun };
+  const allAccounts = values["all-accounts"] === true;
+  if (values["sync-desktop-sessions"]) return { kind: "sync-desktop-sessions", dryRun, allAccounts };
   if (dryRun) throw new BridgeError(400, "invalid_arguments", "--dry-run is only valid with --sync-desktop-sessions.");
+  if (allAccounts) throw new BridgeError(400, "invalid_arguments", "--all-accounts is only valid with --sync-desktop-sessions.");
 
   if (values["reset-config"] || values["reset-cli"] || values["reset-desktop"]) {
     const target = values["reset-config"] ? "all" : values["reset-desktop"] ? "desktop" : "cli";

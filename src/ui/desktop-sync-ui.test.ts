@@ -114,3 +114,63 @@ test("persistent sync feedback is outside tab panels so reset warnings remain vi
   assert.ok(report < firstPanel);
   assert.equal(html.match(/id="desktop-sync-report"/g)?.length, 1);
 });
+
+// The Sync all sessions button previews first, asks before copying, and lets the server skip while Desktop is open.
+function syncButton(preview: Record<string, unknown>, report: DesktopSyncReport, confirmed = true) {
+  const script = renderDashboardHtml().match(/<script>([\s\S]*?)<\/script>/i)?.[1] ?? "";
+  const cut = (start: string, end: string) => script.slice(script.indexOf(start), script.indexOf(end, script.indexOf(start)));
+  const code = cut("function showConfigurationResult(", "/* Tab Controller */")
+    + cut("/* Every Desktop account gets every session", 'document.getElementById("btn-apply").addEventListener');
+  let click: (() => Promise<void>) | undefined;
+  const notice = { textContent: "", className: "", hidden: true, setAttribute: () => {} };
+  const calls: string[] = [];
+  const prompts: string[] = [];
+  const toasts: Array<{ message: string; type: string }> = [];
+  runInNewContext(code, {
+    document: { getElementById: (id: string) => id === "desktop-sync-report" ? notice : id === "btn-sync-sessions"
+      ? { addEventListener: (_event: string, callback: () => Promise<void>) => { click = callback; } }
+      : assert.fail(`unexpected element ${id}`) },
+    showToast: (message: string, type = "success") => toasts.push({ message, type }),
+    confirm: (message: string) => { prompts.push(message); return confirmed; },
+    fetch: async (url: string, init?: { method?: string }) => {
+      calls.push(`${init?.method ?? "GET"} ${url}`);
+      return { json: async () => url.endsWith("/plan") ? { ok: true, ...preview } : { ok: true, desktopSessionSync: report } };
+    },
+  });
+  return { notice, calls, prompts, toasts, click: async () => { assert.ok(click, "missing Sync all sessions handler"); await click(); } };
+}
+
+const pendingPreview = { desktop: "not_running", changes: 2, level: "success", messages: ["All accounts -> Claude (claude.ai) [a/b]: would copy 2 session(s)"] };
+
+test("Sync all sessions confirms the previewed changes before copying them", async () => {
+  const ui = syncButton(pendingPreview, { status: "applied", level: "success", messages: ["copied 2 session(s)"] });
+  await ui.click();
+  assert.deepEqual(ui.calls, ["GET /api/ui/desktop-sessions/plan", "POST /api/ui/desktop-sessions/sync"]);
+  assert.ok(ui.prompts[0]?.includes("would copy 2 session(s)"));
+  assert.ok(ui.prompts[0]?.includes("\n"), "the confirmation lists one change per line");
+  assert.ok(ui.notice.textContent.includes("copied 2 session(s)"));
+  assert.equal(ui.notice.className, "desktop-sync-report success");
+});
+
+test("Sync all sessions copies nothing when the confirmation is declined", async () => {
+  const ui = syncButton(pendingPreview, { status: "applied", level: "success", messages: [] }, false);
+  await ui.click();
+  assert.deepEqual(ui.calls, ["GET /api/ui/desktop-sessions/plan"]);
+  assert.equal(ui.notice.hidden, true);
+});
+
+test("Sync all sessions skips the confirmation while Desktop is open and shows the server's skip report", async () => {
+  const ui = syncButton({ ...pendingPreview, desktop: "running" }, { status: "skipped", level: "warning", messages: ["Quit Claude Desktop, then click Sync all sessions again."] });
+  await ui.click();
+  assert.deepEqual(ui.prompts, []);
+  assert.deepEqual(ui.calls, ["GET /api/ui/desktop-sessions/plan", "POST /api/ui/desktop-sessions/sync"]);
+  assert.equal(ui.notice.className, "desktop-sync-report warning");
+  assert.ok(ui.notice.textContent.includes("History sync skipped."));
+});
+
+test("Sync all sessions reports an already complete sync without writing", async () => {
+  const ui = syncButton({ ...pendingPreview, changes: 0, messages: ["nothing to copy"] }, { status: "applied", level: "success", messages: [] });
+  await ui.click();
+  assert.deepEqual(ui.calls, ["GET /api/ui/desktop-sessions/plan"]);
+  assert.ok(ui.notice.textContent.includes("Every account already lists every session."));
+});
