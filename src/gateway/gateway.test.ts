@@ -3,7 +3,8 @@ import { createServer, request as httpRequest, type IncomingHttpHeaders, type In
 import { connect } from "node:net";
 import test from "node:test";
 import { createGatewayServer, listenOnLoopback, promptCacheKey, type GatewayOptions } from "./gateway.js";
-import { encodeReasoningSignature } from "../bridge/bridge.js";
+import { encodeReasoningSignature, estimateCodexInputTokens, estimateTextTokens, MessageRequest, toOpenAIRequest } from "../bridge/bridge.js";
+import { formatMessagesForAntigravity, pruneToolsForAntigravity } from "../bridge/antigravity.js";
 import { getLogs } from "../telemetry/logger.js";
 import { getTokenUsageStats, resetTokenUsage } from "../telemetry/usage.js";
 
@@ -470,8 +471,89 @@ test("gateway estimates token counts locally and requires credentials for it", a
       method: "POST", headers: { "Content-Type": "application/json", ...AUTH }, body: JSON.stringify(body),
     });
     assert.equal(counted.status, 200);
-    assert.deepEqual(await counted.json(), { input_tokens: 3 });
+    assert.deepEqual(await counted.json(), { input_tokens: 11 });
     assert.equal(upstream.requests.length, 0);
+  });
+});
+
+test("gateway counts the resolved Codex payload and uses the same estimate at message_start", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
+    for (const model of ["claude-sonnet-5-5", "unmapped-model"]) {
+      const request = MessageRequest.parse({
+        model,
+        stream: true,
+        messages: [
+          { role: "assistant", content: [{ type: "thinking", thinking: "Reason about the task", signature: encodeReasoningSignature("gpt-6.1-sol", "opaque") }] },
+          { role: "user", content: [{ type: "document", source: { data: "x".repeat(50_000) } }, { type: "text", text: "Read tiếng Việt" }] },
+        ],
+      });
+      const before = upstream.requests.length;
+      const counted = await fetch(`${gateway.base}/v1/messages/count_tokens`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...AUTH }, body: JSON.stringify(request),
+      });
+      assert.equal(counted.status, 200);
+      const { input_tokens: count } = await counted.json() as { input_tokens: number };
+      const resolved = model === "unmapped-model" ? "gpt-6-sol" : "gpt-6.1-sol";
+      assert.equal(count, estimateCodexInputTokens(toOpenAIRequest(request, resolved)));
+      assert.equal(upstream.requests.length, before);
+      const response = await post(gateway, request);
+      assert.equal(response.status, 200);
+      const events = await response.text();
+      const startLine = events.split("\n").find((line) => line.startsWith('data: {"type":"message_start"'));
+      assert.ok(startLine);
+      const start = JSON.parse(startLine.slice(6)) as { message: { usage: { input_tokens: number } } };
+      assert.equal(start.message.usage.input_tokens, count);
+      assert.match(events, /"usage":\{"input_tokens":3,"output_tokens":2\}/);
+    }
+  }, { tiers: { fable: "gpt-6-astra", opus: "gpt-6.1-sol", sonnet: "gpt-6.1-sol", haiku: "gpt-6-sol" } });
+});
+
+test("gateway counts the pruned Antigravity prompt locally, including protocol and nested tool results", async () => {
+  let promptSeen = "";
+  let runnerCalls = 0;
+  const base = MessageRequest.parse({
+    model: "claude-sonnet-5-5",
+    messages: [{ role: "user", content: "Review this" }],
+    tools: [
+      { name: "Read", description: "Read a file", input_schema: { type: "object" } },
+      { name: "mcp__large__tool", description: "x".repeat(20_000), input_schema: { type: "object" } },
+    ],
+  });
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "x".repeat(20_000) } };
+  const requests: MessageRequest[] = [
+    base,
+    { ...base, tool_choice: { type: "none" } },
+    { ...base, tool_choice: { type: "tool", name: "mcp__large__tool" } },
+    MessageRequest.parse({ ...base, tools: [], messages: [{ role: "user", content: [image] }] }),
+    MessageRequest.parse({ ...base, tools: [], messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "call", content: [image] }] }] }),
+  ];
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
+    for (const request of requests) {
+      const before = runnerCalls;
+      const counted = await fetch(`${gateway.base}/v1/messages/count_tokens`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...AUTH }, body: JSON.stringify(request),
+      });
+      assert.equal(counted.status, 200);
+      const { input_tokens: count } = await counted.json() as { input_tokens: number };
+      assert.equal(runnerCalls, before, "counting must not spawn agy");
+      const expectedPrompt = formatMessagesForAntigravity(pruneToolsForAntigravity(request));
+      assert.equal(count, estimateTextTokens(expectedPrompt));
+      const response = await post(gateway, request);
+      assert.equal(response.status, 200);
+      const message = await response.json() as { usage: { input_tokens: number } };
+      assert.equal(promptSeen, expectedPrompt);
+      assert.equal(message.usage.input_tokens, count);
+      assert.equal(runnerCalls, before + 1);
+    }
+    assert.equal(upstream.requests.length, 0);
+  }, {
+    provider: "antigravity",
+    antigravityRunner: async (options, onEvent) => {
+      runnerCalls++;
+      promptSeen = options.prompt;
+      assert.equal(options.model, "claude-sonnet-4-6");
+      onEvent({ event: "result", result: { status: "success", response: "Done." } });
+    },
   });
 });
 
@@ -546,7 +628,16 @@ test("gateway routes /v1/messages to antigravityRunner when provider is antigrav
 });
 
 test("UI endpoint /api/ui/provider dynamically switches active provider", async () => {
-  await withGateway(replyWithStream(HELLO_STREAM), async (gateway) => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
+    const countRequest = MessageRequest.parse(CHAT_REQUEST);
+    const countTokens = async (): Promise<number> => {
+      const response = await fetch(`${gateway.base}/v1/messages/count_tokens`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...AUTH }, body: JSON.stringify(countRequest),
+      });
+      assert.equal(response.status, 200);
+      return (await response.json() as { input_tokens: number }).input_tokens;
+    };
+    assert.equal(await countTokens(), estimateCodexInputTokens(toOpenAIRequest(countRequest, "gpt-6-sol")));
     // Check initial status
     const statusRes1 = await fetch(`${gateway.base}/api/ui/status`);
     const status1 = await statusRes1.json() as { provider: { active: string } };
@@ -567,6 +658,8 @@ test("UI endpoint /api/ui/provider dynamically switches active provider", async 
     const statusRes2 = await fetch(`${gateway.base}/api/ui/status`);
     const status2 = await statusRes2.json() as { provider: { active: string } };
     assert.equal(status2.provider.active, "antigravity");
+    assert.equal(await countTokens(), estimateTextTokens(formatMessagesForAntigravity(pruneToolsForAntigravity(countRequest))));
+    assert.equal(upstream.requests.length, 0);
   });
 });
 

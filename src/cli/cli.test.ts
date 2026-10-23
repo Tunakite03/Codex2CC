@@ -114,3 +114,34 @@ test("parseCli reads --sync-desktop-sessions with an optional --dry-run and reje
     assert.throws(() => parseCli(argv), (error: unknown) => error instanceof BridgeError && error.code === "invalid_arguments" && /--dry-run/.test(error.message), argv.join(" "));
   }
 });
+
+
+test("parseCli accepts each provider across launch and setup modes", () => {
+  for (const provider of ["codex", "antigravity", "openrouter", "openai", "opencode"]) {
+    for (const flags of [[], ["--ui"], ["--serve"], ["--list-models"], ["--setup"], ["--setup-cli"], ["--setup-desktop"]]) {
+      const command = parseCli([...flags, "--provider", provider]);
+      assert.ok("provider" in command);
+      assert.equal(command.provider, provider);
+    }
+  }
+});
+
+test("parseCli validates environment providers and respects explicit precedence", () => {
+  const previous = process.env.CODEX2CC_PROVIDER;
+  try {
+    process.env.CODEX2CC_PROVIDER = " openrouter ";
+    assert.deepEqual(parseCli(["--list-models"]), { kind: "list-models", provider: "openrouter" });
+    assert.deepEqual(parseCli(["--list-models", "--provider", "OPENAI"]), { kind: "list-models", provider: "openai" });
+    for (const invalid of ["", "unknown", "open-ai"]) {
+      process.env.CODEX2CC_PROVIDER = invalid;
+      assert.throws(() => parseCli(["--serve"]), (error: unknown) => error instanceof BridgeError && error.code === "invalid_arguments" && /CODEX2CC_PROVIDER/.test(error.message));
+    }
+    delete process.env.CODEX2CC_PROVIDER;
+    for (const invalid of ["", "unknown", "open-ai"]) {
+      assert.throws(() => parseCli(["--provider", invalid]), (error: unknown) => error instanceof BridgeError && error.code === "invalid_arguments" && /--provider/.test(error.message));
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CODEX2CC_PROVIDER;
+    else process.env.CODEX2CC_PROVIDER = previous;
+  }
+});

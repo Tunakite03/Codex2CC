@@ -4,7 +4,8 @@ import { z } from "zod";
 import { BridgeError } from "../bridge/bridge.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
 import { resolveDataDir } from "../telemetry/logger.js";
-import { DEFAULT_TIER_MODELS, ANTIGRAVITY_TIER_MODELS, loadTierModels, type ProviderType, type TierModels } from "./models.js";
+import { DEFAULT_TIER_MODELS, ANTIGRAVITY_TIER_MODELS, PROVIDERS, loadTierModels, type ProviderType, type TierModels } from "./models.js";
+import { API_PROVIDERS, ApiProviderConfigsSchema, apiProviderTiers, defaultApiProviderConfig, isApiProvider, parseApiProviderConfig, type ApiProvider, type ApiProviderConfig, type ApiProviderConfigs } from "../providers/config.js";
 
 export const EffortLevel = z.enum(["low", "medium", "high", "xhigh", "max"]);
 export type EffortLevel = z.infer<typeof EffortLevel>;
@@ -22,12 +23,16 @@ const PersistedTierModels = z.object({ version: z.literal(1), tiers: TierModelsS
 
 export const SettingsSchema = z.object({
   version: z.literal(1),
-  provider: z.enum(["codex", "antigravity"]).optional(),
+  provider: z.enum(PROVIDERS).optional(),
+  providers: ApiProviderConfigsSchema.optional(),
   effort: EffortLevel.optional(),
   tiers: TierModelsSchema.optional(),
   mappings: z.object({
     codex: TierModelsSchema.optional(),
     antigravity: TierModelsSchema.optional(),
+    openrouter: TierModelsSchema.optional(),
+    openai: TierModelsSchema.optional(),
+    opencode: TierModelsSchema.optional(),
   }).optional(),
 });
 export type Settings = z.infer<typeof SettingsSchema>;
@@ -54,10 +59,10 @@ export function parseTierModels(input: unknown): TierModels {
 
 /** The mapping the gateway should use right now: live store first, then static tiers, then provider defaults. */
 export function activeTierModels(options: Pick<GatewayOptions, "tierStore" | "tiers" | "provider">): TierModels {
-  const provider = options.provider ?? "codex";
+  const provider = options.provider ?? options.tierStore?.getProvider() ?? "codex";
   if (options.tierStore) return options.tierStore.current(provider);
   if (provider === "codex" && options.tiers) return options.tiers;
-  return provider === "antigravity" ? ANTIGRAVITY_TIER_MODELS : DEFAULT_TIER_MODELS;
+  return isApiProvider(provider) ? apiProviderTiers(defaultApiProviderConfig(provider)) : provider === "antigravity" ? ANTIGRAVITY_TIER_MODELS : DEFAULT_TIER_MODELS;
 }
 
 function writeWarning(operation: string, message: string, path: string): void {
@@ -76,6 +81,7 @@ function readSavedSettings(filePath: string): Settings | undefined {
       return {
         ...data,
         mappings: {
+          ...data.mappings,
           ...(codexMapping ? { codex: codexMapping } : {}),
           ...(data.mappings?.antigravity ? { antigravity: data.mappings.antigravity } : {}),
         },
@@ -148,6 +154,7 @@ export class TierModelStore {
   private effort: EffortLevel | undefined;
   private readonly baselines: Record<ProviderType, TierModels>;
   private readonly customMappings: Map<ProviderType, TierModels> = new Map();
+  private readonly providerConfigs: Map<ApiProvider, ApiProviderConfig> = new Map();
 
   private constructor(
     private readonly filePath: string,
@@ -158,6 +165,9 @@ export class TierModelStore {
     this.baselines = {
       codex: loadTierModels(env),
       antigravity: ANTIGRAVITY_TIER_MODELS,
+      openrouter: apiProviderTiers(defaultApiProviderConfig("openrouter")),
+      openai: apiProviderTiers(defaultApiProviderConfig("openai")),
+      opencode: apiProviderTiers(defaultApiProviderConfig("opencode")),
     };
     this.activeProvider = saved?.provider ?? initialProvider;
     this.effort = saved?.effort ?? (env.CLAUDE_CODE_EFFORT_LEVEL ? EffortLevel.safeParse(env.CLAUDE_CODE_EFFORT_LEVEL).data : undefined);
@@ -167,8 +177,13 @@ export class TierModelStore {
     } else if (saved?.tiers) {
       this.customMappings.set("codex", saved.tiers);
     }
-    if (saved?.mappings?.antigravity) {
-      this.customMappings.set("antigravity", saved.mappings.antigravity);
+    for (const provider of PROVIDERS) {
+      const mapping = saved?.mappings?.[provider];
+      if (mapping) this.customMappings.set(provider, mapping);
+    }
+    for (const provider of API_PROVIDERS) {
+      const config = saved?.providers?.[provider];
+      if (config) this.providerConfigs.set(provider, config);
     }
   }
 
@@ -178,8 +193,10 @@ export class TierModelStore {
   }
 
   setProvider(provider: ProviderType): void {
+    const previous = this.activeProvider;
     this.activeProvider = provider;
-    this.persist();
+    try { this.persist(); }
+    catch (error) { this.activeProvider = previous; throw error; }
   }
 
   getProvider(): ProviderType {
@@ -187,8 +204,10 @@ export class TierModelStore {
   }
 
   setEffort(effort: EffortLevel | undefined): void {
+    const previous = this.effort;
     this.effort = effort;
-    this.persist();
+    try { this.persist(); }
+    catch (error) { this.effort = previous; throw error; }
   }
 
   getEffort(): EffortLevel | undefined {
@@ -197,13 +216,13 @@ export class TierModelStore {
 
   current(provider?: ProviderType): TierModels {
     const target = provider ?? this.activeProvider;
-    return this.customMappings.get(target) ?? this.baselines[target];
+    return this.customMappings.get(target) ?? this.defaults(target);
   }
 
   /** The mapping that applies when nothing is saved (env overrides on top of built-in defaults). */
   defaults(provider?: ProviderType): TierModels {
     const target = provider ?? this.activeProvider;
-    return this.baselines[target];
+    return isApiProvider(target) ? apiProviderTiers(this.getApiProviderConfig(target)) : this.baselines[target];
   }
 
   isCustom(provider?: ProviderType): boolean {
@@ -219,32 +238,66 @@ export class TierModelStore {
   save(tiers: TierModels, provider?: ProviderType): void {
     const target = provider ?? this.activeProvider;
     const next: TierModels = { fable: tiers.fable, opus: tiers.opus, sonnet: tiers.sonnet, haiku: tiers.haiku };
+    const previous = this.customMappings.get(target);
     this.customMappings.set(target, next);
-    this.persist();
+    try { this.persist(); }
+    catch (error) {
+      if (previous) this.customMappings.set(target, previous);
+      else this.customMappings.delete(target);
+      throw error;
+    }
   }
 
   /** Deletes the saved mapping for the provider and reverts to the env/default baseline. */
   reset(provider?: ProviderType): void {
     const target = provider ?? this.activeProvider;
+    const previous = this.customMappings.get(target);
     this.customMappings.delete(target);
-    this.persist();
+    try { this.persist(); }
+    catch (error) {
+      if (previous) this.customMappings.set(target, previous);
+      throw error;
+    }
+  }
+
+  getApiProviderConfig(provider: ApiProvider): ApiProviderConfig {
+    return structuredClone(this.providerConfigs.get(provider) ?? defaultApiProviderConfig(provider));
+  }
+
+  saveApiProviderConfig(provider: ApiProvider, input: ApiProviderConfig): void {
+    const config = parseApiProviderConfig(input);
+    const mapping = this.customMappings.get(provider);
+    const slugs = new Set(config.models.map((model) => model.slug));
+    if (mapping && Object.values(mapping).some((slug) => !slugs.has(slug))) {
+      throw new BridgeError(400, "model_in_use", "Provider configuration removes a model used by a saved tier mapping. Reset or update the mapping first.");
+    }
+    const previous = this.providerConfigs.get(provider);
+    this.providerConfigs.set(provider, config);
+    try {
+      this.persist();
+    } catch (error) {
+      if (previous) this.providerConfigs.set(provider, previous);
+      else this.providerConfigs.delete(provider);
+      throw error;
+    }
   }
 
   private persist(): void {
-    const activeMapping = this.customMappings.get(this.activeProvider) ?? this.customMappings.get("codex");
+    const mappings: Partial<Record<ProviderType, TierModels>> = Object.fromEntries(this.customMappings);
+    const providers: ApiProviderConfigs = Object.fromEntries(this.providerConfigs);
+    const codexMapping = this.customMappings.get("codex");
     const data: Settings = {
       version: 1,
       provider: this.activeProvider,
       ...(this.effort ? { effort: this.effort } : {}),
-      ...(activeMapping ? { tiers: activeMapping } : {}),
-      mappings: {
-        ...(this.customMappings.get("codex") ? { codex: this.customMappings.get("codex") } : {}),
-        ...(this.customMappings.get("antigravity") ? { antigravity: this.customMappings.get("antigravity") } : {}),
-      },
+      // Legacy readers interpret `tiers` as Codex mappings, never as the active API provider.
+      ...(codexMapping ? { tiers: codexMapping } : {}),
+      mappings,
+      providers,
     };
     const tempPath = `${this.filePath}.tmp`;
     mkdirSync(dirname(this.filePath), { recursive: true });
-    writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+    writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     renameSync(tempPath, this.filePath);
   }
 }

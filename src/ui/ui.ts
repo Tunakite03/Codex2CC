@@ -15,7 +15,9 @@ import {
   type SetupTarget,
 } from "../config/config-setup.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
-import { ANTIGRAVITY_MODELS, ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, routedModels, smallestContextWindow, type ProviderType } from "../models/models.js";
+import { ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, PROVIDERS, PROVIDER_LABELS, isProviderType, routedModels, smallestContextWindow, type ProviderType } from "../models/models.js";
+import { apiProviderTiers, hasApiKey, isApiProvider, parseApiProviderConfig } from "../providers/config.js";
+import { currentProvider, getProviderConfig, providerDefaultModel, providerModels } from "../providers/runtime.js";
 import { isAntigravityAvailable } from "../bridge/antigravity.js";
 import {
   desktopProcessState,
@@ -108,13 +110,11 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
   const gatewayUrl = `http://127.0.0.1:${port}`;
   const token = options.policy.mode === "token" ? options.policy.token : "";
   const currentTiers = activeTierModels(options);
-  const activeProvider: ProviderType = options.provider ?? "codex";
-  const isAntigravity = activeProvider === "antigravity";
-  const activeModels = isAntigravity
-    ? (options.antigravityModels ?? ANTIGRAVITY_MODELS)
-    : options.availableModels;
+  const activeProvider = currentProvider(options);
+  const apiConfig = isApiProvider(activeProvider) ? getProviderConfig(options, activeProvider) : undefined;
+  const activeModels = providerModels(options, activeProvider);
   const defaults = options.tierStore?.defaults(activeProvider)
-    ?? (isAntigravity ? ANTIGRAVITY_TIER_MODELS : (options.tiers ?? DEFAULT_TIER_MODELS));
+    ?? (apiConfig ? apiProviderTiers(apiConfig) : activeProvider === "antigravity" ? ANTIGRAVITY_TIER_MODELS : (options.tiers ?? DEFAULT_TIER_MODELS));
   // A stored config only works when it points at this gateway and carries its current token.
   const inSync = (baseUrl: string, storedToken: string): boolean =>
     baseUrl.replace(/\/+$/, "") === gatewayUrl && (options.policy.mode === "open" || storedToken === token);
@@ -173,10 +173,16 @@ export function getStatus(options: GatewayOptions, port: number): Record<string,
   return {
     provider: {
       active: activeProvider,
-      available: [
-        { id: "codex", name: "ChatGPT (Codex)", available: true },
-        { id: "antigravity", name: "Google Antigravity (agy)", available: isAntigravityAvailable() },
-      ],
+      ...(apiConfig ? { config: apiConfig, keyConfigured: hasApiKey(apiConfig, options.providerEnv ?? process.env) } : {}),
+      available: PROVIDERS.map((provider) => {
+        const config = isApiProvider(provider) ? getProviderConfig(options, provider) : undefined;
+        return {
+          id: provider,
+          name: PROVIDER_LABELS[provider],
+          available: provider !== "antigravity" || isAntigravityAvailable(),
+          ...(config ? { config, keyConfigured: hasApiKey(config, options.providerEnv ?? process.env) } : {}),
+        };
+      }),
     },
     gateway: {
       port,
@@ -227,7 +233,7 @@ function refreshDesktopLabels(options: GatewayOptions): boolean {
       level: "info",
       operation: "desktop_labels_refreshed",
       message: "Updated Claude Desktop model picker labels to the active tier mapping; restart Claude Desktop to see them",
-      details: { provider: options.provider ?? "codex" },
+      details: { provider: currentProvider(options) },
     });
   }
   return files.length > 0;
@@ -348,7 +354,7 @@ export async function handleUiRoute(
 
     const unsubscribeUsage = onUsageUpdated((summary) => {
       try {
-        response.write(`event: usage\ndata: ${JSON.stringify({ ...summary, provider: options.provider ?? "codex", antigravity: { available: isAntigravityAvailable() } })}\n\n`);
+        response.write(`event: usage\ndata: ${JSON.stringify({ ...summary, provider: currentProvider(options), antigravity: { available: isAntigravityAvailable() } })}\n\n`);
       } catch {
         cleanup();
       }
@@ -371,8 +377,8 @@ export async function handleUiRoute(
     const forceRefresh = parsedUrl.searchParams.get("refresh") === "true";
     const usage = getTokenUsageStats();
     let limits: AccountUsageLimits | null = null;
-    const currentProvider = options.provider ?? "codex";
-    if (currentProvider === "codex" && typeof options.session.getUsageLimits === "function") {
+    const provider = currentProvider(options);
+    if (provider === "codex" && typeof options.session.getUsageLimits === "function") {
       try {
         limits = await options.session.getUsageLimits(forceRefresh);
       } catch (error) {
@@ -387,11 +393,11 @@ export async function handleUiRoute(
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({
       ...usage,
-      provider: currentProvider,
+      provider,
       antigravity: {
         available: isAntigravityAvailable(),
       },
-      limits: currentProvider === "codex" ? limits : null,
+      limits: provider === "codex" ? limits : null,
     }));
     return true;
   }
@@ -422,14 +428,12 @@ export async function handleUiRoute(
 
   if (pathname === "/api/ui/provider" && request.method === "POST") {
     const body = await readJsonBody(request);
-    if (body.provider !== "antigravity" && body.provider !== "codex") {
-      throw new BridgeError(400, "invalid_provider", 'Provider must be "codex" or "antigravity".');
+    if (typeof body.provider !== "string" || !isProviderType(body.provider)) {
+      throw new BridgeError(400, "invalid_provider", `Provider must be one of: ${PROVIDERS.join(", ")}.`);
     }
     const target: ProviderType = body.provider;
+    options.tierStore?.setProvider(target);
     options.provider = target;
-    if (options.tierStore) {
-      options.tierStore.setProvider(target);
-    }
     recordLog({
       level: "info",
       operation: "provider_switch",
@@ -439,6 +443,20 @@ export async function handleUiRoute(
     const desktopLabelsUpdated = refreshDesktopLabels(options);
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ ok: true, provider: target, desktopLabelsUpdated }));
+    return true;
+  }
+
+  if (pathname === "/api/ui/provider-config" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    if (typeof body.provider !== "string" || !isProviderType(body.provider) || !isApiProvider(body.provider)) {
+      throw new BridgeError(400, "invalid_provider", "API provider must be openrouter, openai, or opencode.");
+    }
+    const config = parseApiProviderConfig(body.config);
+    if (!options.tierStore) throw new BridgeError(503, "settings_unavailable", "Provider configuration storage is unavailable in this gateway mode.");
+    options.tierStore.saveApiProviderConfig(body.provider, config);
+    recordLog({ level: "info", operation: "provider_config_saved", message: "Saved API provider configuration", details: { provider: body.provider } });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ ok: true, provider: body.provider, config, keyConfigured: hasApiKey(config, options.providerEnv ?? process.env) }));
     return true;
   }
 
@@ -452,15 +470,14 @@ export async function handleUiRoute(
     try {
       const body = await readJsonBody(request);
       const tiers = parseTierModels(body.tiers);
-      const currentProvider = options.provider ?? "codex";
-      const isAnt = currentProvider === "antigravity";
-      const modelCatalog = isAnt ? (options.antigravityModels ?? ANTIGRAVITY_MODELS) : options.availableModels;
+      const provider = currentProvider(options);
+      const modelCatalog = providerModels(options, provider);
       const availableModels = new Set(modelCatalog.map((model) => model.slug));
       const unavailable = Object.entries(tiers).find(([, model]) => !availableModels.has(model));
       if (unavailable) {
-        throw new BridgeError(400, "model_unavailable", `Tier mapping model "${unavailable[1]}" is not in the current ${isAnt ? "Antigravity" : "ChatGPT"} model catalog.`);
+        throw new BridgeError(400, "model_unavailable", `Tier mapping model "${unavailable[1]}" is not in the current ${PROVIDER_LABELS[provider]} model catalog.`);
       }
-      store.save(tiers, currentProvider);
+      store.save(tiers, provider);
       if (typeof body.effort === "string") {
         const cleanEffort = body.effort.trim();
         if (cleanEffort === "") {
@@ -475,12 +492,12 @@ export async function handleUiRoute(
       recordLog({
         level: "info",
         operation: "tier_mapping_saved",
-        message: `Saved Claude tier to ${isAnt ? "Antigravity" : "ChatGPT"} model mapping`,
-        details: { provider: currentProvider, fable: tiers.fable, opus: tiers.opus, sonnet: tiers.sonnet, haiku: tiers.haiku },
+        message: `Saved Claude tier to ${PROVIDER_LABELS[provider]} model mapping`,
+        details: { provider, fable: tiers.fable, opus: tiers.opus, sonnet: tiers.sonnet, haiku: tiers.haiku },
       });
       const desktopLabelsUpdated = refreshDesktopLabels(options);
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, tiers: store.current(currentProvider), custom: store.isCustom(currentProvider), effort: store.getEffort() ?? "", desktopLabelsUpdated }));
+      response.end(JSON.stringify({ ok: true, tiers: store.current(provider), custom: store.isCustom(provider), effort: store.getEffort() ?? "", desktopLabelsUpdated }));
     } catch (error) {
       const failure = error instanceof BridgeError
         ? error
@@ -504,16 +521,16 @@ export async function handleUiRoute(
       return true;
     }
     try {
-      const currentProvider = options.provider ?? "codex";
-      store.reset(currentProvider);
+      const provider = currentProvider(options);
+      store.reset(provider);
       recordLog({
         level: "info",
         operation: "tier_mapping_reset",
-        message: `Reset Claude tier mapping to ${currentProvider === "antigravity" ? "Antigravity" : "ChatGPT"} environment or built-in defaults`,
+        message: `Reset Claude tier mapping to ${PROVIDER_LABELS[provider]} environment or built-in defaults`,
       });
       const desktopLabelsUpdated = refreshDesktopLabels(options);
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true, tiers: store.current(currentProvider), custom: store.isCustom(currentProvider), desktopLabelsUpdated }));
+      response.end(JSON.stringify({ ok: true, tiers: store.current(provider), custom: store.isCustom(provider), desktopLabelsUpdated }));
     } catch (error) {
       const failure = error instanceof BridgeError
         ? error
@@ -542,14 +559,17 @@ export async function handleUiRoute(
         ? body.effort.trim()
         : options.tierStore?.getEffort();
       const tiers = activeTierModels(options);
-      const catalog = (options.provider ?? "codex") === "antigravity" ? (options.antigravityModels ?? ANTIGRAVITY_MODELS) : options.availableModels;
+      const provider = currentProvider(options);
+      const catalog = providerModels(options, provider);
+      const defaultModel = providerDefaultModel(options, provider);
       const result = setupConfig(target, {
         gatewayUrl: cleanUrl,
         token,
-        model: options.defaultModel,
+        model: defaultModel,
+        availableModels: catalog.map((model) => model.slug),
         tiers,
         effort,
-        maxContextTokens: smallestContextWindow(catalog, routedModels(tiers, options.defaultModel)),
+        maxContextTokens: smallestContextWindow(catalog, routedModels(tiers, defaultModel)),
       });
       recordLog({
         level: "info",
@@ -793,16 +813,16 @@ export function renderDashboardHtml(): string {
       background: var(--teal);
       border: 1.5px solid var(--line);
     }
-    /* Provider Switcher */
+    /* Provider Switcher Dropdown */
     .provider-bar {
       display: flex;
       align-items: center;
-      gap: 0.5rem;
+      gap: 0.65rem;
       flex-wrap: wrap;
       background: var(--surface-soft);
       border: 1px solid var(--line-soft);
       border-radius: var(--radius);
-      padding: 0.35rem 0.65rem;
+      padding: 0.4rem 0.75rem;
     }
     .provider-label {
       font-size: 0.72rem;
@@ -810,56 +830,252 @@ export function renderDashboardHtml(): string {
       text-transform: uppercase;
       letter-spacing: 0.05em;
       color: var(--ink-soft);
+      user-select: none;
     }
-    .provider-group {
-      display: flex;
-      gap: 0.35rem;
-    }
-    .provider-btn {
+    .provider-select-wrapper {
+      position: relative;
       display: inline-flex;
       align-items: center;
-      gap: 0.35rem;
-      padding: 0.28rem 0.65rem;
-      border-radius: 0.4rem;
-      font-size: 0.75rem;
+    }
+    .provider-select-trigger {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      padding: 0.35rem 0.7rem;
+      min-width: 220px;
+      border-radius: 0.45rem;
+      font-size: 0.8125rem;
       font-weight: 600;
       border: 1.5px solid var(--border);
-      background: var(--surface-soft);
-      color: var(--ink-soft);
-      transition: all 0.15s ease;
-    }
-    .provider-btn:hover {
-      background: var(--paper-deep);
+      background: var(--surface);
       color: var(--ink);
+      box-shadow: 1.5px 1.5px 0 var(--border);
+      cursor: pointer;
+      user-select: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+    }
+    .provider-select-trigger:hover {
+      border-color: var(--line);
+      background: #ffffff;
+      box-shadow: 2px 2px 0 var(--paper-deep);
+    }
+    .provider-select-trigger:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
       border-color: var(--line);
     }
-    .provider-btn.active {
-      background: var(--primary);
+    .provider-select-trigger[aria-expanded="true"] {
       border-color: var(--line);
-      color: #ffffff;
-      box-shadow: 1.5px 1.5px 0 var(--line);
+      box-shadow: 2px 2px 0 var(--paper-deep);
     }
-    .provider-btn .p-icon {
+    .provider-select-trigger .p-trigger-icon {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 14px;
-      height: 14px;
+      width: 18px;
+      height: 18px;
+      color: var(--primary);
       flex-shrink: 0;
-      font-size: 0.85rem;
-      line-height: 1;
     }
-    .provider-btn .p-icon svg {
-      width: 14px;
-      height: 14px;
+    .provider-select-trigger .p-trigger-icon svg {
+      width: 15px;
+      height: 15px;
       display: block;
+    }
+    .provider-select-trigger .p-trigger-text {
+      flex: 1;
+      text-align: left;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .provider-select-trigger .p-trigger-badge {
+      font-size: 0.625rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 0.12rem 0.45rem;
+      border-radius: 9999px;
+      background: var(--teal-soft);
+      color: var(--accent-foreground);
+      border: 1px solid rgba(36, 123, 121, 0.25);
+      flex-shrink: 0;
+    }
+    .provider-select-trigger .p-trigger-badge.staged {
+      background: #fef3c7;
+      color: #92400e;
+      border-color: #f59e0b;
+    }
+    .provider-select-trigger .p-trigger-chevron {
+      color: var(--ink-soft);
+      flex-shrink: 0;
+      transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .provider-select-trigger[aria-expanded="true"] .p-trigger-chevron {
+      transform: rotate(180deg);
+    }
+
+    .provider-select-menu {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      z-index: 100;
+      min-width: 320px;
+      max-width: 380px;
+      background: var(--surface);
+      border: 1.5px solid var(--line);
+      border-radius: 0.625rem;
+      box-shadow: 0 12px 28px -4px rgba(23, 32, 29, 0.16), 3px 3px 0 var(--paper-deep);
+      padding: 0.35rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.2rem;
+      animation: menuFadeIn 0.15s ease-out;
+    }
+    @keyframes menuFadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .provider-select-menu[hidden] {
+      display: none;
+    }
+    .provider-menu-header {
+      padding: 0.35rem 0.55rem 0.25rem;
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--ink-faint);
+      border-bottom: 1px solid var(--border-subtle);
+      margin-bottom: 0.2rem;
+    }
+    .provider-select-option {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      padding: 0.5rem 0.65rem;
+      border-radius: 0.45rem;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--ink);
+      text-align: left;
+      cursor: pointer;
+      width: 100%;
+      transition: all 0.12s ease;
+      user-select: none;
+    }
+    .provider-select-option:hover:not(:disabled) {
+      background: var(--surface-soft);
+      border-color: var(--line-soft);
+    }
+    .provider-select-option:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: -1px;
+    }
+    .provider-select-option.selected {
+      background: var(--teal-soft);
+      border-color: rgba(36, 123, 121, 0.3);
+    }
+    .provider-select-option:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      background: transparent !important;
+    }
+    .provider-select-option .p-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 0.4rem;
+      background: var(--surface-soft);
+      border: 1px solid var(--border);
+      color: var(--primary);
+      flex-shrink: 0;
+    }
+    .provider-select-option.selected .p-icon {
+      background: #ffffff;
+      border-color: var(--primary);
+    }
+    .provider-select-option .p-icon svg {
+      width: 15px;
+      height: 15px;
+      display: block;
+    }
+    .provider-select-option .p-info {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.1rem;
+    }
+    .provider-select-option .p-name {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--ink);
+    }
+    .provider-select-option .p-desc {
+      font-size: 0.7rem;
+      color: var(--ink-soft);
+      line-height: 1.25;
+      white-space: normal;
+    }
+    .provider-select-option .p-meta {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      flex-shrink: 0;
+    }
+    .provider-select-option .p-check {
+      display: none;
+      color: var(--primary);
+    }
+    .provider-select-option.selected .p-check {
+      display: block;
+    }
+    .provider-select-option .p-opt-badge {
+      font-size: 0.625rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      padding: 0.1rem 0.38rem;
+      border-radius: 0.25rem;
+    }
+    .provider-select-option .p-opt-badge.active-badge {
+      background: var(--primary);
+      color: #ffffff;
+    }
+    .provider-select-option .p-opt-badge.unavail-badge {
+      background: var(--muted);
+      color: var(--ink-faint);
+      border: 1px solid var(--line-soft);
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    .provider-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+    }
+    .provider-btn {
+      /* preserved for selector compatibility */
     }
     .btn-provider-submit {
       display: inline-flex;
       align-items: center;
-      gap: 0.3rem;
-      padding: 0.28rem 0.65rem;
-      border-radius: 0.4rem;
+      gap: 0.35rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 0.45rem;
       font-size: 0.75rem;
       font-weight: 700;
       border: 1.5px solid var(--border);
@@ -887,6 +1103,11 @@ export function renderDashboardHtml(): string {
       transform: translate(1px, 1px);
       box-shadow: 1px 1px 0 var(--line);
     }
+    .api-provider-settings { margin-top: 1rem; padding: 1rem; border: 1px solid var(--line-soft); border-radius: var(--radius); background: var(--surface-soft); }
+    .api-provider-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 0.75rem; margin: 0.75rem 0; }
+    .api-provider-fields label { display: grid; gap: 0.3rem; font-size: 0.8rem; }
+    .api-provider-settings textarea { width: 100%; min-height: 15rem; padding: 0.65rem; border: 1px solid var(--input); border-radius: var(--radius); background: var(--surface); color: var(--ink); font-family: monospace; resize: vertical; }
+    .api-provider-settings textarea:focus-visible { outline: 3px solid var(--ring); }
     /* Navigation Tabs */
     .nav-tabs {
       display: flex;
@@ -1381,6 +1602,7 @@ export function renderDashboardHtml(): string {
       gap: 0.6rem;
       box-shadow: 2px 2px 0 var(--paper-deep);
     }
+    .quota-card[hidden] { display: none; }
     .quota-card-top {
       display: flex;
       justify-content: space-between;
@@ -1896,20 +2118,96 @@ export function renderDashboardHtml(): string {
       <section class="card" aria-label="Setup and configuration">
         <!-- Top row: Provider switcher -->
         <div class="provider-bar">
-          <span class="provider-label">Provider</span>
-          <div class="provider-group" id="provider-selector" role="radiogroup" aria-label="Active LLM Provider">
-            <button class="provider-btn active" id="btn-provider-codex" type="button" data-provider="codex" role="radio" aria-checked="true" title="Use ChatGPT Codex subscription">
-              <span class="p-icon">
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
+          <label class="provider-label" for="select-provider">Provider</label>
+          <div class="provider-select-wrapper" id="provider-selector">
+            <select class="sr-only" id="select-provider" aria-label="Active LLM Provider">
+              <option value="codex">ChatGPT (Codex)</option>
+              <option value="antigravity">Antigravity (agy)</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="openai">OpenAI API</option>
+              <option value="opencode">OpenCode</option>
+            </select>
+            <button class="provider-select-trigger" id="provider-select-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="provider-select-menu" title="Click to choose LLM provider">
+              <span class="p-trigger-icon" id="provider-trigger-icon" aria-hidden="true">
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
               </span>
-              <span>ChatGPT (Codex)</span>
+              <span class="p-trigger-text" id="provider-trigger-text">ChatGPT (Codex)</span>
+              <span class="p-trigger-badge" id="provider-trigger-badge">Active</span>
+              <svg class="p-trigger-chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
             </button>
-            <button class="provider-btn" id="btn-provider-antigravity" type="button" data-provider="antigravity" role="radio" aria-checked="false" title="Use Google Antigravity (agy) session">
-              <span class="p-icon">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
-              </span>
-              <span>Antigravity (agy)</span>
-            </button>
+            <div class="provider-select-menu" id="provider-select-menu" role="listbox" aria-label="Select LLM Provider" hidden>
+              <div class="provider-menu-header">Select Provider</div>
+              <button class="provider-btn provider-select-option active selected" id="btn-provider-codex" type="button" data-provider="codex" role="option" aria-selected="true" title="Use ChatGPT Codex subscription">
+                <span class="p-icon">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
+                </span>
+                <span class="p-info">
+                  <span class="p-name">ChatGPT (Codex)</span>
+                  <span class="p-desc">Official subscription & Responses API</span>
+                </span>
+                <span class="p-meta">
+                  <span class="p-opt-badge active-badge" id="badge-opt-codex">Active</span>
+                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </span>
+              </button>
+
+              <button class="provider-btn provider-select-option" id="btn-provider-antigravity" type="button" data-provider="antigravity" role="option" aria-selected="false" title="Use Google Antigravity (agy) session">
+                <span class="p-icon">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+                </span>
+                <span class="p-info">
+                  <span class="p-name">Antigravity (agy)</span>
+                  <span class="p-desc">Google Antigravity CLI session (local agy binary)</span>
+                </span>
+                <span class="p-meta">
+                  <span class="p-opt-badge active-badge" id="badge-opt-antigravity" style="display:none">Active</span>
+                  <span class="p-opt-badge unavail-badge" id="badge-unavail-antigravity" style="display:none">No agy CLI</span>
+                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </span>
+              </button>
+
+              <button class="provider-btn provider-select-option" id="btn-provider-openrouter" type="button" data-provider="openrouter" role="option" aria-selected="false">
+                <span class="p-icon">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+                </span>
+                <span class="p-info">
+                  <span class="p-name">OpenRouter</span>
+                  <span class="p-desc">Multi-model router with unified credit balance</span>
+                </span>
+                <span class="p-meta">
+                  <span class="p-opt-badge active-badge" id="badge-opt-openrouter" style="display:none">Active</span>
+                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </span>
+              </button>
+
+              <button class="provider-btn provider-select-option" id="btn-provider-openai" type="button" data-provider="openai" role="option" aria-selected="false">
+                <span class="p-icon">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3"/><path d="m18.5 4.5 2 2"/></svg>
+                </span>
+                <span class="p-info">
+                  <span class="p-name">OpenAI API</span>
+                  <span class="p-desc">Direct OpenAI platform API key</span>
+                </span>
+                <span class="p-meta">
+                  <span class="p-opt-badge active-badge" id="badge-opt-openai" style="display:none">Active</span>
+                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </span>
+              </button>
+
+              <button class="provider-btn provider-select-option" id="btn-provider-opencode" type="button" data-provider="opencode" role="option" aria-selected="false">
+                <span class="p-icon">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                </span>
+                <span class="p-info">
+                  <span class="p-name">OpenCode</span>
+                  <span class="p-desc">OpenCode inference endpoint</span>
+                </span>
+                <span class="p-meta">
+                  <span class="p-opt-badge active-badge" id="badge-opt-opencode" style="display:none">Active</span>
+                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </span>
+              </button>
+            </div>
           </div>
           <button class="btn btn-primary btn-provider-submit" id="btn-provider-submit" type="button" disabled title="Click to apply and switch provider">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
@@ -1918,6 +2216,36 @@ export function renderDashboardHtml(): string {
         </div>
 
         <p class="instruction-card" id="provider-hint" hidden>Antigravity needs the <code>agy</code> CLI. Put agy on the gateway's PATH, or set <code>CODEX2CC_AGY_BIN</code> to its full path, then restart the gateway.</p>
+
+        <section id="api-provider-settings" class="api-provider-settings" aria-labelledby="api-provider-title" hidden>
+          <h3 id="api-provider-title">API provider settings</h3>
+          <p id="api-key-status" role="status"></p>
+          <p class="supporting-text">Enter the environment variable name, never the API key itself. Set its value in the gateway process environment and restart. Saving settings does not select a provider; press Submit above to switch.</p>
+          <form id="api-provider-form">
+            <div class="api-provider-fields">
+              <label for="api-key-env">API key environment variable name
+                <input id="api-key-env" type="text" autocomplete="off" spellcheck="false" required pattern="[A-Z][A-Z0-9_]*_API_KEY" aria-describedby="api-key-status" />
+              </label>
+              <label for="api-default-model">Default model slug
+                <input id="api-default-model" type="text" spellcheck="false" required />
+              </label>
+              <label for="api-endpoint-chat-completions">Chat Completions endpoint URL
+                <input id="api-endpoint-chat-completions" type="url" spellcheck="false" placeholder="https://api.openai.com/v1/chat/completions" />
+              </label>
+              <label for="api-endpoint-responses">Responses endpoint URL
+                <input id="api-endpoint-responses" type="url" spellcheck="false" placeholder="https://api.openai.com/v1/responses" />
+              </label>
+              <label for="api-endpoint-anthropic-messages">Anthropic Messages endpoint URL
+                <input id="api-endpoint-anthropic-messages" type="url" spellcheck="false" placeholder="https://opencode.ai/inference/anthropic/v1/messages" />
+              </label>
+            </div>
+            <label for="api-model-catalog">Model catalog (JSON array)</label>
+            <p id="api-model-schema" class="supporting-text">Each model requires slug, displayName, and protocol: chat-completions, responses, or anthropic-messages. reasoning is none, openai, or openrouter (default: none). Anthropic Messages uses none; Responses supports openai or none. Optional contextWindow and maxOutputTokens are positive integers. Each protocol needs its complete endpoint URL. The default model must exist in this catalog. Only these adapter protocols are supported, not every model a provider offers.</p>
+            <textarea id="api-model-catalog" spellcheck="false" required aria-describedby="api-model-schema api-model-example"></textarea>
+            <p id="api-model-example" class="supporting-text">Example: [{"slug":"gpt-5.5","displayName":"GPT-5.5","protocol":"responses","reasoning":"openai","contextWindow":200000,"maxOutputTokens":8192}]. Provider defaults load automatically; edit them to match your account.</p>
+            <button class="btn btn-primary btn-sm" id="btn-save-provider-config" type="submit">Save provider settings</button>
+          </form>
+        </section>
 
         <!-- Gateway Credentials Bar -->
         <div class="gateway-bar">
@@ -2379,6 +2707,65 @@ export function renderDashboardHtml(): string {
     let currentActiveProvider = "codex";
     let selectedProvider = "codex";
     let isProviderSwitching = false;
+    let isProviderConfigSaving = false;
+    let providerConfigDirty = false;
+    let editingProvider = null;
+    const providerLabels = ${JSON.stringify(PROVIDER_LABELS)};
+    const apiProtocols = ["chat-completions", "responses", "anthropic-messages"];
+
+    function renderProviderSettings() {
+      const entry = currentStatus?.provider?.available?.find((provider) => provider.id === selectedProvider);
+      const section = document.getElementById("api-provider-settings");
+      section.hidden = !entry?.config;
+      if (!entry?.config) return;
+      document.getElementById("api-provider-title").textContent = providerLabels[selectedProvider] + " settings";
+      document.getElementById("api-key-status").textContent = entry.config.apiKeyEnv + (entry.keyConfigured ? ": configured in the gateway environment" : ": missing or invalid in the gateway environment; inference is unavailable until configured");
+      if (editingProvider === selectedProvider && providerConfigDirty) return;
+      editingProvider = selectedProvider;
+      providerConfigDirty = false;
+      document.getElementById("api-key-env").value = entry.config.apiKeyEnv;
+      document.getElementById("api-default-model").value = entry.config.defaultModel;
+      for (const protocol of apiProtocols) document.getElementById("api-endpoint-" + protocol).value = entry.config.endpoints[protocol] || "";
+      document.getElementById("api-model-catalog").value = JSON.stringify(entry.config.models, null, 2);
+    }
+
+    document.getElementById("api-provider-form").addEventListener("input", () => { providerConfigDirty = true; });
+    document.getElementById("api-provider-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (isProviderConfigSaving || isProviderSwitching) return;
+      const provider = selectedProvider;
+      const button = document.getElementById("btn-save-provider-config");
+      isProviderConfigSaving = true;
+      button.disabled = true;
+      updateProviderControls();
+      try {
+        const endpoints = {};
+        for (const protocol of apiProtocols) {
+          const value = document.getElementById("api-endpoint-" + protocol).value.trim();
+          if (value) endpoints[protocol] = value;
+        }
+        const config = {
+          apiKeyEnv: document.getElementById("api-key-env").value.trim(),
+          defaultModel: document.getElementById("api-default-model").value.trim(),
+          endpoints,
+          models: JSON.parse(document.getElementById("api-model-catalog").value),
+        };
+        const response = await fetch("/api/ui/provider-config", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider, config }),
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "Provider settings could not be saved");
+        providerConfigDirty = false;
+        showToast("Saved " + providerLabels[provider] + " settings. Re-apply client setup if models changed.");
+        await fetchStatus();
+      } catch (error) {
+        showToast(error instanceof SyntaxError ? "Model catalog must be a valid JSON array." : error.message, "error");
+      } finally {
+        isProviderConfigSaving = false;
+        button.disabled = false;
+        updateProviderControls();
+      }
+    });
 
     function updateProviderControls(availableList) {
       const btnCodex = document.getElementById("btn-provider-codex");
@@ -2386,24 +2773,63 @@ export function renderDashboardHtml(): string {
       const btnSubmit = document.getElementById("btn-provider-submit");
       if (!btnCodex || !btnAnt) return;
 
+      let antigravityReady = true;
       if (Array.isArray(availableList)) {
-        const antigravityReady = availableList.some((p) => p.id === "antigravity" && p.available);
+        antigravityReady = availableList.some((p) => p.id === "antigravity" && p.available);
         btnAnt.disabled = !antigravityReady && currentActiveProvider !== "antigravity";
         btnAnt.title = antigravityReady ? "Use Google Antigravity (agy) session" : "agy binary not found on PATH";
+        const badgeUnavail = document.getElementById("badge-unavail-antigravity");
+        if (badgeUnavail) badgeUnavail.style.display = antigravityReady ? "none" : "inline-block";
         document.getElementById("provider-hint").hidden = antigravityReady;
       }
 
-      btnCodex.classList.toggle("active", selectedProvider === "codex");
-      btnCodex.setAttribute("aria-checked", selectedProvider === "codex" ? "true" : "false");
-      btnAnt.classList.toggle("active", selectedProvider === "antigravity");
-      btnAnt.setAttribute("aria-checked", selectedProvider === "antigravity" ? "true" : "false");
+      document.querySelectorAll(".provider-btn[data-provider]").forEach((button) => {
+        const prov = button.dataset.provider;
+        const isSelected = prov === selectedProvider;
+        const isActive = prov === currentActiveProvider;
+        button.classList.toggle("active", isSelected);
+        button.classList.toggle("selected", isSelected);
+        button.setAttribute("aria-selected", isSelected ? "true" : "false");
+        button.setAttribute("aria-checked", isSelected ? "true" : "false");
+        const activeBadge = document.getElementById("badge-opt-" + prov);
+        if (activeBadge) {
+          activeBadge.style.display = isActive ? "inline-block" : "none";
+        }
+      });
+
+      const nativeSelect = document.getElementById("select-provider");
+      if (nativeSelect && nativeSelect.value !== selectedProvider) {
+        nativeSelect.value = selectedProvider;
+      }
+
+      const triggerIcon = document.getElementById("provider-trigger-icon");
+      const triggerText = document.getElementById("provider-trigger-text");
+      const triggerBadge = document.getElementById("provider-trigger-badge");
+      if (triggerText) {
+        triggerText.textContent = providerLabels[selectedProvider] || selectedProvider;
+      }
+      if (triggerIcon) {
+        const activeOpt = document.getElementById("btn-provider-" + selectedProvider);
+        const iconSvg = activeOpt?.querySelector(".p-icon svg");
+        if (iconSvg) {
+          triggerIcon.innerHTML = iconSvg.outerHTML;
+        }
+      }
+      if (triggerBadge) {
+        const isPending = selectedProvider !== currentActiveProvider;
+        triggerBadge.textContent = isPending ? "Pending" : "Active";
+        triggerBadge.classList.toggle("staged", isPending);
+        triggerBadge.title = isPending ? "Staged: click Submit to activate" : "Currently active provider";
+      }
+
+      renderProviderSettings();
 
       const isPending = selectedProvider !== currentActiveProvider;
       if (btnSubmit) {
-        btnSubmit.disabled = isProviderSwitching || !isPending;
+        btnSubmit.disabled = isProviderSwitching || isProviderConfigSaving || !isPending;
         btnSubmit.classList.toggle("pending", isPending && !isProviderSwitching);
         if (isPending) {
-          btnSubmit.title = "Click to apply and switch to " + (selectedProvider === "antigravity" ? "Google Antigravity" : "ChatGPT Codex");
+          btnSubmit.title = "Click to apply and switch to " + providerLabels[selectedProvider];
         } else {
           btnSubmit.title = "Active provider already selected";
         }
@@ -2411,13 +2837,82 @@ export function renderDashboardHtml(): string {
     }
 
     function selectProvider(target) {
-      if (isProviderSwitching) return;
-      if (target !== "codex" && target !== "antigravity") return;
-      const btn = document.getElementById(target === "codex" ? "btn-provider-codex" : "btn-provider-antigravity");
+      if (isProviderSwitching || isProviderConfigSaving || !Object.hasOwn(providerLabels, target)) return;
+      const btn = document.getElementById("btn-provider-" + target);
       if (btn?.disabled) return;
+      if (target !== selectedProvider && providerConfigDirty) {
+        if (!confirm("Discard unsaved API provider settings?")) return;
+        providerConfigDirty = false;
+      }
       selectedProvider = target;
+      closeProviderDropdown();
       updateProviderControls();
     }
+
+    const pTrigger = document.getElementById("provider-select-trigger");
+    const pMenu = document.getElementById("provider-select-menu");
+
+    function openProviderDropdown() {
+      if (!pMenu || !pTrigger) return;
+      pMenu.hidden = false;
+      pTrigger.setAttribute("aria-expanded", "true");
+      const currentOpt = pMenu.querySelector(".provider-select-option.selected:not(:disabled)") || pMenu.querySelector(".provider-select-option:not(:disabled)");
+      currentOpt?.focus();
+    }
+
+    function closeProviderDropdown() {
+      if (!pMenu || !pTrigger) return;
+      pMenu.hidden = true;
+      pTrigger.setAttribute("aria-expanded", "false");
+    }
+
+    function toggleProviderDropdown() {
+      if (!pMenu) return;
+      if (pMenu.hidden) openProviderDropdown();
+      else closeProviderDropdown();
+    }
+
+    pTrigger?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleProviderDropdown();
+    });
+
+    pTrigger?.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        openProviderDropdown();
+      }
+    });
+
+    document.addEventListener("click", (e) => {
+      if (pMenu && !pMenu.hidden && !pMenu.contains(e.target) && !pTrigger?.contains(e.target)) {
+        closeProviderDropdown();
+      }
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (!pMenu || pMenu.hidden) return;
+      if (e.key === "Escape") {
+        closeProviderDropdown();
+        pTrigger?.focus();
+      } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const options = Array.from(pMenu.querySelectorAll(".provider-select-option:not(:disabled)"));
+        if (!options.length) return;
+        const currentIndex = options.indexOf(document.activeElement);
+        let nextIndex = 0;
+        if (e.key === "ArrowDown") {
+          nextIndex = currentIndex >= 0 && currentIndex < options.length - 1 ? currentIndex + 1 : 0;
+        } else {
+          nextIndex = currentIndex > 0 ? currentIndex - 1 : options.length - 1;
+        }
+        options[nextIndex]?.focus();
+      }
+    });
+
+    document.getElementById("select-provider")?.addEventListener("change", (e) => {
+      selectProvider(e.target.value);
+    });
 
     function renderStatus(s) {
       document.getElementById("val-gateway-url").textContent = s.gateway.url;
@@ -2432,9 +2927,7 @@ export function renderDashboardHtml(): string {
         updateProviderControls(s.provider.available);
         const descElem = document.getElementById("tier-mapping-desc");
         if (descElem) {
-          descElem.textContent = currentActiveProvider === "antigravity"
-            ? "Map each Claude tier to a Google Antigravity (agy) model. Changes apply immediately upon saving."
-            : "Map each Claude tier to a ChatGPT backend model. Changes apply immediately upon saving.";
+          descElem.textContent = "Map each Claude tier to a " + providerLabels[currentActiveProvider] + " model. Changes apply immediately upon saving.";
         }
       }
 
@@ -2469,7 +2962,7 @@ export function renderDashboardHtml(): string {
         });
         const data = await res.json();
         if (data.ok) {
-          showToast("Switched active provider to " + (provider === "antigravity" ? "Google Antigravity (agy)" : "ChatGPT (Codex)"));
+          showToast("Switched active provider to " + providerLabels[provider]);
           cachedLimits = null;
           await fetchStatus();
           await fetchUsage(true);
@@ -2483,9 +2976,12 @@ export function renderDashboardHtml(): string {
 
     document.getElementById("btn-provider-codex")?.addEventListener("click", () => selectProvider("codex"));
     document.getElementById("btn-provider-antigravity")?.addEventListener("click", () => selectProvider("antigravity"));
+    document.getElementById("btn-provider-openrouter")?.addEventListener("click", () => selectProvider("openrouter"));
+    document.getElementById("btn-provider-openai")?.addEventListener("click", () => selectProvider("openai"));
+    document.getElementById("btn-provider-opencode")?.addEventListener("click", () => selectProvider("opencode"));
 
     document.getElementById("btn-provider-submit")?.addEventListener("click", async () => {
-      if (selectedProvider === currentActiveProvider || isProviderSwitching) return;
+      if (selectedProvider === currentActiveProvider || isProviderSwitching || isProviderConfigSaving) return;
       if (hasUnsavedTierChanges()) {
         if (!confirm("You have unsaved model routing edits for the current provider. Switch anyway?")) return;
       }
@@ -2522,7 +3018,7 @@ export function renderDashboardHtml(): string {
         const selectedModel = mapping.current[tier];
         const choices = [...models];
         if (!choices.some((model) => model.slug === selectedModel)) {
-          choices.push({ slug: selectedModel, displayName: selectedModel + " (not in current account catalog)" });
+          choices.push({ slug: selectedModel, displayName: selectedModel + " (not in current provider catalog)" });
         }
         select.replaceChildren();
         for (const model of choices) {
@@ -2548,7 +3044,7 @@ export function renderDashboardHtml(): string {
       let port = "3456";
       try { port = new URL(url).port || "3456"; } catch {}
       const token = document.getElementById("input-token").value || "YOUR_SECRET_TOKEN";
-      document.getElementById("text-run-cmd").textContent = 'CODEX2CC_TOKEN="' + token + '" node dist/main.js --serve --port ' + port;
+      document.getElementById("text-run-cmd").textContent = 'CODEX2CC_TOKEN="' + token + '" node dist/main.js --serve --port ' + port + ' --provider ' + currentActiveProvider;
     }
 
     /* Clipboard & Input helpers */
@@ -3045,11 +3541,19 @@ export function renderDashboardHtml(): string {
       document.getElementById("val-output-tokens").textContent = fmt(data.totalOutputTokens);
       document.getElementById("val-cached-tokens").textContent = fmt(data.totalCachedTokens);
 
-      const isAnt = (data.provider === "antigravity") || (!data.provider && currentStatus?.provider?.active === "antigravity");
+      const activeProvider = data.provider || currentStatus?.provider?.active || "codex";
+      const isAnt = activeProvider === "antigravity";
+      const isApi = !["codex", "antigravity"].includes(activeProvider);
+      document.getElementById("card-quota-5h").hidden = isApi;
+      document.getElementById("card-quota-weekly").hidden = isApi;
       const planBadge = document.getElementById("quota-plan-badge");
       const statusText = document.getElementById("quota-status-text");
 
-      if (isAnt) {
+      if (isApi) {
+        cachedLimits = null;
+        if (planBadge) planBadge.textContent = providerLabels[activeProvider];
+        if (statusText) statusText.textContent = "API billing and limits are managed by the provider. ChatGPT subscription quotas do not apply. Token totals include all providers.";
+      } else if (isAnt) {
         if (planBadge) {
           planBadge.textContent = "Google Antigravity";
           planBadge.className = "quota-plan-badge badge-active";
@@ -3167,13 +3671,8 @@ export function renderDashboardHtml(): string {
           ? ((m.totalTokens / data.grandTotalTokens) * 100).toFixed(1) + "%"
           : "0.0%";
 
-        const isAntModel = m.model.startsWith("claude-") || m.model.startsWith("gemini-") || m.model.startsWith("gpt-oss-");
-        const providerBadge = isAntModel
-          ? '<span class="badge-sub" style="margin-left:0.5rem;font-size:0.68rem;padding:0.12rem 0.45rem;border-radius:4px;background:rgba(36,123,121,0.15);color:var(--primary);font-weight:600;">Antigravity</span>'
-          : '<span class="badge-sub" style="margin-left:0.5rem;font-size:0.68rem;padding:0.12rem 0.45rem;border-radius:4px;background:rgba(217,119,6,0.15);color:#d97706;font-weight:600;">ChatGPT</span>';
-
         html += '<tr>' +
-          '<td><span class="model-tag">' + escapeHtml(m.model) + '</span>' + providerBadge + '</td>' +
+          '<td><span class="model-tag">' + escapeHtml(m.model) + '</span></td>' +
           '<td class="num-col">' + fmt(m.requests) + '</td>' +
           '<td class="num-col">' + fmt(m.inputTokens) + '</td>' +
           '<td class="num-col">' + fmt(m.outputTokens) + '</td>' +
