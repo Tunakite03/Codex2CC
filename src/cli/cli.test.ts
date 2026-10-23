@@ -108,12 +108,17 @@ test("arguments after -- are not validated as codex2cc options", () => {
 });
 
 test("parseCli reads --sync-desktop-sessions with an optional --dry-run and rejects a stray --dry-run", () => {
-  assert.deepEqual(parseCli(["--sync-desktop-sessions"]), { kind: "sync-desktop-sessions", dryRun: false });
-  assert.deepEqual(parseCli(["--sync-desktop-sessions", "--dry-run"]), { kind: "sync-desktop-sessions", dryRun: true });
-  assert.deepEqual(parseCli(["--sync-desktop-sessions", "--setup-desktop"]), { kind: "sync-desktop-sessions", dryRun: false });
+  assert.deepEqual(parseCli(["--sync-desktop-sessions"]), { kind: "sync-desktop-sessions", dryRun: false, allAccounts: false });
+  assert.deepEqual(parseCli(["--sync-desktop-sessions", "--dry-run"]), { kind: "sync-desktop-sessions", dryRun: true, allAccounts: false });
+  assert.deepEqual(parseCli(["--sync-desktop-sessions", "--setup-desktop"]), { kind: "sync-desktop-sessions", dryRun: false, allAccounts: false });
   for (const argv of [["--dry-run"], ["--setup", "--dry-run"], ["--reset-desktop", "--dry-run"]]) {
     assert.throws(() => parseCli(argv), (error: unknown) => error instanceof BridgeError && error.code === "invalid_arguments" && /--dry-run/.test(error.message), argv.join(" "));
   }
+});
+
+test("parseCli reads --all-accounts only as a --sync-desktop-sessions modifier", () => {
+  assert.deepEqual(parseCli(["--sync-desktop-sessions", "--all-accounts", "--dry-run"]), { kind: "sync-desktop-sessions", dryRun: true, allAccounts: true });
+  assert.throws(() => parseCli(["--all-accounts"]), (error: unknown) => error instanceof BridgeError && error.code === "invalid_arguments" && /--all-accounts/.test(error.message));
 });
 
 
