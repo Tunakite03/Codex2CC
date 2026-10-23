@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import test from "node:test";
+import { dirname, join } from "node:path";
+import { syncBuiltinESMExports } from "node:module";
+import test, { type TestContext } from "node:test";
 import { BridgeError } from "../bridge/bridge.js";
 import {
   applyDesktopSessionSync,
@@ -24,6 +25,23 @@ import {
 } from "./desktop-sessions.js";
 
 const NOW = new Date("2026-10-23T10:00:00.000Z");
+
+// chmod does not deny directory writes on Windows (or under root). Inject only manifest-write errors,
+// preserving real copies, backups and receipts so recovery assertions still exercise the filesystem.
+function failManifestWrites(t: TestContext, manifestDir: string): () => void {
+  const write = fs.writeFileSync;
+  const mocked = t.mock.method(fs, "writeFileSync", (...args: Parameters<typeof fs.writeFileSync>) => {
+    const file = args[0];
+    if (typeof file === "string" && dirname(file) === manifestDir && file.endsWith(".json")) {
+      throw Object.assign(new Error("EACCES: simulated manifest write failure"), { code: "EACCES", syscall: "open", path: file });
+    }
+    return write(...args);
+  });
+  syncBuiltinESMExports();
+  const restore = () => { mocked.mock.restore(); syncBuiltinESMExports(); };
+  t.after(restore);
+  return restore;
+}
 
 test("Windows session sync uses the LocalAppData gateway profile and the Roaming Claude profile", () => {
   const paths = resolveDesktopSessionPaths({ APPDATA: "roaming", LOCALAPPDATA: "local" }, "win32");
@@ -380,9 +398,8 @@ test("desktopSyncReport tells clients when history was left hidden", () => {
   assert.deepEqual(applied, { status: "applied", level: "success", messages: [] });
 });
 
-test("Desktop state is unknown off macOS and the explicit command refuses unless Desktop is closed", () => {
-  assert.equal(desktopProcessState("linux"), "unknown");
-  assert.equal(desktopProcessState("win32"), "unknown");
+test("unsupported platforms stay unknown and the explicit command refuses unless Desktop is closed", () => {
+  assert.equal(desktopProcessState("linux", () => { throw new Error("must not probe"); }), "unknown");
   assert.throws(() => requireDesktopClosed("running"), (error: unknown) => error instanceof BridgeError && error.code === "desktop_running");
   assert.throws(() => requireDesktopClosed("unknown"), (error: unknown) => error instanceof BridgeError && error.code === "desktop_state_unknown");
   assert.doesNotThrow(() => requireDesktopClosed("not_running"));
@@ -444,7 +461,7 @@ test("a copy codex2cc made is refreshed when its original has newer activity, an
   }
 });
 
-test("a manifest write failure is reported together with the copy failure it follows, never instead of it", () => {
+test("a manifest write failure is reported together with the copy failure it follows, never instead of it", (t) => {
   const { paths, cleanup } = createSandbox();
   try {
     const claude = scopeDir(paths.profiles.claude, "acct", "org");
@@ -454,7 +471,7 @@ test("a manifest write failure is reported together with the copy failure it fol
     writeSession(gateway, "g1", "cli-g1", 3_000);
     for (const id of ["cli-c1", "cli-c2", "cli-g1"]) writeTranscript(paths, id);
     mkdirSync(paths.manifestDir, { recursive: true });
-    chmodSync(paths.manifestDir, 0o500);
+    failManifestWrites(t, paths.manifestDir);
 
     const plans = planDesktopSessionSync(TO_GATEWAY_PROFILE, paths);
     writeFileSync(plans[0]!.copies[1]!.destination, "written by Desktop meanwhile");
@@ -466,12 +483,11 @@ test("a manifest write failure is reported together with the copy failure it fol
       && error.entries.length === 1
       && error.manifestPath === undefined);
   } finally {
-    chmodSync(paths.manifestDir, 0o700);
     cleanup();
   }
 });
 
-test("runDesktopSessionSync turns sync failures into an outcome that lists what already changed", () => {
+test("runDesktopSessionSync turns sync failures into an outcome that lists what already changed", (t) => {
   const { paths, cleanup } = createSandbox();
   try {
     const claude = scopeDir(paths.profiles.claude, "acct", "org");
@@ -480,7 +496,7 @@ test("runDesktopSessionSync turns sync failures into an outcome that lists what 
     writeSession(gateway, "g1", "cli-g1", 3_000);
     writeTranscript(paths, "cli-c1");
     mkdirSync(paths.manifestDir, { recursive: true });
-    chmodSync(paths.manifestDir, 0o500);
+    const restoreWrites = failManifestWrites(t, paths.manifestDir);
 
     const outcome = syncDesktopSessionsWhenClosed(TO_GATEWAY_PROFILE, paths, "not_running", NOW);
     assert.equal(outcome.status, "failed");
@@ -488,7 +504,7 @@ test("runDesktopSessionSync turns sync failures into an outcome that lists what 
     assert.match(lines[0] ?? "", /could not record the changes/);
     assert.match(lines[1] ?? "", new RegExp(`added ${join(gateway, "local_c1.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 
-    chmodSync(paths.manifestDir, 0o700);
+    restoreWrites();
     writeFileSync(join(paths.manifestDir, "broken.json"), "{");
     const badManifest = runDesktopSessionSync(TO_GATEWAY_PROFILE, paths, NOW);
     assert.deepEqual(badManifest.status, "failed");
@@ -498,7 +514,7 @@ test("runDesktopSessionSync turns sync failures into an outcome that lists what 
   }
 });
 
-test("a refresh whose manifest cannot be written still leaves its backup and receipt behind", () => {
+test("a refresh whose manifest cannot be written still leaves its backup and receipt behind", (t) => {
   const { paths, cleanup } = createSandbox();
   try {
     const claude = scopeDir(paths.profiles.claude, "acct", "org");
@@ -512,16 +528,101 @@ test("a refresh whose manifest cannot be written still leaves its backup and rec
     const plans = planDesktopSessionSync(TO_GATEWAY_PROFILE, paths);
     // Backups may still be created, but the run's manifest cannot be.
     mkdirSync(join(paths.manifestDir, "backups"), { recursive: true });
-    chmodSync(paths.manifestDir, 0o500);
+    const restoreWrites = failManifestWrites(t, paths.manifestDir);
     try {
       assert.throws(() => applyDesktopSessionSync(plans, paths.manifestDir, new Date(NOW.getTime() + 1_000)), (error: unknown) =>
         error instanceof DesktopSyncError && /could not record the changes/.test(error.message) && error.entries[0]?.backupPath !== undefined
         && readFileSync(error.entries[0].backupPath, "utf8").includes("state only the copy has")
         && existsSync(`${error.entries[0].backupPath}.json`));
     } finally {
-      chmodSync(paths.manifestDir, 0o700);
+      restoreWrites();
     }
   } finally {
     cleanup();
   }
+});
+
+test("Windows distinguishes Desktop from its native CLI using product metadata", () => {
+  const scenarios = [
+    { products: [], expected: "not_running" },
+    { products: ["Claude Code"], expected: "not_running" },
+    { products: ["Claude Code", "Claude Code"], expected: "not_running" },
+    { products: ["Claude"], expected: "running" },
+    { products: ["Claude Code", "Claude", "Claude"], expected: "running" },
+    { products: [" claude "], expected: "running" },
+    { products: [null, "Claude"], expected: "running" },
+    { products: [null], expected: "unknown" },
+    { products: ["", "Claude Code"], expected: "unknown" },
+    { products: ["Unknown application"], expected: "unknown" },
+  ];
+  for (const { products, expected } of scenarios) {
+    const state = desktopProcessState("win32", (command, args, options) => {
+      assert.equal(command, "powershell.exe");
+      assert.deepEqual(args.slice(0, 3), ["-NoProfile", "-NonInteractive", "-Command"]);
+      assert.match(args[3]!, /Get-Process -ErrorAction Stop/);
+      assert.match(args[3]!, /FileVersionInfo.ProductName/);
+      assert.equal(options.shell, false);
+      assert.equal(options.windowsHide, true);
+      assert.equal(options.timeout, 5_000);
+      return { status: 0, stdout: JSON.stringify(products.map((productName) => ({ productName }))) };
+    });
+    assert.equal(state, expected, JSON.stringify(products));
+  }
+});
+
+test("Windows process detection fails closed on errors, timeouts, or unexpected output", () => {
+  for (const stdout of ["", "not json", "null", "{}", '[{}]', '[{"productName":123}]']) {
+    assert.equal(desktopProcessState("win32", () => ({ status: 0, stdout })), "unknown", stdout);
+  }
+  for (const result of [
+    { status: 1, stdout: "[]" },
+    { status: null, stdout: "[]" },
+    { status: 0, stdout: "[]", error: new Error("ENOENT") },
+    { status: null, stdout: "[]", error: new Error("ETIMEDOUT") },
+  ]) assert.equal(desktopProcessState("win32", () => result), "unknown");
+  assert.equal(desktopProcessState("win32", () => { throw new Error("query failed"); }), "unknown");
+});
+
+test("macOS process detection preserves pgrep exit semantics", () => {
+  for (const [status, expected] of [[0, "running"], [1, "not_running"], [2, "unknown"], [null, "unknown"]] as const) {
+    assert.equal(desktopProcessState("darwin", (command, args) => {
+      assert.equal(command, "pgrep");
+      assert.deepEqual(args, ["-x", "Claude"]);
+      return { status };
+    }), expected);
+  }
+  assert.equal(desktopProcessState("darwin", () => ({ status: 1, error: new Error("spawn failed") })), "unknown");
+});
+
+test("Windows sync copies history with CLI only and refuses while Desktop is open", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    const claude = scopeDir(paths.profiles.claude, "acct", "org");
+    const gateway = scopeDir(paths.profiles.thirdParty, "gw", "org");
+    writeSession(claude, "c1", "cli-c1", 1_000);
+    writeTranscript(paths, "cli-c1");
+    const running = desktopProcessState("win32", () => ({ status: 0, stdout: '[{"productName":"Claude"}]' }));
+    assert.equal(syncDesktopSessionsWhenClosed(TO_GATEWAY_PROFILE, paths, running, NOW).status, "skipped");
+    assert.deepEqual(sessionFiles(gateway), []);
+    const closed = desktopProcessState("win32", () => ({ status: 0, stdout: '[{"productName":"Claude Code"}]' }));
+    requireDesktopClosed(closed);
+    const result = syncDesktopSessionsWhenClosed(TO_GATEWAY_PROFILE, paths, closed, NOW);
+    assert.equal(result.status, "applied");
+    assert.deepEqual(sessionFiles(gateway), ["local_c1.json"]);
+    assert.equal(desktopSyncReport(result).level, "success");
+  } finally { cleanup(); }
+});
+
+test("sync reports warn when a destination scope or source transcripts are missing", () => {
+  const { paths, cleanup } = createSandbox();
+  try {
+    writeSession(scopeDir(paths.profiles.claude, "acct", "org"), "c1", "cli-c1", 1_000);
+    const noScope = desktopSyncReport(runDesktopSessionSync(TO_GATEWAY_PROFILE, paths, NOW));
+    assert.equal(noScope.level, "warning");
+    assert.match(noScope.messages.join(" "), /then quit it and rerun/);
+    scopeDir(paths.profiles.thirdParty, "gw", "org");
+    const noTranscript = desktopSyncReport(runDesktopSessionSync(TO_GATEWAY_PROFILE, paths, NOW));
+    assert.equal(noTranscript.level, "warning");
+    assert.match(noTranscript.messages.join(" "), /1 without transcript/);
+  } finally { cleanup(); }
 });

@@ -1388,6 +1388,50 @@ export function renderDashboardHtml(): string {
       transform: none;
       box-shadow: 1px 1px 0 var(--paper-deep);
     }
+    .usage-refresh-icon { flex: none; }
+    #btn-refresh-usage { min-width: 8.5rem; }
+    #btn-refresh-usage[aria-busy="true"] .usage-refresh-icon,
+    #btn-confirm-reset-usage[aria-busy="true"] .usage-reset-icon {
+      animation: usage-spin 0.85s linear infinite;
+    }
+    @keyframes usage-spin { to { transform: rotate(360deg); } }
+    .usage-feedback {
+      min-height: 1.3em;
+      margin: -0.25rem 0 1rem;
+      color: var(--muted-foreground);
+      font-size: 0.75rem;
+    }
+    .usage-feedback[data-state="error"] { color: var(--destructive); }
+    .usage-reset-dialog {
+      width: min(29rem, calc(100vw - 2rem));
+      max-height: calc(100dvh - 2rem);
+      padding: 0;
+      overflow-y: auto;
+      border: 2px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      color: var(--foreground);
+      box-shadow: 6px 6px 0 rgba(23, 32, 29, 0.18);
+    }
+    .usage-reset-dialog::backdrop { background: rgba(23, 32, 29, 0.48); }
+    .usage-reset-body { padding: 1.5rem; }
+    .usage-reset-heading { display: flex; align-items: center; gap: 0.8rem; margin-bottom: 1rem; }
+    .usage-reset-symbol {
+      display: grid; place-items: center; flex: none;
+      width: 2.75rem; height: 2.75rem;
+      color: var(--destructive); background: #f8dfd8; border-radius: 50%;
+    }
+    .usage-reset-heading h2 { margin: 0; font-family: var(--font-display); font-size: 1.4rem; line-height: 1.2; }
+    .usage-reset-body p { margin: 0; font-size: 0.85rem; line-height: 1.65; color: var(--muted-foreground); }
+    .usage-reset-scope { margin: 1rem 0; padding-left: 1.2rem; font-size: 0.85rem; line-height: 1.65; }
+    .usage-reset-scope li + li { margin-top: 0.4rem; }
+    .usage-reset-body .usage-reset-warning { color: var(--destructive); font-weight: 600; }
+    .usage-reset-error { margin-top: 1rem; padding: 0.75rem; background: #f8dfd8; color: var(--destructive); border-radius: var(--radius); font-size: 0.8125rem; line-height: 1.5; }
+    .usage-reset-actions {
+      display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.75rem;
+      padding: 1rem 1.5rem; border-top: 1px solid var(--border); background: var(--surface-soft);
+    }
+    .usage-reset-actions .btn { min-height: 2.75rem; }
     .btn-sm {
       padding: 0.35rem 0.6rem;
       font-size: 0.75rem;
@@ -2006,6 +2050,24 @@ export function renderDashboardHtml(): string {
       color: #174d48;
       border: 1.5px solid var(--line);
     }
+    #toast.warning {
+      background: #fff0cb;
+      color: #704b12;
+      border: 1.5px solid var(--line);
+    }
+    .desktop-sync-report {
+      margin-bottom: 1rem;
+      padding: 0.75rem 1rem;
+      border: 1.5px solid var(--line);
+      border-radius: 0.65rem;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 0.8125rem;
+      background: var(--teal-soft);
+      color: #174d48;
+    }
+    .desktop-sync-report.warning { background: #fff0cb; color: #704b12; }
+    .desktop-sync-report.error { background: #f8dfd8; color: #7d3430; }
     #toast.error {
       background: #f8dfd8;
       color: #7d3430;
@@ -2063,6 +2125,7 @@ export function renderDashboardHtml(): string {
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; }
+      .usage-refresh-icon, .usage-reset-icon { animation: none !important; }
     }
   </style>
 </head>
@@ -2118,6 +2181,7 @@ export function renderDashboardHtml(): string {
         </button>
       </div>
     <div class="container">
+      <div id="desktop-sync-report" class="desktop-sync-report" role="status" aria-live="polite" hidden></div>
     <!-- Setup: provider, gateway endpoint, Claude clients and model map -->
     <div class="tab-pane active" id="tab-setup" role="tabpanel">
       <section class="card" aria-label="Setup and configuration">
@@ -2418,10 +2482,15 @@ export function renderDashboardHtml(): string {
             Token usage & quota limits
           </h2>
           <div class="logs-controls">
-            <button class="btn btn-secondary btn-sm" id="btn-refresh-usage" type="button" title="Refresh token usage & limits">Refresh</button>
+            <button class="btn btn-secondary btn-sm" id="btn-refresh-usage" type="button" title="Refresh token usage & limits" aria-busy="false">
+              <svg class="usage-refresh-icon" aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"/></svg>
+              <span id="usage-refresh-label">Refresh</span>
+            </button>
             <button class="btn btn-secondary btn-sm" id="btn-reset-usage" type="button" title="Reset token usage counters">Reset counters</button>
           </div>
         </div>
+
+        <p class="usage-feedback" id="usage-feedback" role="status" aria-live="polite" aria-atomic="true"></p>
 
         <!-- Account Quota & Remaining Limits (5h & Weekly) -->
         <div class="quota-limits-section" id="quota-limits-section">
@@ -2633,6 +2702,29 @@ export function renderDashboardHtml(): string {
     </main>
   </div>
 
+  <dialog class="usage-reset-dialog" id="usage-reset-dialog" aria-labelledby="usage-reset-title" aria-describedby="usage-reset-description usage-reset-warning">
+    <div class="usage-reset-body">
+      <div class="usage-reset-heading">
+        <span class="usage-reset-symbol" aria-hidden="true"><svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10a9 9 0 1 1 2.6 8.4M3 4v6h6"/><path d="M12 8v4l3 2"/></svg></span>
+        <h2 id="usage-reset-title">Reset usage counters?</h2>
+      </div>
+      <p id="usage-reset-description">Start a fresh count for this gateway. This clears recorded usage across all models and providers.</p>
+      <ul class="usage-reset-scope">
+        <li><strong>Cleared:</strong> request counts, token totals, and per-model usage.</li>
+        <li><strong>Unchanged:</strong> account quotas, provider billing, and client settings.</li>
+      </ul>
+      <p class="usage-reset-warning" id="usage-reset-warning">This cannot be undone.</p>
+      <div class="usage-reset-error" id="usage-reset-error" role="alert" hidden></div>
+    </div>
+    <div class="usage-reset-actions">
+      <button class="btn btn-secondary" id="btn-cancel-reset-usage" type="button" autofocus>Cancel</button>
+      <button class="btn btn-danger" id="btn-confirm-reset-usage" type="button" aria-busy="false">
+        <svg class="usage-reset-icon" aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10a9 9 0 1 1 2.6 8.4M3 4v6h6"/></svg>
+        <span id="usage-reset-label">Reset counters</span>
+      </button>
+    </div>
+  </dialog>
+
   <div id="toast" role="status" aria-live="polite"></div>
 
   <script>
@@ -2643,6 +2735,25 @@ export function renderDashboardHtml(): string {
       el.textContent = msg;
       el.className = "show " + type;
       setTimeout(() => { el.className = ""; }, 3500);
+    }
+
+    // Configuration success does not imply history was synced. Keep the report visible after the toast.
+    function showConfigurationResult(message, report) {
+      if (!report) {
+        showToast(message);
+        return; // A CLI-only action must not erase an unresolved Desktop warning.
+      }
+      const level = report.level === "error" ? "error" : report.level === "warning" ? "warning" : "success";
+      const summary = report.status === "failed" ? "History sync failed."
+        : report.status === "skipped" ? "History sync skipped."
+        : level === "warning" ? "History sync needs attention." : "History sync completed.";
+      const notice = document.getElementById("desktop-sync-report");
+      notice.textContent = [message, summary, ...report.messages].join("\\n");
+      notice.className = "desktop-sync-report " + level;
+      notice.setAttribute("role", level === "success" ? "status" : "alert");
+      notice.setAttribute("aria-live", level === "success" ? "polite" : "assertive");
+      notice.hidden = false;
+      showToast(message + " " + summary, level);
     }
 
     /* Tab Controller */
@@ -2970,6 +3081,8 @@ export function renderDashboardHtml(): string {
           showToast("Switched active provider to " + providerLabels[provider]);
           cachedLimits = null;
           await fetchStatus();
+          // Finish the previous provider read before refreshing the new provider.
+          await usageRequest;
           await fetchUsage(true);
         } else {
           showToast("Failed to switch provider: " + (data.error || "Unknown error"), "error");
@@ -3109,7 +3222,7 @@ export function renderDashboardHtml(): string {
         });
         const data = await res.json();
         if (!data.ok) throw new Error(data.error);
-        showToast("Configuration applied successfully!");
+        showConfigurationResult("Configuration applied successfully!", data.desktopSessionSync);
         fetchStatus();
       } catch (err) {
         showToast("Failed to apply configuration: " + err.message, "error");
@@ -3163,7 +3276,7 @@ export function renderDashboardHtml(): string {
         const restartHint = target === "cli"
           ? "Reload your terminal or editor."
           : "Quit and reopen Claude Desktop to return to Claude account sign-in.";
-        showToast("Reset completed for " + target + ". " + restartHint);
+        showConfigurationResult("Reset completed for " + target + ". " + restartHint, data.desktopSessionSync);
         fetchStatus();
       } catch (err) {
         showToast("Reset failed: " + err.message, "error");
@@ -3524,16 +3637,56 @@ export function renderDashboardHtml(): string {
       }
     }
 
-    async function fetchUsage(refresh = false) {
-      try {
-        const url = refresh ? "/api/ui/usage?refresh=true" : "/api/ui/usage";
-        const res = await fetch(url);
-        if (!res.ok) return;
-        const data = await res.json();
-        renderUsage(data);
-      } catch (err) {
-        // Silently skip transient errors
-      }
+    let usageRequest = null;
+    let usageLoading = false;
+    let usageResetPending = false;
+
+    function updateUsageControls() {
+      const busy = usageLoading || usageResetPending;
+      document.getElementById("btn-refresh-usage").disabled = busy;
+      document.getElementById("btn-refresh-usage").setAttribute("aria-busy", String(usageLoading));
+      document.getElementById("usage-refresh-label").textContent = usageLoading ? "Refreshing…" : "Refresh";
+      document.getElementById("btn-reset-usage").disabled = busy;
+      document.getElementById("btn-confirm-reset-usage").disabled = busy;
+      document.getElementById("btn-confirm-reset-usage").setAttribute("aria-busy", String(usageResetPending));
+      document.getElementById("usage-reset-label").textContent = usageResetPending ? "Resetting…" : "Reset counters";
+      document.getElementById("btn-cancel-reset-usage").disabled = usageResetPending;
+    }
+
+    function setUsageFeedback(message, state = "idle") {
+      const feedback = document.getElementById("usage-feedback");
+      feedback.textContent = message;
+      feedback.dataset.state = state;
+    }
+
+    function fetchUsage(refresh = false) {
+      // Share one in-flight read across clicks, tab activation, and initial loading.
+      if (usageRequest) return usageRequest;
+      if (usageResetPending) return Promise.resolve(false);
+      usageLoading = true;
+      updateUsageControls();
+      setUsageFeedback("Refreshing usage and quota limits…", "loading");
+      usageRequest = Promise.resolve().then(async () => {
+        try {
+          const url = refresh ? "/api/ui/usage?refresh=true" : "/api/ui/usage";
+          const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+          if (!res.ok) throw new Error("Request failed (HTTP " + res.status + ").");
+          const data = await res.json();
+          renderUsage(data);
+          setUsageFeedback("Updated at " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+          return true;
+        } catch (err) {
+          const message = err.name === "TimeoutError" ? "Request timed out. Try Refresh again." : "Could not refresh usage. " + err.message;
+          setUsageFeedback(message, "error");
+          if (refresh) showToast(message, "error");
+          return false;
+        } finally {
+          usageRequest = null;
+          usageLoading = false;
+          updateUsageControls();
+        }
+      });
+      return usageRequest;
     }
 
     let cachedLimits = null;
@@ -3697,18 +3850,46 @@ export function renderDashboardHtml(): string {
     }
 
     function setupUsageControls() {
+      const dialog = document.getElementById("usage-reset-dialog");
+      const error = document.getElementById("usage-reset-error");
       document.getElementById("btn-refresh-usage").addEventListener("click", () => fetchUsage(true));
-      document.getElementById("btn-reset-usage").addEventListener("click", async () => {
-        if (!confirm("Reset all token usage counters to zero?")) return;
+      document.getElementById("btn-reset-usage").addEventListener("click", () => {
+        if (usageLoading || usageResetPending || dialog.open) return;
+        error.hidden = true;
+        error.textContent = "";
+        dialog.showModal();
+      });
+      document.getElementById("btn-cancel-reset-usage").addEventListener("click", () => {
+        if (!usageResetPending) dialog.close();
+      });
+      dialog.addEventListener("cancel", (event) => {
+        if (usageResetPending) event.preventDefault();
+      });
+      dialog.addEventListener("close", () => {
+        document.getElementById("btn-reset-usage").focus();
+      });
+      document.getElementById("btn-confirm-reset-usage").addEventListener("click", async () => {
+        if (!dialog.open || usageLoading || usageResetPending) return;
+        usageResetPending = true;
+        error.hidden = true;
+        updateUsageControls();
         try {
-          const res = await fetch("/api/ui/usage/reset", { method: "POST" });
-          if (res.ok) {
-            showToast("Token usage counters reset.");
-            fetchUsage();
-          }
+          const res = await fetch("/api/ui/usage/reset", { method: "POST", signal: AbortSignal.timeout(20000) });
+          if (!res.ok) throw new Error("Request failed (HTTP " + res.status + ").");
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || "Reset was not completed.");
         } catch (err) {
-          showToast("Failed to reset token usage: " + err.message, "error");
+          error.textContent = "Could not confirm the reset. " + (err.name === "TimeoutError" ? "Request timed out." : err.message) + " Refresh usage before trying again.";
+          error.hidden = false;
+          return;
+        } finally {
+          usageResetPending = false;
+          updateUsageControls();
         }
+        dialog.close();
+        showToast("Token usage counters reset.");
+        await fetchUsage();
+        document.getElementById("btn-reset-usage").focus();
       });
     }
 

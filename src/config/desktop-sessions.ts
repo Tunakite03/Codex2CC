@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -61,16 +61,44 @@ export function resolveDesktopSessionPaths(env: NodeJS.ProcessEnv = process.env,
 
 export type DesktopProcessState = "running" | "not_running" | "unknown";
 
-/**
- * Whether the Claude Desktop app is open. Only macOS can tell it apart from the `claude` CLI by process
- * name; elsewhere, and when the process list cannot be read, the answer is `unknown`.
- */
-export function desktopProcessState(platformName: string = platform()): DesktopProcessState {
-  if (platformName !== "darwin") return "unknown";
-  const probe = spawnSync("pgrep", ["-x", "Claude"], { stdio: ["ignore", "ignore", "ignore"], shell: false });
-  if (probe.status === 0) return "running";
-  if (probe.status === 1) return "not_running";
-  return "unknown";
+type ProcessProbe = (
+  command: string,
+  args: readonly string[],
+  options: SpawnSyncOptionsWithStringEncoding,
+) => { readonly status: number | null; readonly stdout?: string; readonly error?: Error };
+
+// Desktop and the native CLI are both claude.exe. Only a positively identified CLI may be ignored.
+const WINDOWS_PROCESS_QUERY = [
+  "$ErrorActionPreference = 'Stop'",
+  "$processes = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -ieq 'claude' })",
+  "$products = @($processes | ForEach-Object { $product = $null; try { $product = $_.MainModule.FileVersionInfo.ProductName } catch {}; [PSCustomObject]@{ productName = $product } })",
+  "ConvertTo-Json -InputObject $products -Compress",
+].join("; ");
+const WindowsProcesses = z.array(z.object({ productName: z.string().nullable() }));
+
+/** Checks Desktop without confusing the Windows CLI with the Electron app. Probe failures fail closed. */
+export function desktopProcessState(platformName: string = platform(), probe: ProcessProbe = spawnSync): DesktopProcessState {
+  if (platformName !== "darwin" && platformName !== "win32") return "unknown";
+  const options: SpawnSyncOptionsWithStringEncoding = {
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: false, windowsHide: true, timeout: 5_000,
+  };
+  try {
+    const result = platformName === "win32"
+      ? probe("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_PROCESS_QUERY], options)
+      : probe("pgrep", ["-x", "Claude"], options);
+    if (result.error) return "unknown";
+    if (platformName === "darwin") {
+      return result.status === 0 ? "running" : result.status === 1 ? "not_running" : "unknown";
+    }
+    if (result.status !== 0) return "unknown";
+    const parsed = WindowsProcesses.safeParse(JSON.parse(result.stdout ?? ""));
+    if (!parsed.success) return "unknown";
+    const products = parsed.data.map(({ productName }) => productName?.trim().toLowerCase());
+    if (products.includes("claude")) return "running";
+    return products.every((name) => name === "claude code") ? "not_running" : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 const SessionEntry = z.object({ sessionId: z.string().regex(/^local_[A-Za-z0-9-]+$/), cliSessionId: z.string().min(1) }).loose();
@@ -432,7 +460,7 @@ export function describePlans(plans: readonly DirectionPlan[], tense: PlanTense)
   return plans.map((plan) => {
     const route = `${PROFILE_LABEL[plan.from]} -> ${PROFILE_LABEL[plan.to]}`;
     if (plan.blocked === "no_source_sessions") return `${route}: no sessions to copy.`;
-    if (plan.blocked === "no_destination_scope") return `${route}: skipped, open Claude Desktop once in that mode so it creates its session list.`;
+    if (plan.blocked === "no_destination_scope") return `${route}: skipped, open Claude Desktop once in that mode so it creates its session list, then quit it and rerun: codex2cc --sync-desktop-sessions`;
     const { alreadyPresent, deletedInDestination, missingTranscript, invalid } = plan.skipped;
     return `${route}: ${tense.add} ${plan.copies.length} session(s), ${tense.refresh} ${plan.refreshes.length} earlier cop(ies); skipped ${alreadyPresent} already present, ${deletedInDestination} deleted there, ${missingTranscript} without transcript, ${invalid} unreadable.`;
   });
@@ -464,7 +492,9 @@ export type DesktopSyncReport = {
 
 /** The outcome in the shape the control panel shows after a setup or reset. */
 export function desktopSyncReport(outcome: DesktopSyncOutcome): DesktopSyncReport {
-  const level = outcome.status === "applied" ? "success" : outcome.status === "skipped" ? "warning" : "error";
+  const incomplete = outcome.status === "applied" && outcome.sync.plans.some((plan) =>
+    plan.blocked === "no_destination_scope" || plan.skipped.missingTranscript > 0 || plan.skipped.invalid > 0);
+  const level = outcome.status === "failed" ? "error" : outcome.status === "skipped" || incomplete ? "warning" : "success";
   return { status: outcome.status, level, messages: describeOutcome(outcome) };
 }
 
