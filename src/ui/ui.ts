@@ -16,7 +16,7 @@ import {
 } from "../config/config-setup.js";
 import type { GatewayOptions } from "../gateway/gateway.js";
 import { ANTIGRAVITY_TIER_MODELS, DEFAULT_TIER_MODELS, PROVIDERS, PROVIDER_LABELS, isProviderType, routedModels, smallestContextWindow, type ProviderType } from "../models/models.js";
-import { apiProviderTiers, hasApiKey, isApiProvider, parseApiProviderConfig } from "../providers/config.js";
+import { API_PROVIDERS, apiProviderTiers, hasApiKey, isApiProvider, parseApiProviderConfig } from "../providers/config.js";
 import { currentProvider, getProviderConfig, providerDefaultModel, providerModels } from "../providers/runtime.js";
 import { isAntigravityAvailable } from "../bridge/antigravity.js";
 import {
@@ -449,7 +449,7 @@ export async function handleUiRoute(
   if (pathname === "/api/ui/provider-config" && request.method === "POST") {
     const body = await readJsonBody(request);
     if (typeof body.provider !== "string" || !isProviderType(body.provider) || !isApiProvider(body.provider)) {
-      throw new BridgeError(400, "invalid_provider", "API provider must be openrouter, openai, or opencode.");
+      throw new BridgeError(400, "invalid_provider", `API provider must be one of: ${API_PROVIDERS.join(", ")}.`);
     }
     const config = parseApiProviderConfig(body.config);
     if (!options.tierStore) throw new BridgeError(503, "settings_unavailable", "Provider configuration storage is unavailable in this gateway mode.");
@@ -921,8 +921,11 @@ export function renderDashboardHtml(): string {
       top: calc(100% + 6px);
       left: 0;
       z-index: 100;
-      min-width: 320px;
-      max-width: 380px;
+      min-width: min(320px, calc(100vw - 3rem));
+      max-width: min(380px, calc(100vw - 3rem));
+      max-height: min(440px, 60vh);
+      overflow-y: auto;
+      overscroll-behavior: contain;
       background: var(--surface);
       border: 1.5px solid var(--line);
       border-radius: 0.625rem;
@@ -2123,9 +2126,7 @@ export function renderDashboardHtml(): string {
             <select class="sr-only" id="select-provider" aria-label="Active LLM Provider">
               <option value="codex">ChatGPT (Codex)</option>
               <option value="antigravity">Antigravity (agy)</option>
-              <option value="openrouter">OpenRouter</option>
-              <option value="openai">OpenAI API</option>
-              <option value="opencode">OpenCode</option>
+              ${API_PROVIDERS.map((provider) => `<option value="${provider}">${PROVIDER_LABELS[provider]}</option>`).join("\n")}
             </select>
             <button class="provider-select-trigger" id="provider-select-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="provider-select-menu" title="Click to choose LLM provider">
               <span class="p-trigger-icon" id="provider-trigger-icon" aria-hidden="true">
@@ -2166,47 +2167,18 @@ export function renderDashboardHtml(): string {
                 </span>
               </button>
 
-              <button class="provider-btn provider-select-option" id="btn-provider-openrouter" type="button" data-provider="openrouter" role="option" aria-selected="false">
-                <span class="p-icon">
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
-                </span>
+              ${API_PROVIDERS.map((provider) => `
+              <button class="provider-btn provider-select-option" id="btn-provider-${provider}" type="button" data-provider="${provider}" role="option" aria-selected="false">
+                <span class="p-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m8 8-4 4 4 4m8-8 4 4-4 4m-3-11-2 22"/></svg></span>
                 <span class="p-info">
-                  <span class="p-name">OpenRouter</span>
-                  <span class="p-desc">Multi-model router with unified credit balance</span>
+                  <span class="p-name">${PROVIDER_LABELS[provider]}</span>
+                  <span class="p-desc">${provider === "custom" ? "Your endpoint, protocol and models" : "API key and configurable model catalog"}</span>
                 </span>
                 <span class="p-meta">
-                  <span class="p-opt-badge active-badge" id="badge-opt-openrouter" style="display:none">Active</span>
-                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                  <span class="p-opt-badge active-badge" id="badge-opt-${provider}" style="display:none">Active</span>
+                  <svg class="p-check" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 4 4L19 6"/></svg>
                 </span>
-              </button>
-
-              <button class="provider-btn provider-select-option" id="btn-provider-openai" type="button" data-provider="openai" role="option" aria-selected="false">
-                <span class="p-icon">
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3"/><path d="m18.5 4.5 2 2"/></svg>
-                </span>
-                <span class="p-info">
-                  <span class="p-name">OpenAI API</span>
-                  <span class="p-desc">Direct OpenAI platform API key</span>
-                </span>
-                <span class="p-meta">
-                  <span class="p-opt-badge active-badge" id="badge-opt-openai" style="display:none">Active</span>
-                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                </span>
-              </button>
-
-              <button class="provider-btn provider-select-option" id="btn-provider-opencode" type="button" data-provider="opencode" role="option" aria-selected="false">
-                <span class="p-icon">
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-                </span>
-                <span class="p-info">
-                  <span class="p-name">OpenCode</span>
-                  <span class="p-desc">OpenCode inference endpoint</span>
-                </span>
-                <span class="p-meta">
-                  <span class="p-opt-badge active-badge" id="badge-opt-opencode" style="display:none">Active</span>
-                  <svg class="p-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                </span>
-              </button>
+              </button>`).join("\n")}
             </div>
           </div>
           <button class="btn btn-primary btn-provider-submit" id="btn-provider-submit" type="button" disabled title="Click to apply and switch provider">
@@ -2221,6 +2193,7 @@ export function renderDashboardHtml(): string {
           <h3 id="api-provider-title">API provider settings</h3>
           <p id="api-key-status" role="status"></p>
           <p class="supporting-text">Enter the environment variable name, never the API key itself. Set its value in the gateway process environment and restart. Saving settings does not select a provider; press Submit above to switch.</p>
+          <p id="custom-provider-help" class="supporting-text" hidden>Custom supports Chat Completions, Responses and Anthropic Messages compatible APIs. Replace the example endpoint and model with your server settings. Enter complete resource URLs, not base URLs. HTTPS is required except for localhost HTTP.</p>
           <form id="api-provider-form">
             <div class="api-provider-fields">
               <label for="api-key-env">API key environment variable name
@@ -2717,6 +2690,7 @@ export function renderDashboardHtml(): string {
       const entry = currentStatus?.provider?.available?.find((provider) => provider.id === selectedProvider);
       const section = document.getElementById("api-provider-settings");
       section.hidden = !entry?.config;
+      document.getElementById("custom-provider-help").hidden = selectedProvider !== "custom";
       if (!entry?.config) return;
       document.getElementById("api-provider-title").textContent = providerLabels[selectedProvider] + " settings";
       document.getElementById("api-key-status").textContent = entry.config.apiKeyEnv + (entry.keyConfigured ? ": configured in the gateway environment" : ": missing or invalid in the gateway environment; inference is unavailable until configured");
@@ -2976,9 +2950,7 @@ export function renderDashboardHtml(): string {
 
     document.getElementById("btn-provider-codex")?.addEventListener("click", () => selectProvider("codex"));
     document.getElementById("btn-provider-antigravity")?.addEventListener("click", () => selectProvider("antigravity"));
-    document.getElementById("btn-provider-openrouter")?.addEventListener("click", () => selectProvider("openrouter"));
-    document.getElementById("btn-provider-openai")?.addEventListener("click", () => selectProvider("openai"));
-    document.getElementById("btn-provider-opencode")?.addEventListener("click", () => selectProvider("opencode"));
+    ${API_PROVIDERS.map((provider) => `document.getElementById("btn-provider-${provider}")?.addEventListener("click", () => selectProvider("${provider}"));`).join("\n    ")}
 
     document.getElementById("btn-provider-submit")?.addEventListener("click", async () => {
       if (selectedProvider === currentActiveProvider || isProviderSwitching || isProviderConfigSaving) return;

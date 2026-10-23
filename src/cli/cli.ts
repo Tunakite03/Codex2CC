@@ -52,7 +52,7 @@ Options:
   --no-auth                 Standalone gateway without a token (not recommended)
   --gateway-url, --url <u>  Base URL for setup (default: http://127.0.0.1:${DEFAULT_PORT})
   --token <secret>          Gateway token for client setup (or CODEX2CC_TOKEN)
-  --provider <name>         Backend: codex, antigravity, openrouter, openai, opencode
+  --provider <name>         Backend: ${PROVIDERS.join(", ")}
   --dry-run                 With --sync-desktop-sessions: show what would be copied, change nothing
   -p, --print <prompt>      Run Claude Code non-interactively
   -c, --continue            Continue the previous Claude Code session

@@ -1,3 +1,4 @@
+import { PROVIDERS } from "../models/models.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BridgeError } from "../bridge/bridge.js";
@@ -117,7 +118,7 @@ test("parseCli reads --sync-desktop-sessions with an optional --dry-run and reje
 
 
 test("parseCli accepts each provider across launch and setup modes", () => {
-  for (const provider of ["codex", "antigravity", "openrouter", "openai", "opencode"]) {
+  for (const provider of PROVIDERS) {
     for (const flags of [[], ["--ui"], ["--serve"], ["--list-models"], ["--setup"], ["--setup-cli"], ["--setup-desktop"]]) {
       const command = parseCli([...flags, "--provider", provider]);
       assert.ok("provider" in command);

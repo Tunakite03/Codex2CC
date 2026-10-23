@@ -718,9 +718,9 @@ test("API settings, key indicators and every provider mapping survive independen
     const reloaded = TierModelStore.open(file, {});
     for (const provider of PROVIDERS) assert.deepEqual(reloaded.current(provider), saved.get(provider));
     const restarted = getStatus({ ...mockOptions, tierStore: reloaded, providerEnv: {} }, 3456) as ApiStatus;
-    assert.equal(restarted.provider.active, "opencode");
+    assert.equal(restarted.provider.active, PROVIDERS.at(-1));
     assert.equal(restarted.provider.keyConfigured, false);
-    assert.deepEqual(restarted.tierMapping.current, saved.get("opencode"));
+    assert.deepEqual(restarted.tierMapping.current, saved.get(PROVIDERS.at(-1)!));
     await handleUiRoute(options, createMockRequest("POST", "/api/ui/provider", { provider: "codex" }), createMockResponse().response, "/api/ui/provider", 3456);
     const codex = getStatus(options, 3456) as ApiStatus;
     assert.deepEqual(codex.tierMapping.models, mockOptions.availableModels);

@@ -1,8 +1,8 @@
 import { z } from "zod";
 import { BridgeError } from "../bridge/bridge.js";
-import type { ProviderType, TierModels } from "../models/models.js";
+import { API_PROVIDERS, type ProviderType, type TierModels } from "../models/models.js";
 
-export const API_PROVIDERS = ["openrouter", "openai", "opencode"] as const;
+export { API_PROVIDERS };
 export type ApiProvider = typeof API_PROVIDERS[number];
 export const ApiProviderSchema = z.enum(API_PROVIDERS);
 export const ApiProtocolSchema = z.enum(["chat-completions", "responses", "anthropic-messages"]);
@@ -62,11 +62,7 @@ export const ApiProviderConfigSchema = z.object({
   if (!slugs.has(config.defaultModel)) context.addIssue({ code: "custom", path: ["defaultModel"], message: "must exist in the configured models" });
 });
 export type ApiProviderConfig = z.infer<typeof ApiProviderConfigSchema>;
-export const ApiProviderConfigsSchema = z.object({
-  openrouter: ApiProviderConfigSchema.optional(),
-  openai: ApiProviderConfigSchema.optional(),
-  opencode: ApiProviderConfigSchema.optional(),
-});
+export const ApiProviderConfigsSchema = z.partialRecord(ApiProviderSchema, ApiProviderConfigSchema);
 export type ApiProviderConfigs = z.infer<typeof ApiProviderConfigsSchema>;
 
 const DEFAULT_CONFIGS: Readonly<Record<ApiProvider, ApiProviderConfig>> = {
@@ -97,10 +93,52 @@ const DEFAULT_CONFIGS: Readonly<Record<ApiProvider, ApiProviderConfig>> = {
       { slug: "kimi-k3", displayName: "Kimi K3", protocol: "chat-completions", reasoning: "none" },
     ],
   },
+  anthropic: {
+    apiKeyEnv: "ANTHROPIC_API_KEY",
+    endpoints: { "anthropic-messages": "https://api.anthropic.com/v1/messages" },
+    defaultModel: "claude-sonnet-5-5",
+    models: [{ slug: "claude-sonnet-5-5", displayName: "Claude Sonnet 5.5", protocol: "anthropic-messages", reasoning: "none" }],
+  },
+  gemini: {
+    apiKeyEnv: "GEMINI_API_KEY",
+    endpoints: { "chat-completions": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" },
+    defaultModel: "gemini-3.8-flash",
+    models: [{ slug: "gemini-3.8-flash", displayName: "Gemini 3.8 Flash", protocol: "chat-completions", reasoning: "none" }],
+  },
+  deepseek: {
+    apiKeyEnv: "DEEPSEEK_API_KEY",
+    endpoints: { "chat-completions": "https://api.deepseek.com/chat/completions" },
+    defaultModel: "deepseek-flash",
+    models: [{ slug: "deepseek-flash", displayName: "DeepSeek Flash", protocol: "chat-completions", reasoning: "none" }],
+  },
+  groq: {
+    apiKeyEnv: "GROQ_API_KEY",
+    endpoints: { "chat-completions": "https://api.groq.com/openai/v1/chat/completions" },
+    defaultModel: "openai/gpt-oss-120b",
+    models: [{ slug: "openai/gpt-oss-120b", displayName: "GPT-OSS 120B", protocol: "chat-completions", reasoning: "none" }],
+  },
+  xai: {
+    apiKeyEnv: "XAI_API_KEY",
+    endpoints: { "chat-completions": "https://api.x.ai/v1/chat/completions" },
+    defaultModel: "grok-4.20-0309-non-reasoning",
+    models: [{ slug: "grok-4.20-0309-non-reasoning", displayName: "Grok 4.20 Non-Reasoning", protocol: "chat-completions", reasoning: "none" }],
+  },
+  mistral: {
+    apiKeyEnv: "MISTRAL_API_KEY",
+    endpoints: { "chat-completions": "https://api.mistral.ai/v1/chat/completions" },
+    defaultModel: "mistral-large-latest",
+    models: [{ slug: "mistral-large-latest", displayName: "Mistral Large", protocol: "chat-completions", reasoning: "none" }],
+  },
+  custom: {
+    apiKeyEnv: "CUSTOM_API_KEY",
+    endpoints: { "chat-completions": "http://127.0.0.1:8000/v1/chat/completions" },
+    defaultModel: "custom-model",
+    models: [{ slug: "custom-model", displayName: "Custom model", protocol: "chat-completions", reasoning: "none" }],
+  },
 };
 
 export function isApiProvider(provider: ProviderType): provider is ApiProvider {
-  return provider === "openrouter" || provider === "openai" || provider === "opencode";
+  return API_PROVIDERS.some((candidate) => candidate === provider);
 }
 
 export function defaultApiProviderConfig(provider: ApiProvider): ApiProviderConfig {

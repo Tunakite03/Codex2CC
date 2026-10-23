@@ -359,8 +359,8 @@ test("streamed provider rate, auth and context errors retain actionable status c
   }
 });
 
-test("OpenCode reasoning_content is preserved for reasoning model tool continuations", async () => {
-  const selected: ChatStreamScope = { provider: "opencode", model: "kimi-k3" };
+for (const provider of ["opencode", "deepseek", "custom"] as const) test(`${provider} reasoning_content is preserved for reasoning model tool continuations`, async () => {
+  const selected: ChatStreamScope = { provider, model: "reasoning-model" };
   const source = delta({ reasoning_content: "Need to read the file." })
     + delta({ tool_calls: [{ index: 0, id: "r", function: { name: "Read", arguments: "{}" } }] }, "tool_calls") + "data: [DONE]\n\n";
   const accumulator = new MessageAccumulator(selected.model);
@@ -370,6 +370,81 @@ test("OpenCode reasoning_content is preserved for reasoning model tool continuat
   const assistant = toChatCompletionsRequest(next, selected.model, "none", undefined, selected).messages[0];
   assert.ok(assistant?.role === "assistant");
   assert.equal(assistant.reasoning_content, "Need to read the file.");
+  for (const other of ["opencode", "deepseek", "custom"] as const) {
+    if (other !== provider) assert.doesNotMatch(JSON.stringify(toChatCompletionsRequest(next, selected.model, "none", undefined, { ...selected, provider: other })), /reasoning_content/);
+  }
   assert.doesNotMatch(JSON.stringify(toChatCompletionsRequest(next, selected.model, "none", undefined, { ...selected, provider: "openai" })), /reasoning_content/);
   assert.doesNotMatch(JSON.stringify(toChatCompletionsRequest(next, "other", "none", undefined, { ...selected, model: "other" })), /reasoning_content/);
+});
+
+
+test("provider-specific request fields match token and streaming capabilities", () => {
+  for (const provider of ["groq", "xai"] as const) {
+    const converted = toChatCompletionsRequest(basic(), scope.model, "none", undefined, { ...scope, provider });
+    assert.equal(converted.max_completion_tokens, 1200);
+    assert.equal(converted.max_tokens, undefined);
+    assert.deepEqual(converted.stream_options, { include_usage: true });
+  }
+  const mistral = toChatCompletionsRequest(basic(), scope.model, "none", undefined, { ...scope, provider: "mistral" });
+  assert.equal(mistral.max_tokens, 1200);
+  assert.equal(mistral.stream_options, undefined);
+  const deepseek: ChatStreamScope = { ...scope, provider: "deepseek" };
+  for (const tool_choice of [{ type: "any" }, { type: "tool", name: "Read" }] as const) {
+    const request = MessageRequest.parse({ ...basic(), tools: [tool], tool_choice });
+    assert.deepEqual(toChatCompletionsRequest(request, scope.model, "none", undefined, deepseek).thinking, { type: "disabled" });
+  }
+  assert.equal(toChatCompletionsRequest(basic(), scope.model, "none", undefined, deepseek).thinking, undefined);
+  assert.deepEqual(toChatCompletionsRequest({ ...basic(), thinking: { type: "disabled" } }, scope.model, "none", undefined, deepseek).thinking, { type: "disabled" });
+});
+
+test("Mistral typed thinking and text chunks normalize alongside plain text and usage", async () => {
+  const selected: ChatStreamScope = { provider: "mistral", model: "mistral-large-latest" };
+  const source = delta({ content: [{ type: "thinking", thinking: [{ type: "text", text: "Consider " }] }] })
+    + delta({ content: [{ type: "thinking", thinking: [{ type: "text", text: "this." }] }, { type: "text", text: "The " }] })
+    + delta({ content: "answer." })
+    + frame({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5 } });
+  const accumulator = new MessageAccumulator(selected.model);
+  await readChatCompletionsSse(body(source), (event) => accumulator.accept(event), selected);
+  const message = BuiltMessage.parse(accumulator.buildMessage());
+  assert.ok(message.content.some((block) => block.type === "thinking" && block.thinking === "Consider this."));
+  assert.ok(message.content.some((block) => block.type === "text" && block.text === "The answer."));
+  assert.equal(message.usage.output_tokens, 5);
+  assert.equal(message.stop_reason, "end_turn");
+});
+
+
+for (const provider of ["gemini", "custom"] as const) test(`${provider} tool thought signatures survive replay without crossing provider or model boundaries`, async () => {
+  const selected: ChatStreamScope = { provider, model: "gemini-test" };
+  const source = delta({ tool_calls: [{ index: 0, id: "signed-call", function: { name: "Read", arguments: "" }, extra_content: { google: { thought_signature: "opaque-thought" } } }] })
+    + delta({ tool_calls: [{ index: 0, function: { arguments: "{}" } }] }, "tool_calls") + "data: [DONE]\n\n";
+  const accumulator = new MessageAccumulator(selected.model);
+  await readChatCompletionsSse(body(source), (event) => accumulator.accept(event), selected);
+  const message = BuiltMessage.parse(accumulator.buildMessage());
+  assert.ok(message.content.some((block) => block.type === "redacted_thinking" && block.data));
+  const next = MessageRequest.parse({ ...basic(), messages: [{ role: "assistant", content: message.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: "signed-call", content: "file" }] }] });
+  const assistant = toChatCompletionsRequest(next, selected.model, "none", undefined, selected).messages[0];
+  assert.ok(assistant?.role === "assistant");
+  assert.equal(assistant.tool_calls?.[0]?.extra_content?.google?.thought_signature, "opaque-thought");
+  assert.doesNotMatch(JSON.stringify(toChatCompletionsRequest(next, "different-model", "none", undefined, { ...selected, model: "different-model" })), /opaque-thought/);
+  for (const other of ["gemini", "custom", "openai"] as const) {
+    if (other !== provider) assert.doesNotMatch(JSON.stringify(toChatCompletionsRequest(next, selected.model, "none", undefined, { ...selected, provider: other })), /opaque-thought/);
+  }
+});
+
+test("Gemini rejects conflicting tool thought signatures", async () => {
+  const selected: ChatStreamScope = { provider: "gemini", model: "gemini-test" };
+  const source = delta({ tool_calls: [{ index: 0, id: "a", function: { name: "Read", arguments: "" }, extra_content: { google: { thought_signature: "first" } } }] })
+    + delta({ tool_calls: [{ index: 0, function: { arguments: "{}" }, extra_content: { google: { thought_signature: "different" } } }] }, "tool_calls");
+  await assert.rejects(events(source, selected), errorCode("invalid_upstream_event"));
+});
+
+
+test("truncated Gemini tools do not leave unreplayable thought signatures", async () => {
+  const selected: ChatStreamScope = { provider: "gemini", model: "gemini-test" };
+  const source = delta({ tool_calls: [{ index: 0, function: { name: "Read", arguments: "{" }, extra_content: { google: { thought_signature: "incomplete-call" } } }] }, "length") + "data: [DONE]\n\n";
+  const accumulator = new MessageAccumulator(selected.model);
+  await readChatCompletionsSse(body(source), (event) => accumulator.accept(event), selected);
+  const message = BuiltMessage.parse(accumulator.buildMessage());
+  assert.equal(message.stop_reason, "max_tokens");
+  assert.ok(!message.content.some((block) => block.type === "redacted_thinking"));
 });
