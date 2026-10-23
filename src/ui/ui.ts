@@ -30,6 +30,7 @@ import {
   DRY_RUN_TENSE,
   planAllAccountsSessionSync,
   resolveDesktopSessionPaths,
+  summarizePlans,
   syncAllAccountsWhenClosed,
   syncDesktopSessionsWhenClosed,
   TO_CLAUDE_PROFILE,
@@ -287,7 +288,7 @@ function previewAllAccountsSync(): Record<string, unknown> {
   const plans = planAllAccountsSessionSync(resolveDesktopSessionPaths());
   const { level } = desktopSyncReport({ status: "applied", sync: { plans, entries: [], manifestPath: undefined } });
   const changes = plans.reduce((sum, plan) => sum + plan.copies.length + plan.refreshes.length, 0);
-  return { ok: true, desktop: desktopProcessState(), changes, level, messages: describePlans(plans, DRY_RUN_TENSE) };
+  return { ok: true, desktop: desktopProcessState(), changes, level, headline: summarizePlans(plans, DRY_RUN_TENSE), messages: describePlans(plans, DRY_RUN_TENSE) };
 }
 
 /** The Sync all sessions button: a skipped sync also lists what it would have changed. */
@@ -295,8 +296,11 @@ function syncAllAccounts(): DesktopSyncReport {
   const paths = resolveDesktopSessionPaths();
   const outcome = syncAllAccountsWhenClosed(paths, desktopProcessState(), new Date());
   const report = desktopSyncReport(outcome, SYNC_BUTTON_RETRY_HINT);
-  const pending = outcome.status === "skipped" ? describePlans(planAllAccountsSessionSync(paths), DRY_RUN_TENSE) : [];
-  return logDesktopSync(outcome, { ...report, messages: [...report.messages, ...pending] });
+  if (outcome.status !== "skipped") return logDesktopSync(outcome, report);
+  const pending = planAllAccountsSessionSync(paths);
+  const waiting = pending.reduce((sum, plan) => sum + plan.copies.length + plan.refreshes.length, 0);
+  const headline = waiting === 0 ? report.headline : `${report.headline} ${waiting} session(s) waiting to copy.`;
+  return logDesktopSync(outcome, { ...report, headline, messages: [...report.messages, ...describePlans(pending, DRY_RUN_TENSE)] });
 }
 
 /** Records a sync in the activity log and returns its report for the control panel. */
@@ -305,7 +309,7 @@ function logDesktopSync(outcome: DesktopSyncOutcome, report: DesktopSyncReport):
   recordLog({
     level: report.level === "success" ? "info" : report.level === "warning" ? "warn" : "error",
     operation: "desktop_session_sync",
-    message: report.messages.join(" "),
+    message: [report.headline, ...report.messages].join(" "),
     details: { status: outcome.status, changes },
   });
   return report;
@@ -1653,6 +1657,11 @@ export function renderDashboardHtml(): string {
       flex: 1;
       max-width: 22rem;
     }
+    .setup-toolbar-actions {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
     .instruction-card {
       background: #fff8df;
       border: 1.5px solid var(--line);
@@ -2198,16 +2207,18 @@ export function renderDashboardHtml(): string {
       border: 1.5px solid var(--line);
     }
     .desktop-sync-report {
-      margin-bottom: 1rem;
+      margin-top: 1rem;
       padding: 0.75rem 1rem;
       border: 1.5px solid var(--line);
       border-radius: 0.65rem;
-      white-space: pre-wrap;
       overflow-wrap: anywhere;
       font-size: 0.8125rem;
       background: var(--teal-soft);
       color: #174d48;
     }
+    .desktop-sync-details { margin-top: 0.35rem; }
+    .desktop-sync-details summary { cursor: pointer; font-size: 0.75rem; opacity: 0.8; }
+    .desktop-sync-lines { margin-top: 0.35rem; white-space: pre-wrap; font-size: 0.75rem; opacity: 0.85; }
     .desktop-sync-report.warning { background: #fff0cb; color: #704b12; }
     .desktop-sync-report.error { background: #f8dfd8; color: #7d3430; }
     #toast.error {
@@ -2247,6 +2258,7 @@ export function renderDashboardHtml(): string {
       .usage-stat:nth-child(3) { border-left: none; }
       .setup-toolbar { flex-direction: column; align-items: stretch; }
       .setup-target-group select { max-width: none; }
+      .setup-toolbar-actions > .btn { flex: 1; }
       .logs-toolbar { flex-direction: column; align-items: stretch; }
       .logs-filter-group { min-width: 0; }
       .logs-controls { flex-wrap: wrap; }
@@ -2323,7 +2335,6 @@ export function renderDashboardHtml(): string {
         </button>
       </div>
     <div class="container">
-      <div id="desktop-sync-report" class="desktop-sync-report" role="status" aria-live="polite" hidden></div>
     <!-- Setup: provider, gateway endpoint, Claude clients and model map -->
     <div class="tab-pane active" id="tab-setup" role="tabpanel">
       <section class="card" aria-label="Setup and configuration">
@@ -2580,7 +2591,6 @@ export function renderDashboardHtml(): string {
               <div class="client-path">Claude-3p/configLibrary</div>
               <div class="client-actions">
                 <button class="btn btn-secondary btn-sm" id="btn-quick-desktop" type="button">Sync Desktop</button>
-                <button class="btn btn-secondary btn-sm" id="btn-sync-sessions" type="button" title="Copy missing Code-tab sessions between every Claude Desktop account, claude.ai and gateway">Sync all sessions</button>
               </div>
             </div>
           </div>
@@ -2594,10 +2604,13 @@ export function renderDashboardHtml(): string {
                 <option value="desktop">Claude Desktop only</option>
               </select>
             </div>
-            <button class="btn btn-primary" id="btn-apply" type="button">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-              Apply configuration
-            </button>
+            <div class="setup-toolbar-actions">
+              <button class="btn btn-secondary" id="btn-sync-sessions" type="button" title="Copy missing Code-tab sessions between every Claude Desktop account, claude.ai and gateway">Sync all sessions</button>
+              <button class="btn btn-primary" id="btn-apply" type="button">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+                Apply configuration
+              </button>
+            </div>
           </div>
 
           <p class="instruction-card"><strong>Next:</strong> Restart Claude Desktop and choose “Continue with Gateway” (not claude.ai). Reload your terminal or editor before running <code>claude</code>.</p>
@@ -2830,6 +2843,14 @@ export function renderDashboardHtml(): string {
         </div>
       </details>
     </div>
+      <div id="desktop-sync-report" class="desktop-sync-report" role="status" aria-live="polite" hidden>
+        <strong id="desktop-sync-title"></strong>
+        <span id="desktop-sync-headline"></span>
+        <details id="desktop-sync-details" class="desktop-sync-details">
+          <summary>Details</summary>
+          <div id="desktop-sync-lines" class="desktop-sync-lines"></div>
+        </details>
+      </div>
     </div>
     </main>
   </div>
@@ -2876,16 +2897,22 @@ export function renderDashboardHtml(): string {
         return; // A CLI-only action must not erase an unresolved Desktop warning.
       }
       const level = report.level === "error" ? "error" : report.level === "warning" ? "warning" : "success";
-      const summary = report.status === "failed" ? "History sync failed."
-        : report.status === "skipped" ? "History sync skipped."
-        : level === "warning" ? "History sync needs attention." : "History sync completed.";
+      const summary = report.status === "failed" ? "Session sync failed."
+        : report.status === "skipped" ? "Session sync skipped."
+        : level === "warning" ? "Session sync needs attention." : "Session sync completed.";
+      document.getElementById("desktop-sync-title").textContent = summary;
+      document.getElementById("desktop-sync-headline").textContent = report.headline;
+      // Per-account lines stay one click away so the notice reads as a single point.
+      document.getElementById("desktop-sync-lines").textContent = report.messages.join("\\n");
+      const details = document.getElementById("desktop-sync-details");
+      details.hidden = report.messages.length === 0;
+      details.open = false;
       const notice = document.getElementById("desktop-sync-report");
-      notice.textContent = [message, summary, ...report.messages].join("\\n");
       notice.className = "desktop-sync-report " + level;
       notice.setAttribute("role", level === "success" ? "status" : "alert");
       notice.setAttribute("aria-live", level === "success" ? "polite" : "assertive");
       notice.hidden = false;
-      showToast(message + " " + summary, level);
+      showToast(message ? message + " " + summary : summary, level);
     }
 
     /* Tab Controller */
@@ -3652,15 +3679,15 @@ export function renderDashboardHtml(): string {
         const preview = await (await fetch("/api/ui/desktop-sessions/plan")).json();
         if (!preview.ok) throw new Error(preview.error);
         if (preview.changes === 0) {
-          showConfigurationResult("Every account already lists every session.", { status: "applied", level: preview.level, messages: preview.messages });
+          showConfigurationResult("", { status: "applied", level: preview.level, headline: preview.headline, messages: preview.messages });
           return;
         }
         const closed = preview.desktop === "not_running";
-        if (closed && !confirm("Copy sessions between all Claude Desktop accounts?\\n\\n" + preview.messages.join("\\n"))) return;
+        if (closed && !confirm("Copy sessions between all Claude Desktop accounts?\\n\\n" + preview.headline)) return;
         const res = await fetch("/api/ui/desktop-sessions/sync", { method: "POST" });
         const data = await res.json();
         if (!data.ok) throw new Error(data.error);
-        showConfigurationResult("Session sync:", data.desktopSessionSync);
+        showConfigurationResult("", data.desktopSessionSync);
       } catch (err) {
         showToast("Session sync failed: " + err.message, "error");
       }

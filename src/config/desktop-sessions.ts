@@ -545,8 +545,35 @@ export function describePlans(plans: readonly DirectionPlan[], tense: PlanTense)
     if (plan.blocked === "no_source_sessions") return `${route}: no sessions to copy.`;
     if (plan.blocked === "no_destination_scope") return `${route}: skipped, open Claude Desktop once in that mode so it creates its session list, then quit it and rerun: codex2cc --sync-desktop-sessions`;
     const { alreadyPresent, deletedInDestination, missingTranscript, invalid } = plan.skipped;
-    return `${route}: ${tense.add} ${plan.copies.length} session(s), ${tense.refresh} ${plan.refreshes.length} earlier cop(ies); skipped ${alreadyPresent} already present, ${deletedInDestination} deleted there, ${missingTranscript} without transcript, ${invalid} unreadable.`;
+    const refreshed = plan.refreshes.length === 0 ? "" : `, ${tense.refresh} ${plan.refreshes.length} earlier cop(ies)`;
+    const skipped = [
+      [alreadyPresent, "already present"],
+      [deletedInDestination, "deleted there"],
+      [missingTranscript, "without transcript"],
+      [invalid, "unreadable"],
+    ] as const;
+    const skippedParts = skipped.filter(([count]) => count > 0).map(([count, reason]) => `${count} ${reason}`);
+    const skippedText = skippedParts.length === 0 ? "" : `; skipped ${skippedParts.join(", ")}`;
+    return `${route}: ${tense.add} ${plan.copies.length} session(s)${refreshed}${skippedText}.`;
   });
+}
+
+/** One sentence for the whole plan set: how much moved, and what a person must still fix. */
+export function summarizePlans(plans: readonly DirectionPlan[], tense: PlanTense): string {
+  const copies = plans.reduce((sum, plan) => sum + plan.copies.length, 0);
+  const refreshes = plans.reduce((sum, plan) => sum + plan.refreshes.length, 0);
+  const accounts = plans.filter((plan) => plan.copies.length + plan.refreshes.length > 0).length;
+  const verb = tense.add.charAt(0).toUpperCase() + tense.add.slice(1);
+  const moved = copies + refreshes === 0
+    ? "No sessions needed copying."
+    : `${verb} ${copies} session(s)${refreshes === 0 ? "" : ` and ${tense.refresh} ${refreshes}`} across ${accounts} account(s).`;
+  const noScope = plans.filter((plan) => plan.blocked === "no_destination_scope").length;
+  const unreadable = plans.reduce((sum, plan) => sum + plan.skipped.missingTranscript + plan.skipped.invalid, 0);
+  const issues = [
+    noScope === 0 ? "" : ` ${noScope} account(s) have no session list yet: open Claude Desktop once in that mode, quit it, and sync again.`,
+    unreadable === 0 ? "" : ` ${unreadable} session(s) cannot be copied (missing or unreadable transcript).`,
+  ];
+  return moved + issues.join("");
 }
 
 /** How a person retries a skipped sync; the control panel's button supplies its own. */
@@ -569,10 +596,23 @@ export function describeOutcome(outcome: DesktopSyncOutcome, retryHint: string =
   return [`Desktop session sync skipped: ${reason}. Quit Claude Desktop, then ${retryHint}`];
 }
 
+/** The main point of an outcome in one sentence; `describeOutcome` keeps the per-direction detail. */
+export function summarizeOutcome(outcome: DesktopSyncOutcome, retryHint: string = CLI_RETRY_HINT): string {
+  if (outcome.status === "applied") return summarizePlans(outcome.sync.plans, APPLIED_TENSE);
+  if (outcome.status === "failed") {
+    return outcome.entries.length === 0 ? outcome.error : `${outcome.error} Some sessions were already copied; see details.`;
+  }
+  const reason = outcome.desktop === "running" ? "Claude Desktop is running" : "Could not confirm that Claude Desktop is closed";
+  return `${reason}. Quit it, then ${retryHint}`;
+}
+
 export type DesktopSyncReport = {
   readonly status: DesktopSyncOutcome["status"];
   /** How prominently a client should surface it: a skipped or failed sync leaves history hidden. */
   readonly level: "success" | "warning" | "error";
+  /** What happened and what to do next, in one sentence. */
+  readonly headline: string;
+  /** Supporting lines a client may show on demand; they never repeat the headline. */
   readonly messages: readonly string[];
 };
 
@@ -581,7 +621,10 @@ export function desktopSyncReport(outcome: DesktopSyncOutcome, retryHint?: strin
   const incomplete = outcome.status === "applied" && outcome.sync.plans.some((plan) =>
     plan.blocked === "no_destination_scope" || plan.skipped.missingTranscript > 0 || plan.skipped.invalid > 0);
   const level = outcome.status === "failed" ? "error" : outcome.status === "skipped" || incomplete ? "warning" : "success";
-  return { status: outcome.status, level, messages: describeOutcome(outcome, retryHint) };
+  // A failed or skipped outcome leads with the line the headline already carries.
+  const lines = describeOutcome(outcome, retryHint);
+  const messages = outcome.status === "applied" ? lines : lines.slice(1);
+  return { status: outcome.status, level, headline: summarizeOutcome(outcome, retryHint), messages };
 }
 
 /** For the explicit command: refuses instead of skipping, since syncing was the whole request. */
