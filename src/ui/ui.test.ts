@@ -87,7 +87,7 @@ const mockOptions: GatewayOptions = {
 
 test('dashboard inline JavaScript parses before it fetches status', () => {
      const html = renderDashboardHtml();
-     const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+     const script = html.match(/<script>([\s\S]*?)<\/script>/i)?.[1];
      assert.ok(script);
      const result = spawnSync(process.execPath, ['--check'], { input: script, encoding: 'utf8' });
      assert.equal(result.status, 0, result.stderr);
@@ -152,7 +152,7 @@ test('setup section holds the provider switch, gateway endpoint, Claude clients 
 
 test('provider buttons only stage a choice; the switch runs when Submit is pressed', () => {
      const html = renderDashboardHtml();
-     const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+     const script = html.match(/<script>([\s\S]*?)<\/script>/i)?.[1];
      assert.ok(script);
      assert.ok(script.includes('addEventListener("click", () => selectProvider("codex"))'));
      assert.ok(script.includes('addEventListener("click", () => selectProvider("antigravity"))'));
