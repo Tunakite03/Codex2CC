@@ -6,7 +6,8 @@ on:
   pull_request:
 
 jobs:
-  test:
+  test-os:
+    name: test (${{ matrix.os }}, ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -22,3 +23,21 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+
+  # Branch protection requires the check names `test (22)` and `test (24)`.
+  # Adding `os` to the matrix above renamed those jobs, so these gates report
+  # the required names and pass only when every OS/Node combination passed.
+  test:
+    if: always()
+    needs: test-os
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - name: Require every OS/Node job to succeed
+        env:
+          TEST_OS_RESULT: ${{ needs.test-os.result }}
+        run: |
+          echo "test-os matrix result: $TEST_OS_RESULT"
+          test "$TEST_OS_RESULT" = "success"
