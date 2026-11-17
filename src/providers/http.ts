@@ -1,8 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { BridgeError } from "../bridge/bridge.js";
 import { recordLog } from "../telemetry/logger.js";
 import type { ApiProtocol, ApiProvider } from "./config.js";
+
+export const CODEX2CC_USER_AGENT = "Codex2CC/0.1.0";
 
 const MAX_ATTEMPTS = 3;
 const REQUEST_TIMEOUT_MS = 600_000;
@@ -20,6 +23,11 @@ export type ApiInference = {
   readonly apiKey: string;
   readonly body: object;
   readonly signal: AbortSignal;
+  /**
+   * Stable per-conversation session ID for OpenCode Go routing
+   * (header `x-opencode-session`). Falls back to a fresh UUID when absent.
+   */
+  readonly sessionId?: string | undefined;
 };
 
 function retryAfter(header: string | null): number | undefined {
@@ -73,7 +81,8 @@ async function httpError(response: Response, request: ApiInference): Promise<Bri
 /** Retries only before a stream is handed to the caller. Redirects cannot forward provider credentials. */
 export async function openApiInference(request: ApiInference): Promise<Response> {
   const signal = AbortSignal.any([request.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
-  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "text/event-stream" };
+  const sessionId = (request.sessionId?.trim() && /^[\x21-\x7e]+$/.test(request.sessionId.trim())) ? request.sessionId.trim() : randomUUID();
+  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "text/event-stream", "User-Agent": CODEX2CC_USER_AGENT, "x-opencode-session": sessionId };
   if (request.protocol === "anthropic-messages") {
     headers["x-api-key"] = request.apiKey;
     headers["anthropic-version"] = "2023-06-01";

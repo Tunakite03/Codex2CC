@@ -184,6 +184,21 @@ export function promptCacheKey(headers: IncomingHttpHeaders): string | undefined
   return createHash("sha256").update(scope, "utf8").digest("base64url");
 }
 
+/**
+ * Stable `x-opencode-session` ID for OpenCode Go routing, derived from the Claude Code session
+ * headers so each conversation (and each subagent) gets its own routing bucket. OpenCode Go
+ * rejects requests without this header.
+ */
+export function opencodeSessionKey(headers: IncomingHttpHeaders): string | undefined {
+  const session = headers["x-claude-code-session-id"];
+  if (typeof session !== "string" || session.trim().length === 0) return undefined;
+  const trimmed = session.trim();
+  if (!/^[\x21-\x7e]+$/.test(trimmed)) return undefined;
+  const agent = headers["x-claude-code-agent-id"];
+  if (typeof agent === "string" && /^[a-zA-Z0-9._:-]+$/.test(agent.trim())) return `${trimmed}:${agent.trim()}`;
+  return trimmed;
+}
+
 function sendGuardFailure(response: ServerResponse, failure: Extract<GuardResult, { ok: false }>): void {
   response.writeHead(failure.status, { "Content-Type": "application/json" }).end(
     JSON.stringify({ type: "error", error: { type: failure.type, message: failure.message } }),
@@ -305,7 +320,7 @@ async function handleMessage(
   }
   const provider = options.activeProvider();
   if (isApiProvider(provider)) {
-    await routeToApi(options, provider, inbound, response, clientGone, startTime);
+    await routeToApi(options, provider, inbound, request.headers, response, clientGone, startTime);
     return;
   }
   if (provider === "antigravity") {
@@ -485,6 +500,7 @@ async function routeToApi(
   options: ResolvedGatewayOptions,
   provider: ApiProvider,
   inbound: MessageRequest,
+  headers: IncomingHttpHeaders,
   response: ServerResponse,
   clientGone: AbortSignal,
   startTime: number,
@@ -509,7 +525,7 @@ async function routeToApi(
     for (let attempt = 1; ; attempt++) {
       clientGone.throwIfAborted();
       // HTTP failures retain their own retry policy; only stream overloads reach this catch.
-      const upstream = await openApiInference({ provider, protocol: model.protocol, url: endpoint, apiKey, body: outgoing, signal: clientGone });
+      const upstream = await openApiInference({ provider, protocol: model.protocol, url: endpoint, apiKey, body: outgoing, signal: clientGone, sessionId: opencodeSessionKey(headers) });
       const read = (accept: (event: OpenAIEvent) => void): Promise<void> => readApiStream(upstream.body!, accept, provider, model);
       try {
         if (inbound.stream) {

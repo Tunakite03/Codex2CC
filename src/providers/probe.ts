@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { BridgeError, MessageAccumulator, MessageRequest, type EffortLevel, type OpenAIEvent } from "../bridge/bridge.js";
 import { toAnthropicRequest, readAnthropicSse } from "../bridge/anthropic.js";
 import { toChatCompletionsRequest, readChatCompletionsSse } from "../bridge/chat-completions.js";
@@ -71,6 +72,7 @@ export async function probeApiProvider(
       apiKey,
       body: toApiRequestBody(inbound, provider, model, undefined),
       signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]),
+      sessionId: `codex2cc-probe-${randomUUID()}`,
     });
     const accumulator = new MessageAccumulator(model.slug);
     let reply = "";
