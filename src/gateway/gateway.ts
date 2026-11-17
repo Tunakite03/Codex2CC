@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { getAppConfig } from "../config/app-config.js";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
@@ -639,7 +640,7 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
       return;
     }
     if (path === "/" || path === "/ui" || path.startsWith("/api/ui/")) {
-      const port = (request.socket.localPort) || 3456;
+      const port = request.socket.localPort ?? getAppConfig(process.env).port;
       const originCheck = checkUiOrigin(request.headers, port);
       if (!originCheck.ok) {
         recordLog({
