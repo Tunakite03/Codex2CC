@@ -131,6 +131,18 @@ const DEFAULT_CONFIGS: Readonly<Record<ApiProvider, ApiProviderConfig>> = {
     defaultModel: "mistral-large-latest",
     models: [{ slug: "mistral-large-latest", displayName: "Mistral Large", protocol: "chat-completions", reasoning: "none" }],
   },
+  togetherai: {
+    apiKeyEnv: "TOGETHER_API_KEY",
+    endpoints: { "chat-completions": "https://api.together.xyz/v1/chat/completions" },
+    defaultModel: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    models: [{ slug: "meta-llama/Llama-3.3-70B-Instruct-Turbo", displayName: "Llama 3.3 70B Instruct Turbo", protocol: "chat-completions", reasoning: "none", contextWindow: 128_000 }],
+  },
+  zai: {
+    apiKeyEnv: "ZAI_API_KEY",
+    endpoints: { "chat-completions": "https://api.z.ai/api/paas/v4/chat/completions" },
+    defaultModel: "glm-5.3",
+    models: [{ slug: "glm-5.3", displayName: "GLM 5.3", protocol: "chat-completions", reasoning: "none", contextWindow: 1_000_000 }],
+  },
   custom: {
     apiKeyEnv: "CUSTOM_API_KEY",
     endpoints: { "chat-completions": "http://127.0.0.1:8000/v1/chat/completions" },

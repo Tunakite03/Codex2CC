@@ -158,6 +158,8 @@ async function fetchPage(url: URL, headers: Readonly<Record<string, string>>, pr
       if (!(error instanceof SyntaxError)) throw error;
       throw new BridgeError(502, "invalid_model_list", `${provider} model listing was not valid JSON.`);
     }
+    // Some providers (e.g. Together AI) return a bare array of models instead of { data: [...] }.
+    if (Array.isArray(payload)) payload = { data: payload };
     const parsed = ModelListPage.safeParse(payload);
     if (!parsed.success) throw new BridgeError(502, "invalid_model_list", `${provider} model listing did not match the expected shape.`);
     return parsed.data;
