@@ -10,13 +10,36 @@ import { API_PROVIDERS, defaultApiProviderConfig } from "./providers/config.js";
 
 function startupEnvironment(home: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home, CODEX2CC_HOME: home, CODEX2CC_SETTINGS_FILE: join(home, "settings.json"), CODEX2CC_LOG_FILE: join(home, "gateway.log"), CODEX2CC_USAGE_FILE: join(home, "usage.json") };
-  for (const name of ["CODEX2CC_PROVIDER", ...API_PROVIDERS.map((provider) => defaultApiProviderConfig(provider).apiKeyEnv)]) delete env[name];
+  for (const name of ["PORT", "CODEX2CC_PROVIDER", ...API_PROVIDERS.map((provider) => defaultApiProviderConfig(provider).apiKeyEnv)]) delete env[name];
   return env;
 }
 
 function launch(args: string[], env: NodeJS.ProcessEnv): ReturnType<typeof spawnSync> {
   return spawnSync(process.execPath, [fileURLToPath(new URL("./main.js", import.meta.url)), ...args], { env, encoding: "utf8", timeout: 15000 });
 }
+
+test("setup resolves its port from dotenv, shell, explicit CLI, then the shared default", () => {
+  const home = mkdtempSync(join(tmpdir(), "codex2cc-port-"));
+  try {
+    const env = startupEnvironment(home);
+    const args = ["--setup-cli", "--token", "fixture-gateway-token-1234567890"];
+    const configuredUrl = (extra: string[], launchEnv: NodeJS.ProcessEnv): string => {
+      const result = launch([...args, ...extra], launchEnv);
+      assert.equal(result.status, 0, String(result.stderr));
+      const settings = JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8")) as { env: { ANTHROPIC_BASE_URL: string } };
+      return settings.env.ANTHROPIC_BASE_URL;
+    };
+    assert.equal(configuredUrl([], env), "http://127.0.0.1:3456");
+    writeFileSync(join(home, ".env"), "PORT = 4567\n");
+    assert.equal(configuredUrl([], env), "http://127.0.0.1:4567");
+    assert.equal(configuredUrl([], { ...env, PORT: "4568" }), "http://127.0.0.1:4568");
+    assert.equal(configuredUrl(["--port", "4569"], env), "http://127.0.0.1:4569");
+    assert.equal(configuredUrl(["--gateway-url", "http://localhost:4570"], env), "http://localhost:4570");
+    const invalid = launch(args, { ...env, PORT: "70000" });
+    assert.notEqual(invalid.status, 0);
+    assert.match(String(invalid.stderr), /PORT.*integer.*65535/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
 
 test("startup lists configured API catalogs without keys or a Codex login", () => {
   const home = mkdtempSync(join(tmpdir(), "codex2cc-startup-"));
@@ -70,7 +93,7 @@ test("startup reads provider keys from the data directory .env without overridin
   try {
     writeFileSync(join(home, ".env"), "OPENROUTER_API_KEY =fixture-dotenv-key-0123456789\n");
     // An empty PATH makes the Claude launch fail after the key check instead of starting Claude.
-    const env = { ...startupEnvironment(home), PATH: home };
+    const env = { ...startupEnvironment(home), PATH: home, PORT: "0" };
     const fromFile = launch(["--provider", "openrouter"], env);
     assert.equal(fromFile.status, 1);
     assert.doesNotMatch(String(fromFile.stderr), /missing_provider_key/);
@@ -105,7 +128,8 @@ test("API standalone startup permits a missing key and keeps the saved provider 
   const env = startupEnvironment(home);
   const store = TierModelStore.open(env.CODEX2CC_SETTINGS_FILE!, {});
   store.setProvider("opencode");
-  const child = spawn(process.execPath, [fileURLToPath(new URL("./main.js", import.meta.url)), "--serve", "--port", "0", "--no-auth"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  writeFileSync(join(home, ".env"), "PORT = 0\n");
+  const child = spawn(process.execPath, [fileURLToPath(new URL("./main.js", import.meta.url)), "--serve", "--no-auth"], { env, stdio: ["ignore", "pipe", "pipe"] });
   const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
   let output = "";
   let errors = "";
@@ -123,6 +147,11 @@ test("API standalone startup permits a missing key and keeps the saved provider 
     });
     const response = await fetch(`${url}/api/ui/status`);
     assert.equal(response.status, 200);
+    const dashboard = await fetch(`${url}/ui`);
+    assert.equal(dashboard.status, 200);
+    const html = await dashboard.text();
+    assert.ok(html.includes(`placeholder="${url}"`));
+    assert.ok(html.includes(`--serve --port ${new URL(url).port}</span>`));
     const status = await response.json() as { provider: { active: string; keyConfigured: boolean }; tierMapping: { models: { slug: string }[] } };
     assert.equal(status.provider.active, "opencode");
     assert.equal(status.provider.keyConfigured, false);

@@ -4,7 +4,8 @@ import { BridgeError } from "../bridge/bridge.js";
 import { MIN_TOKEN_LENGTH, type GuardPolicy } from "../gateway/guard.js";
 import { PROVIDERS, isProviderType, type ProviderType } from "../models/models.js";
 
-export const DEFAULT_PORT = 3456;
+import { DEFAULT_PORT, getAppConfig, parsePort as parseConfiguredPort } from "../config/app-config.js";
+export { DEFAULT_PORT } from "../config/app-config.js";
 
 export type CliCommand =
   | { readonly kind: "help" }
@@ -48,9 +49,9 @@ Modes (default: launch Claude Code):
 Options:
   --model <slug>            Model to use from the selected provider catalog
   --effort <level>          Reasoning effort level: low, medium, high, xhigh, max
-  --port <n>                Standalone gateway port, 0-65535 (default: ${DEFAULT_PORT})
+  --port <n>                Gateway port, 0-65535 (default: PORT from environment/.env, or ${DEFAULT_PORT})
   --no-auth                 Standalone gateway without a token (not recommended)
-  --gateway-url, --url <u>  Base URL for setup (default: http://127.0.0.1:${DEFAULT_PORT})
+  --gateway-url, --url <u>  Base URL for setup (default: http://127.0.0.1:<resolved port>)
   --token <secret>          Gateway token for client setup (or CODEX2CC_TOKEN)
   --provider <name>         Backend: ${PROVIDERS.join(", ")}
   --dry-run                 With --sync-desktop-sessions: show what would be copied, change nothing
@@ -115,11 +116,9 @@ function parseGatewayOptions(options: readonly string[]) {
 }
 
 function parsePort(raw: string | undefined): number {
-  if (raw === undefined || raw === "") return DEFAULT_PORT;
-  if (!/^\d+$/.test(raw) || Number(raw) > 65_535) {
-    throw new BridgeError(400, "invalid_port", `--port must be an integer between 0 and 65535, got "${raw}".`);
-  }
-  return Number(raw);
+  return raw === undefined || raw === ""
+    ? getAppConfig(process.env).port
+    : parseConfiguredPort(raw, "--port");
 }
 
 /**
@@ -160,7 +159,7 @@ export function parseCli(argv: readonly string[]): CliCommand {
 
   if (values.setup || values["setup-cli"] || values["setup-desktop"]) {
     const target = values.setup ? "all" : values["setup-desktop"] ? "desktop" : "cli";
-    const port = values.port ? parsePort(values.port) : DEFAULT_PORT;
+    const port = parsePort(values.port);
     const gatewayUrl = values["gateway-url"] || values.url || `http://127.0.0.1:${port}`;
     const token = values.token?.trim() || undefined;
     const effort = values.effort?.trim() || undefined;

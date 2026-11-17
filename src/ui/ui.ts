@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { getAppConfig } from "../config/app-config.js";
 import { existsSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
@@ -357,7 +358,7 @@ export async function handleUiRoute(
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-cache",
     });
-    response.end(renderDashboardHtml());
+    response.end(renderDashboardHtml(port));
     return true;
   }
 
@@ -791,7 +792,7 @@ export async function handleUiRoute(
   return false;
 }
 
-export function renderDashboardHtml(): string {
+export function renderDashboardHtml(port: number = getAppConfig(process.env).port): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1560,6 +1561,20 @@ export function renderDashboardHtml(): string {
       transform: none;
       box-shadow: 1px 1px 0 var(--paper-deep);
     }
+    #section-usage {
+      --usage-padding-x: 1.25rem;
+      --usage-padding-y: 1.1rem;
+    }
+    #section-usage > .card-header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      flex-wrap: wrap;
+      margin: calc(-1 * var(--usage-padding-y)) calc(-1 * var(--usage-padding-x)) 0;
+      padding: var(--usage-padding-y) var(--usage-padding-x) 0.65rem;
+      background: var(--card);
+      border-radius: calc(1rem - 1.5px) calc(0.85rem - 1.5px) 0 0;
+    }
     .usage-refresh-icon { flex: none; }
     #btn-refresh-usage { min-width: 8.5rem; }
     #btn-refresh-usage[aria-busy="true"] .usage-refresh-icon,
@@ -1970,10 +1985,15 @@ export function renderDashboardHtml(): string {
 
     /* Usage Table */
     .usage-table-wrapper {
-      overflow-x: auto;
+      max-height: min(32rem, 65vh);
+      overflow: auto;
       border: 1.5px solid var(--line);
       border-radius: 0.7rem 0.6rem 0.75rem 0.6rem;
       background: var(--surface);
+    }
+    .usage-table-wrapper:focus-visible {
+      outline: 3px solid var(--ring);
+      outline-offset: 3px;
     }
     .usage-table {
       width: 100%;
@@ -1982,6 +2002,9 @@ export function renderDashboardHtml(): string {
       text-align: left;
     }
     .usage-table th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
       background: var(--surface-soft);
       color: var(--muted-foreground);
       font-size: 0.6875rem;
@@ -2000,6 +2023,9 @@ export function renderDashboardHtml(): string {
       background: #fff8df;
     }
     .usage-table tfoot td {
+      position: sticky;
+      bottom: 0;
+      z-index: 1;
       background: var(--accent);
       color: var(--accent-foreground);
       font-weight: 700;
@@ -2321,6 +2347,7 @@ export function renderDashboardHtml(): string {
       .brand-text h1 { font-size: 1.05rem; }
       .status-badge { font-size: 0.7rem; }
       .card { padding: 0.9rem; }
+      #section-usage { --usage-padding-x: 0.9rem; --usage-padding-y: 0.9rem; }
       .tier-grid { grid-template-columns: 1fr; }
       .usage-metrics { grid-template-columns: 1fr; }
       .usage-stat + .usage-stat { border-left: none; border-top: 1px solid var(--border); }
@@ -2518,7 +2545,7 @@ export function renderDashboardHtml(): string {
               <span class="badge-sub badge-active" id="val-auth-mode">Token Protected</span>
             </div>
             <div class="input-group">
-              <input type="text" id="input-url" placeholder="http://127.0.0.1:3456" readonly />
+              <input type="text" id="input-url" placeholder="http://127.0.0.1:${port}" readonly />
               <span id="val-gateway-url" style="display:none">--</span>
               <button class="btn btn-secondary btn-sm" id="btn-copy-url" type="button" title="Copy Gateway URL">Copy</button>
             </div>
@@ -2780,7 +2807,7 @@ export function renderDashboardHtml(): string {
           </div>
         </div>
 
-        <div class="usage-table-wrapper">
+        <div class="usage-table-wrapper" role="region" aria-label="Model token usage" tabindex="0">
           <table class="usage-table" id="usage-table">
             <thead>
               <tr>
@@ -2888,7 +2915,7 @@ export function renderDashboardHtml(): string {
               </h2>
             </div>
             <div class="code-snippet">
-              <span id="text-run-cmd">CODEX2CC_TOKEN="..." node dist/main.js --serve --port 3456</span>
+              <span id="text-run-cmd">CODEX2CC_TOKEN="..." node dist/main.js --serve --port ${port}</span>
               <button class="btn btn-secondary btn-sm" id="btn-copy-cmd" type="button">Copy</button>
             </div>
           </section>
@@ -3708,9 +3735,8 @@ export function renderDashboardHtml(): string {
     }
 
     function updateRunCommand() {
-      const url = document.getElementById("input-url").value || "http://127.0.0.1:3456";
-      let port = "3456";
-      try { port = new URL(url).port || "3456"; } catch {}
+      const url = new URL(document.getElementById("input-url").value || "http://127.0.0.1:${port}");
+      const port = url.port || (url.protocol === "https:" ? "443" : "80");
       const token = document.getElementById("input-token").value || "YOUR_SECRET_TOKEN";
       document.getElementById("text-run-cmd").textContent = 'CODEX2CC_TOKEN="' + token + '" node dist/main.js --serve --port ' + port + ' --provider ' + currentActiveProvider;
     }

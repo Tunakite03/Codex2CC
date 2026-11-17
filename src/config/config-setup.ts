@@ -1,18 +1,30 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { BridgeError } from "../bridge/bridge.js";
 import { MIN_TOKEN_LENGTH } from "../gateway/guard.js";
-import { CLAUDE_GATEWAY_MODELS, DEFAULT_TIER_MODELS, type TierModels } from "../models/models.js";
+import {
+  CLAUDE_GATEWAY_MODELS,
+  DEFAULT_TIER_MODELS,
+  type TierModels,
+} from "../models/models.js";
 
-export const CODEX2CC_DESKTOP_CONFIG_ID = "c0d3e2cc-0000-4000-8000-000000000001";
+export const CODEX2CC_DESKTOP_CONFIG_ID =
+  "c0d3e2cc-0000-4000-8000-000000000001";
 export const DEFAULT_CONFIG_NAME = "Codex2CC Gateway";
-export const DEFAULT_GATEWAY_URL = "http://127.0.0.1:3456";
+export { DEFAULT_GATEWAY_URL } from "./app-config.js";
 const HAIKU_MODEL_CAPABILITIES = "effort,xhigh_effort,max_effort";
 const LEGACY_MODEL_CAPABILITIES = "effort,max_effort,xhigh_effort";
-const LEGACY_HAIKU_PROFILE_DESCRIPTION = "Codex2CC Haiku route with Sonnet 4.6 client behavior";
+const LEGACY_HAIKU_PROFILE_DESCRIPTION =
+  "Codex2CC Haiku route with Sonnet 4.6 client behavior";
 
 export type SetupTarget = "cli" | "desktop" | "all";
 
@@ -62,7 +74,9 @@ export type ResetResult = {
   readonly filesModified: readonly string[];
 };
 
-export function resolveDefaultPaths(platformName: string = platform()): ResolvedSetupPaths {
+export function resolveDefaultPaths(
+  platformName: string = platform(),
+): ResolvedSetupPaths {
   const home = homedir();
   const claudeSettingsPath = join(home, ".claude", "settings.json");
   const claudeJsonPath = join(home, ".claude.json");
@@ -82,7 +96,8 @@ export function resolveDefaultPaths(platformName: string = platform()): Resolved
   }
 
   if (platformName === "win32") {
-    const localAppData = process.env.LOCALAPPDATA || join(home, "AppData", "Local");
+    const localAppData =
+      process.env.LOCALAPPDATA || join(home, "AppData", "Local");
     const appData = process.env.APPDATA || join(home, "AppData", "Roaming");
     return {
       claudeSettingsPath,
@@ -111,14 +126,23 @@ export function resolveDefaultPaths(platformName: string = platform()): Resolved
   };
 }
 
-export function resolvePaths(custom?: SetupPaths | undefined): ResolvedSetupPaths {
+export function resolvePaths(
+  custom?: SetupPaths | undefined,
+): ResolvedSetupPaths {
   const defaults = resolveDefaultPaths();
   return {
-    claudeSettingsPath: custom?.claudeSettingsPath ?? defaults.claudeSettingsPath,
+    claudeSettingsPath:
+      custom?.claudeSettingsPath ?? defaults.claudeSettingsPath,
     claudeJsonPath: custom?.claudeJsonPath ?? defaults.claudeJsonPath,
     claudeDesktopDir: custom?.claudeDesktopDir ?? defaults.claudeDesktopDir,
-    claudeDesktopLegacyDirs: custom?.claudeDesktopLegacyDirs ?? (custom?.claudeDesktopDir === undefined ? defaults.claudeDesktopLegacyDirs : []),
-    claudeDeveloperSettingsPaths: custom?.claudeDeveloperSettingsPaths ?? defaults.claudeDeveloperSettingsPaths,
+    claudeDesktopLegacyDirs:
+      custom?.claudeDesktopLegacyDirs ??
+      (custom?.claudeDesktopDir === undefined
+        ? defaults.claudeDesktopLegacyDirs
+        : []),
+    claudeDeveloperSettingsPaths:
+      custom?.claudeDeveloperSettingsPaths ??
+      defaults.claudeDeveloperSettingsPaths,
   };
 }
 
@@ -126,19 +150,34 @@ export function resolvePaths(custom?: SetupPaths | undefined): ResolvedSetupPath
 export function desktopLibraryDirs(pathsInput?: SetupPaths): readonly string[] {
   const paths = resolvePaths(pathsInput);
   const dirs = [paths.claudeDesktopDir, ...paths.claudeDesktopLegacyDirs];
-  return dirs.filter((dir, index) => dirs.findIndex((other) => platform() === "win32" ? other.toLowerCase() === dir.toLowerCase() : other === dir) === index);
+  return dirs.filter(
+    (dir, index) =>
+      dirs.findIndex((other) =>
+        platform() === "win32"
+          ? other.toLowerCase() === dir.toLowerCase()
+          : other === dir,
+      ) === index,
+  );
 }
 
 export function validateGatewayUrl(url: string): string {
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      throw new BridgeError(400, "invalid_gateway_url", `Gateway URL must use http: or https: protocol, got "${url}".`);
+      throw new BridgeError(
+        400,
+        "invalid_gateway_url",
+        `Gateway URL must use http: or https: protocol, got "${url}".`,
+      );
     }
     return parsed.origin + parsed.pathname.replace(/\/+$/, "");
   } catch (error) {
     if (error instanceof BridgeError) throw error;
-    throw new BridgeError(400, "invalid_gateway_url", `Invalid gateway URL "${url}".`);
+    throw new BridgeError(
+      400,
+      "invalid_gateway_url",
+      `Invalid gateway URL "${url}".`,
+    );
   }
 }
 
@@ -148,54 +187,97 @@ export function validateToken(token: string | undefined): string {
     return randomBytes(32).toString("base64url");
   }
   if (trimmed.length < MIN_TOKEN_LENGTH) {
-    throw new BridgeError(400, "weak_gateway_token", `Gateway token must be at least ${MIN_TOKEN_LENGTH} characters.`);
+    throw new BridgeError(
+      400,
+      "weak_gateway_token",
+      `Gateway token must be at least ${MIN_TOKEN_LENGTH} characters.`,
+    );
   }
   return trimmed;
 }
 
-function readSavedGatewayConfig<T>(filePath: string, schema: z.ZodType<T>): T | undefined {
+function readSavedGatewayConfig<T>(
+  filePath: string,
+  schema: z.ZodType<T>,
+): T | undefined {
   if (!existsSync(filePath)) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(filePath, "utf8"));
   } catch (error) {
-    const reason = error instanceof SyntaxError ? "invalid JSON" : "file could not be read";
-    throw new BridgeError(500, "invalid_saved_gateway_config", `Could not load saved gateway configuration at ${filePath}: ${reason}.`);
+    const reason =
+      error instanceof SyntaxError ? "invalid JSON" : "file could not be read";
+    throw new BridgeError(
+      500,
+      "invalid_saved_gateway_config",
+      `Could not load saved gateway configuration at ${filePath}: ${reason}.`,
+    );
   }
   const result = schema.safeParse(parsed);
   if (!result.success) {
-    throw new BridgeError(500, "invalid_saved_gateway_config", `Saved gateway configuration at ${filePath} is missing required fields.`);
+    throw new BridgeError(
+      500,
+      "invalid_saved_gateway_config",
+      `Saved gateway configuration at ${filePath} is missing required fields.`,
+    );
   }
   return result.data;
 }
 
 /** Reuses a local UI gateway credential across restarts when no explicit token is supplied. */
-export function configuredGatewayToken(gatewayUrl: string, pathsInput?: SetupPaths): string | undefined {
+export function configuredGatewayToken(
+  gatewayUrl: string,
+  pathsInput?: SetupPaths,
+): string | undefined {
   const paths = resolvePaths(pathsInput);
   for (const libraryDir of desktopLibraryDirs(paths)) {
-    const meta = readSavedGatewayConfig(join(libraryDir, "_meta.json"), z.object({ appliedId: z.string() }));
+    const meta = readSavedGatewayConfig(
+      join(libraryDir, "_meta.json"),
+      z.object({ appliedId: z.string() }),
+    );
     if (meta?.appliedId !== CODEX2CC_DESKTOP_CONFIG_ID) continue;
     const desktop = readSavedGatewayConfig(
       join(libraryDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`),
-      z.object({ inferenceGatewayBaseUrl: z.string(), inferenceGatewayApiKey: z.string() }),
+      z.object({
+        inferenceGatewayBaseUrl: z.string(),
+        inferenceGatewayApiKey: z.string(),
+      }),
     );
     if (desktop === undefined) {
-      throw new BridgeError(500, "missing_saved_gateway_config", "Applied Claude Desktop gateway configuration file is missing.");
+      throw new BridgeError(
+        500,
+        "missing_saved_gateway_config",
+        "Applied Claude Desktop gateway configuration file is missing.",
+      );
     }
     const token = desktop.inferenceGatewayApiKey;
-    if (desktop.inferenceGatewayBaseUrl === gatewayUrl && token.length >= MIN_TOKEN_LENGTH) {
+    if (
+      desktop.inferenceGatewayBaseUrl === gatewayUrl &&
+      token.length >= MIN_TOKEN_LENGTH
+    ) {
       return token;
     }
   }
 
   const cli = readSavedGatewayConfig(
     paths.claudeSettingsPath,
-    z.object({ env: z.object({ ANTHROPIC_BASE_URL: z.string().optional(), ANTHROPIC_AUTH_TOKEN: z.string().optional() }).optional() }),
+    z.object({
+      env: z
+        .object({
+          ANTHROPIC_BASE_URL: z.string().optional(),
+          ANTHROPIC_AUTH_TOKEN: z.string().optional(),
+        })
+        .optional(),
+    }),
   );
   const env = cli?.env;
   if (env !== undefined) {
     const token = env.ANTHROPIC_AUTH_TOKEN;
-    if (env.ANTHROPIC_BASE_URL === gatewayUrl && typeof token === "string" && token.length >= MIN_TOKEN_LENGTH) {
+    if (
+      env.ANTHROPIC_BASE_URL === gatewayUrl &&
+      typeof token === "string" &&
+      token.length >= MIN_TOKEN_LENGTH
+    ) {
       return token;
     }
   }
@@ -207,7 +289,11 @@ function safeReadJson(filePath: string): Record<string, unknown> | null {
   try {
     const content = readFileSync(filePath, "utf8");
     const parsed = JSON.parse(content);
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    return typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
   } catch {
     return {};
   }
@@ -223,18 +309,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isLegacyHaikuProfileRow(value: unknown): boolean {
-  return isRecord(value)
-    && typeof value.description === "string"
-    && value.description.startsWith(LEGACY_HAIKU_PROFILE_DESCRIPTION);
+  return (
+    isRecord(value) &&
+    typeof value.description === "string" &&
+    value.description.startsWith(LEGACY_HAIKU_PROFILE_DESCRIPTION)
+  );
 }
 
 function removeLegacyHaikuProfileRow(settings: Record<string, unknown>): void {
   const currentPicker = settings.modelPicker;
   if (!isRecord(currentPicker) || !Array.isArray(currentPicker.options)) return;
 
-  const retainedOptions = currentPicker.options.filter((row) => !isLegacyHaikuProfileRow(row));
+  const retainedOptions = currentPicker.options.filter(
+    (row) => !isLegacyHaikuProfileRow(row),
+  );
   if (retainedOptions.length === currentPicker.options.length) return;
-  if (retainedOptions.length === 0 && Object.keys(currentPicker).every((key) => key === "options")) {
+  if (
+    retainedOptions.length === 0 &&
+    Object.keys(currentPicker).every((key) => key === "options")
+  ) {
     delete settings.modelPicker;
     return;
   }
@@ -256,7 +349,10 @@ export type ClaudeLaunch = {
  * explicitly wins; otherwise the routed models' real window replaces Claude Code's 200K assumption,
  * which keeps proactive auto-compaction working for model IDs it does not recognize.
  */
-export function claudeLaunchEnvironment(base: NodeJS.ProcessEnv, launch: ClaudeLaunch): NodeJS.ProcessEnv {
+export function claudeLaunchEnvironment(
+  base: NodeJS.ProcessEnv,
+  launch: ClaudeLaunch,
+): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     ...base,
     ANTHROPIC_BASE_URL: launch.gatewayUrl,
@@ -267,8 +363,13 @@ export function claudeLaunchEnvironment(base: NodeJS.ProcessEnv, launch: ClaudeL
     ANTHROPIC_DEFAULT_HAIKU_MODEL: launch.haikuModel,
     CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
   };
-  if (!base.CLAUDE_CODE_MAX_CONTEXT_TOKENS && launch.maxContextTokens !== undefined) {
-    environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(launch.maxContextTokens);
+  if (
+    !base.CLAUDE_CODE_MAX_CONTEXT_TOKENS &&
+    launch.maxContextTokens !== undefined
+  ) {
+    environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(
+      launch.maxContextTokens,
+    );
   }
   delete environment.ANTHROPIC_API_KEY;
   return environment;
@@ -281,9 +382,12 @@ export function setupClaudeCodeCli(options: SetupOptions): readonly string[] {
   const modified: string[] = [];
 
   const settingsData = safeReadJson(paths.claudeSettingsPath) ?? {};
-  const currentEnv = typeof settingsData.env === "object" && settingsData.env !== null && !Array.isArray(settingsData.env)
-    ? { ...(settingsData.env as Record<string, unknown>) }
-    : {};
+  const currentEnv =
+    typeof settingsData.env === "object" &&
+    settingsData.env !== null &&
+    !Array.isArray(settingsData.env)
+      ? { ...(settingsData.env as Record<string, unknown>) }
+      : {};
 
   currentEnv.ANTHROPIC_BASE_URL = options.gatewayUrl;
   currentEnv.ANTHROPIC_AUTH_TOKEN = options.token;
@@ -291,7 +395,8 @@ export function setupClaudeCodeCli(options: SetupOptions): readonly string[] {
   currentEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = tiers.opus;
   currentEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = tiers.sonnet;
   currentEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = tiers.haiku;
-  currentEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES = HAIKU_MODEL_CAPABILITIES;
+  currentEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES =
+    HAIKU_MODEL_CAPABILITIES;
   currentEnv.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
   currentEnv.CLAUDE_CODE_USE_GATEWAY = "1";
   currentEnv.CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK = "1";
@@ -304,15 +409,20 @@ export function setupClaudeCodeCli(options: SetupOptions): readonly string[] {
     currentEnv.CLAUDE_CODE_EFFORT_LEVEL = options.effort;
   }
   if (options.maxContextTokens !== undefined) {
-    currentEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(options.maxContextTokens);
+    currentEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(
+      options.maxContextTokens,
+    );
   }
   delete currentEnv.ANTHROPIC_API_KEY;
 
   settingsData.env = currentEnv;
   removeLegacyHaikuProfileRow(settingsData);
-  const currentPermissions = typeof settingsData.permissions === "object" && settingsData.permissions !== null && !Array.isArray(settingsData.permissions)
-    ? { ...(settingsData.permissions as Record<string, unknown>) }
-    : {};
+  const currentPermissions =
+    typeof settingsData.permissions === "object" &&
+    settingsData.permissions !== null &&
+    !Array.isArray(settingsData.permissions)
+      ? { ...(settingsData.permissions as Record<string, unknown>) }
+      : {};
   currentPermissions.defaultMode = "bypassPermissions";
   settingsData.permissions = currentPermissions;
   settingsData.skipDangerousModePermissionPrompt = true;
@@ -332,26 +442,46 @@ export function setupClaudeCodeCli(options: SetupOptions): readonly string[] {
   return modified;
 }
 
-export type DesktopInferenceModel = { readonly name: string; readonly labelOverride: string };
+export type DesktopInferenceModel = {
+  readonly name: string;
+  readonly labelOverride: string;
+};
 
 /**
  * Desktop rejects route IDs naming a non-Anthropic model (gpt, codex, gemini, …), so each route keeps
  * its Claude ID and the picker shows the routed account model through `labelOverride` instead.
  */
-export function desktopInferenceModels(tiers: TierModels): readonly DesktopInferenceModel[] {
-  return CLAUDE_GATEWAY_MODELS.map((model) => ({ name: model.id, labelOverride: tiers[model.tier] }));
+export function desktopInferenceModels(
+  tiers: TierModels,
+): readonly DesktopInferenceModel[] {
+  return CLAUDE_GATEWAY_MODELS.map((model) => ({
+    name: model.id,
+    labelOverride: tiers[model.tier],
+  }));
 }
 
-function setupDesktopLibrary(libraryDir: string, desktopConfig: object, configName: string): readonly string[] {
+function setupDesktopLibrary(
+  libraryDir: string,
+  desktopConfig: object,
+  configName: string,
+): readonly string[] {
   const deployment = prepareDesktopDeploymentMode(libraryDir, "3p");
   const metaFile = join(libraryDir, "_meta.json");
   const meta = readSavedGatewayConfig(metaFile, z.looseObject({})) ?? {};
-  const entries = Array.isArray(meta.entries) ? meta.entries.filter((entry) => isRecord(entry) && entry.id !== CODEX2CC_DESKTOP_CONFIG_ID) : [];
+  const entries = Array.isArray(meta.entries)
+    ? meta.entries.filter(
+        (entry) => isRecord(entry) && entry.id !== CODEX2CC_DESKTOP_CONFIG_ID,
+      )
+    : [];
   entries.push({ id: CODEX2CC_DESKTOP_CONFIG_ID, name: configName });
 
   const configFile = join(libraryDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
   writeJson(configFile, desktopConfig);
-  writeJson(metaFile, { ...meta, appliedId: CODEX2CC_DESKTOP_CONFIG_ID, entries });
+  writeJson(metaFile, {
+    ...meta,
+    appliedId: CODEX2CC_DESKTOP_CONFIG_ID,
+    entries,
+  });
   const modified = [configFile, metaFile];
   if (deployment) {
     writeJson(deployment.file, deployment.data);
@@ -372,19 +502,33 @@ export function setupClaudeDesktop(options: SetupOptions): readonly string[] {
     inferenceGatewayAuthScheme: "x-api-key",
     inferenceCredentialKind: "static",
     modelDiscoveryEnabled: true,
-    inferenceModels: desktopInferenceModels(options.tiers ?? DEFAULT_TIER_MODELS),
+    inferenceModels: desktopInferenceModels(
+      options.tiers ?? DEFAULT_TIER_MODELS,
+    ),
     chatTabEnabled: true,
     coworkTabEnabled: true,
     isClaudeCodeForDesktopEnabled: true,
   };
 
   const [primaryDir, ...legacyDirs] = desktopLibraryDirs(paths);
-  modified.push(...setupDesktopLibrary(primaryDir!, desktopConfig, options.configName ?? DEFAULT_CONFIG_NAME));
+  modified.push(
+    ...setupDesktopLibrary(
+      primaryDir!,
+      desktopConfig,
+      options.configName ?? DEFAULT_CONFIG_NAME,
+    ),
+  );
   for (const libraryDir of legacyDirs) {
     // Keep existing legacy installations usable without creating an unused second library.
     if (!existsSync(join(libraryDir, "_meta.json"))) continue;
     try {
-      modified.push(...setupDesktopLibrary(libraryDir, desktopConfig, options.configName ?? DEFAULT_CONFIG_NAME));
+      modified.push(
+        ...setupDesktopLibrary(
+          libraryDir,
+          desktopConfig,
+          options.configName ?? DEFAULT_CONFIG_NAME,
+        ),
+      );
     } catch {
       // An optional legacy mirror must not fail an already-applied primary setup.
     }
@@ -407,19 +551,32 @@ export function setupClaudeDesktop(options: SetupOptions): readonly string[] {
  * Rewrites the picker labels of the applied Codex2CC Desktop config after the tier mapping changes,
  * keeping its gateway URL and credential. Returns no files when Desktop is not pointed at Codex2CC.
  */
-export function refreshDesktopModelLabels(tiers: TierModels, pathsInput?: SetupPaths): readonly string[] {
+export function refreshDesktopModelLabels(
+  tiers: TierModels,
+  pathsInput?: SetupPaths,
+): readonly string[] {
   const modified: string[] = [];
   const inferenceModels = desktopInferenceModels(tiers);
   for (const libraryDir of desktopLibraryDirs(pathsInput)) {
-    const meta = readSavedGatewayConfig(join(libraryDir, "_meta.json"), z.object({ appliedId: z.string() }));
+    const meta = readSavedGatewayConfig(
+      join(libraryDir, "_meta.json"),
+      z.object({ appliedId: z.string() }),
+    );
     if (meta?.appliedId !== CODEX2CC_DESKTOP_CONFIG_ID) continue;
     const configFile = join(libraryDir, `${CODEX2CC_DESKTOP_CONFIG_ID}.json`);
     const config = readSavedGatewayConfig(
       configFile,
-      z.looseObject({ inferenceGatewayBaseUrl: z.string(), inferenceGatewayApiKey: z.string() }),
+      z.looseObject({
+        inferenceGatewayBaseUrl: z.string(),
+        inferenceGatewayApiKey: z.string(),
+      }),
     );
     if (config === undefined) {
-      throw new BridgeError(500, "missing_saved_gateway_config", "Applied Claude Desktop gateway configuration file is missing.");
+      throw new BridgeError(
+        500,
+        "missing_saved_gateway_config",
+        "Applied Claude Desktop gateway configuration file is missing.",
+      );
     }
     writeJson(configFile, { ...config, inferenceModels });
     modified.push(configFile);
@@ -427,19 +584,31 @@ export function refreshDesktopModelLabels(tiers: TierModels, pathsInput?: SetupP
   return modified;
 }
 
-export function resetClaudeCodeCli(pathsInput?: SetupPaths | undefined): readonly string[] {
+export function resetClaudeCodeCli(
+  pathsInput?: SetupPaths | undefined,
+): readonly string[] {
   const paths = resolvePaths(pathsInput);
   const modified: string[] = [];
 
   if (existsSync(paths.claudeSettingsPath)) {
     const settings = safeReadJson(paths.claudeSettingsPath);
-    if (settings !== null && typeof settings.permissions === "object" && settings.permissions !== null && !Array.isArray(settings.permissions)) {
+    if (
+      settings !== null &&
+      typeof settings.permissions === "object" &&
+      settings.permissions !== null &&
+      !Array.isArray(settings.permissions)
+    ) {
       const permissions = settings.permissions as Record<string, unknown>;
-      if (permissions.defaultMode === "bypassPermissions") delete permissions.defaultMode;
+      if (permissions.defaultMode === "bypassPermissions")
+        delete permissions.defaultMode;
       if (Object.keys(permissions).length === 0) delete settings.permissions;
       delete settings.skipDangerousModePermissionPrompt;
     }
-    if (settings !== null && typeof settings.env === "object" && settings.env !== null) {
+    if (
+      settings !== null &&
+      typeof settings.env === "object" &&
+      settings.env !== null
+    ) {
       const env = settings.env as Record<string, unknown>;
       const keysToRemove = [
         "ANTHROPIC_BASE_URL",
@@ -481,14 +650,26 @@ export function resetClaudeCodeCli(pathsInput?: SetupPaths | undefined): readonl
   return modified;
 }
 
-function prepareDesktopDeploymentMode(libraryDir: string, mode: "1p" | "3p"): { file: string; data: object } | undefined {
+function prepareDesktopDeploymentMode(
+  libraryDir: string,
+  mode: "1p" | "3p",
+): { file: string; data: object } | undefined {
   const file = join(dirname(libraryDir), "claude_desktop_config.json");
-  const config = readSavedGatewayConfig(file, z.looseObject({ deploymentMode: z.enum(["1p", "3p"]).optional() }));
-  if (config?.deploymentMode === mode || (config === undefined && mode === "1p")) return undefined;
+  const config = readSavedGatewayConfig(
+    file,
+    z.looseObject({ deploymentMode: z.enum(["1p", "3p"]).optional() }),
+  );
+  if (
+    config?.deploymentMode === mode ||
+    (config === undefined && mode === "1p")
+  )
+    return undefined;
   return { file, data: { ...config, deploymentMode: mode } };
 }
 
-export function resetClaudeDesktop(pathsInput?: SetupPaths | undefined): readonly string[] {
+export function resetClaudeDesktop(
+  pathsInput?: SetupPaths | undefined,
+): readonly string[] {
   // Validate every affected profile before removing any applied gateway configuration.
   const plans = desktopLibraryDirs(pathsInput).map((libraryDir) => {
     const metaFile = join(libraryDir, "_meta.json");
@@ -499,7 +680,9 @@ export function resetClaudeDesktop(pathsInput?: SetupPaths | undefined): readonl
       metaFile,
       meta,
       applied,
-      deployment: applied ? prepareDesktopDeploymentMode(libraryDir, "1p") : undefined,
+      deployment: applied
+        ? prepareDesktopDeploymentMode(libraryDir, "1p")
+        : undefined,
     };
   });
   const modified: string[] = [];
@@ -509,9 +692,16 @@ export function resetClaudeDesktop(pathsInput?: SetupPaths | undefined): readonl
       modified.push(plan.deployment.file);
     }
     if (plan.meta) {
-      const appliedId = plan.applied ? "" : typeof plan.meta.appliedId === "string" ? plan.meta.appliedId : "";
+      const appliedId = plan.applied
+        ? ""
+        : typeof plan.meta.appliedId === "string"
+          ? plan.meta.appliedId
+          : "";
       const entries = Array.isArray(plan.meta.entries)
-        ? plan.meta.entries.filter((entry) => isRecord(entry) && entry.id !== CODEX2CC_DESKTOP_CONFIG_ID)
+        ? plan.meta.entries.filter(
+            (entry) =>
+              isRecord(entry) && entry.id !== CODEX2CC_DESKTOP_CONFIG_ID,
+          )
         : [];
       writeJson(plan.metaFile, { ...plan.meta, appliedId, entries });
       modified.push(plan.metaFile);
@@ -524,11 +714,19 @@ export function resetClaudeDesktop(pathsInput?: SetupPaths | undefined): readonl
   return modified;
 }
 
-export function setupConfig(target: SetupTarget, options: SetupOptions): SetupResult {
+export function setupConfig(
+  target: SetupTarget,
+  options: SetupOptions,
+): SetupResult {
   const cleanUrl = validateGatewayUrl(options.gatewayUrl);
   const cleanToken = validateToken(options.token);
   const effort = options.effort?.trim() || undefined;
-  const resolvedOptions: SetupOptions = { ...options, gatewayUrl: cleanUrl, token: cleanToken, effort };
+  const resolvedOptions: SetupOptions = {
+    ...options,
+    gatewayUrl: cleanUrl,
+    token: cleanToken,
+    effort,
+  };
 
   const modified: string[] = [];
   let cliConfigured = false;
@@ -557,7 +755,10 @@ export function setupConfig(target: SetupTarget, options: SetupOptions): SetupRe
   };
 }
 
-export function resetConfig(target: SetupTarget, paths?: SetupPaths | undefined): ResetResult {
+export function resetConfig(
+  target: SetupTarget,
+  paths?: SetupPaths | undefined,
+): ResetResult {
   const modified: string[] = [];
   let cliReset = false;
   let desktopReset = false;
