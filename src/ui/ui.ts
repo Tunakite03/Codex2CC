@@ -1985,10 +1985,15 @@ export function renderDashboardHtml(port: number = getAppConfig(process.env).por
 
     /* Usage Table */
     .usage-table-wrapper {
-      overflow-x: auto;
+      max-height: min(32rem, 65vh);
+      overflow: auto;
       border: 1.5px solid var(--line);
       border-radius: 0.7rem 0.6rem 0.75rem 0.6rem;
       background: var(--surface);
+    }
+    .usage-table-wrapper:focus-visible {
+      outline: 3px solid var(--ring);
+      outline-offset: 3px;
     }
     .usage-table {
       width: 100%;
@@ -1997,6 +2002,9 @@ export function renderDashboardHtml(port: number = getAppConfig(process.env).por
       text-align: left;
     }
     .usage-table th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
       background: var(--surface-soft);
       color: var(--muted-foreground);
       font-size: 0.6875rem;
@@ -2015,6 +2023,9 @@ export function renderDashboardHtml(port: number = getAppConfig(process.env).por
       background: #fff8df;
     }
     .usage-table tfoot td {
+      position: sticky;
+      bottom: 0;
+      z-index: 1;
       background: var(--accent);
       color: var(--accent-foreground);
       font-weight: 700;
@@ -2796,7 +2807,7 @@ export function renderDashboardHtml(port: number = getAppConfig(process.env).por
           </div>
         </div>
 
-        <div class="usage-table-wrapper">
+        <div class="usage-table-wrapper" role="region" aria-label="Model token usage" tabindex="0">
           <table class="usage-table" id="usage-table">
             <thead>
               <tr>
