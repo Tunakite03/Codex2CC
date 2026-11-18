@@ -46,6 +46,7 @@ import {
   type SyncDirection,
 } from "../config/desktop-sessions.js";
 import { activeTierModels, parseTierModels, EffortLevel } from "../models/tier-store.js";
+import type { PayloadTraces } from "../telemetry/payload-traces.js";
 import { clearLogs, getActiveLogFilePath, getLogs, getLogStats, onLog, onLogsCleared, recordLog, type LogLevel } from "../telemetry/logger.js";
 import type { AccountUsageLimits } from "../auth/auth.js";
 import { getTokenUsageStats, onUsageUpdated, resetTokenUsage } from "../telemetry/usage.js";
@@ -352,6 +353,7 @@ export async function handleUiRoute(
   response: ServerResponse,
   pathname: string,
   port: number,
+  traces?: PayloadTraces,
 ): Promise<boolean> {
   if (pathname === "/" || pathname === "/ui") {
     response.writeHead(200, {
@@ -366,6 +368,21 @@ export async function handleUiRoute(
     const status = getStatus(options, port);
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify(status));
+    return true;
+  }
+
+  if (traces && pathname.startsWith("/api/ui/payload-traces")) {
+    const root = "/api/ui/payload-traces";
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("Content-Type", "application/json");
+    if (request.method === "POST" && pathname === root + "/start") traces.start();
+    else if (request.method === "POST" && pathname === root + "/stop") traces.stop();
+    else if (request.method === "GET" && pathname.startsWith(root + "/")) {
+      const trace = traces.get(pathname.slice(root.length + 1));
+      response.writeHead(trace ? 200 : 404).end(JSON.stringify(trace ?? { error: "Capture expired" }));
+      return true;
+    } else if (request.method !== "GET" || pathname !== root) return false;
+    response.end(JSON.stringify(traces.index()));
     return true;
   }
 
@@ -459,6 +476,7 @@ export async function handleUiRoute(
   }
 
   if (pathname === "/api/ui/logs/clear" && request.method === "POST") {
+    traces?.clear();
     clearLogs({ clearFile: true });
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ ok: true }));
@@ -2054,6 +2072,10 @@ export function renderDashboardHtml(port: number = getAppConfig(process.env).por
       color: var(--muted-foreground);
     }
 
+    #payload-stages pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 28rem; overflow: auto; }
+    #payload-stages details { padding: .5rem 0; }
+    #payload-stages summary { cursor: pointer; }
+
     /* Logs & Terminal */
     .logs-header {
       display: flex;
@@ -2843,6 +2865,21 @@ export function renderDashboardHtml(port: number = getAppConfig(process.env).por
 
     <!-- Tab 4: Live Logs -->
     <div class="tab-pane" id="tab-logs" role="tabpanel">
+      <section class="card" aria-labelledby="payload-title">
+        <div class="card-header">
+          <h2 class="card-title" id="payload-title">ChatGPT payload trace</h2>
+          <button type="button" class="btn btn-secondary btn-sm" id="payload-toggle" disabled>Start capture</button>
+        </div>
+        <p>Captures conversation and tool content in memory. Stopping clears the history.</p>
+        <label>Request <select id="payload-request"><option value="">Follow latest</option></select></label>
+        <p id="payload-status" role="status"></p>
+        <div id="payload-stages" hidden>
+          <details open><summary>Claude → Gateway · request</summary><pre id="payload-claudeRequest"></pre></details>
+          <details><summary>Gateway → ChatGPT · request</summary><pre id="payload-chatgptRequest"></pre></details>
+          <details><summary>ChatGPT → Gateway · response</summary><pre id="payload-chatgptResponse"></pre></details>
+          <details><summary>Gateway → Claude · response</summary><pre id="payload-claudeResponse"></pre></details>
+        </div>
+      </section>
       <section class="card" id="section-logs" aria-labelledby="logs-title">
         <div class="card-header logs-header">
           <h2 class="card-title" id="logs-title">
@@ -4199,7 +4236,80 @@ export function renderDashboardHtml(port: number = getAppConfig(process.env).por
       }
     }
 
+    function setupPayloadCapture() {
+      const endpoint = "/api/ui/payload-traces";
+      const button = document.getElementById("payload-toggle");
+      const select = document.getElementById("payload-request");
+      const status = document.getElementById("payload-status");
+      const stages = document.getElementById("payload-stages");
+      let enabled = false;
+      let generation = 0;
+      let displayed = "";
+      let choices = "";
+
+      async function refresh(action = "") {
+        const version = ++generation;
+        try {
+          const res = await fetch(endpoint + action, { method: action ? "POST" : "GET" });
+          if (!res.ok) throw new Error("Could not load capture state (HTTP " + res.status + ").");
+          const state = await res.json();
+          if (version !== generation) return;
+          enabled = state.enabled;
+          button.textContent = enabled ? "Stop and clear" : "Start capture";
+          button.disabled = false;
+          const ids = state.requests.map(row => row.id).join(",");
+          if (ids !== choices) {
+            const previous = select.value;
+            select.replaceChildren(new Option("Follow latest", ""));
+            for (const row of state.requests) select.add(new Option(new Date(row.started).toLocaleTimeString() + " · " + row.id.slice(0, 8), row.id));
+            select.value = state.requests.some(row => row.id === previous) ? previous : "";
+            choices = ids;
+          }
+          const row = state.requests.find(row => row.id === select.value) || state.requests[0];
+          if (!row) {
+            displayed = "";
+            stages.hidden = true;
+            for (const pre of stages.querySelectorAll("pre")) pre.textContent = "";
+            status.textContent = enabled ? "Waiting for a Claude request routed to ChatGPT." : "Capture is off.";
+            return;
+          }
+          status.textContent = "Request " + row.id;
+          if (displayed === row.id + "/" + row.revision) return;
+          const detail = await fetch(endpoint + "/" + row.id);
+          if (!detail.ok) throw new Error("Could not load the selected request (HTTP " + detail.status + ").");
+          const trace = await detail.json();
+          if (version !== generation) return;
+          for (const [key, raw] of Object.entries(trace.stages)) {
+            let text = raw;
+            if (raw.trimStart().startsWith("{")) {
+              try { text = JSON.stringify(JSON.parse(raw), null, 2); } catch { /* Multiple attempts or truncated JSON. */ }
+            }
+            document.getElementById("payload-" + key).textContent = text || "No payload captured yet.";
+          }
+          displayed = row.id + "/" + trace.revision;
+          stages.hidden = false;
+        } catch (error) {
+          if (version === generation) status.textContent = error.message;
+        }
+      }
+
+      let busy = false;
+      button.addEventListener("click", async () => {
+        busy = true;
+        button.disabled = true;
+        try { await refresh(enabled ? "/stop" : "/start"); }
+        finally { busy = false; button.disabled = false; }
+      });
+      select.addEventListener("change", () => refresh());
+      async function poll() {
+        if (!busy && !document.hidden && document.getElementById("tab-logs").classList.contains("active")) await refresh();
+        setTimeout(poll, 1000);
+      }
+      poll();
+    }
+
     function setupLogControls() {
+      setupPayloadCapture();
       document.getElementById("btn-refresh-logs").addEventListener("click", () => fetchLogs());
       document.getElementById("select-log-level").addEventListener("change", () => fetchLogs());
       document.getElementById("input-log-search").addEventListener("input", () => fetchLogs());

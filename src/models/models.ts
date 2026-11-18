@@ -14,9 +14,9 @@ export type Tier = "fable" | "opus" | "sonnet" | "haiku";
 export type TierModels = Readonly<Record<Tier, string>>;
 
 export const DEFAULT_TIER_MODELS: TierModels = {
-  fable: "gpt-6-astra",
-  opus: "gpt-6.1-sol",
-  sonnet: "gpt-6-sol",
+  fable: "gpt-6.2-astra",
+  opus: "gpt-6.2-sol",
+  sonnet: "gpt-6.1-terra",
   haiku: "gpt-6-luna",
 };
 
@@ -55,9 +55,9 @@ export const ANTIGRAVITY_MODELS: readonly ModelCatalogItem[] = [
 
 /** Catalog shown while no ChatGPT session exists, so the control panel can still render tier mappings. */
 export const OFFLINE_CODEX_MODELS: readonly ModelCatalogItem[] = [
-  { slug: "gpt-6-astra", displayName: "ChatGPT Fable Tier (gpt-6-astra)" },
-  { slug: "gpt-6-sol", displayName: "ChatGPT Sonnet Tier (gpt-6-sol)" },
-  { slug: "gpt-6.1-sol", displayName: "ChatGPT Opus Tier (gpt-6.1-sol)" },
+  { slug: "gpt-6.2-astra", displayName: "ChatGPT Fable Tier (gpt-6.2-astra)" },
+  { slug: "gpt-6.1-terra", displayName: "ChatGPT Sonnet Tier (gpt-6.1-terra)" },
+  { slug: "gpt-6.2-sol", displayName: "ChatGPT Opus Tier (gpt-6.2-sol)" },
   { slug: "gpt-6-luna", displayName: "ChatGPT Haiku Tier (gpt-6-luna)" },
 ];
 

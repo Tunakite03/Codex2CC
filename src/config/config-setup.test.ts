@@ -162,7 +162,7 @@ test("setupConfig configures Claude Code CLI atomically and cleans old credentia
     const settings = JSON.parse(readFileSync(paths.claudeSettingsPath, "utf8"));
     assert.equal(settings.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:3456");
     assert.equal(settings.env.ANTHROPIC_AUTH_TOKEN, "secure-token-1234567890123456");
-    assert.equal(settings.env.ANTHROPIC_MODEL, "gpt-6-sol");
+    assert.equal(settings.env.ANTHROPIC_MODEL, "gpt-6.1-terra");
     assert.equal(settings.env.CLAUDE_CODE_EFFORT_LEVEL, "high");
     assert.equal(settings.env.CLAUDE_CODE_USE_GATEWAY, "1");
     assert.equal(settings.env.ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES, undefined);
@@ -192,7 +192,7 @@ test("setupConfig configures Claude Desktop library, models and _meta.json", () 
     const result = setupConfig("desktop", {
       gatewayUrl: "http://127.0.0.1:3456",
       token: "secure-token-1234567890123456",
-      availableModels: ["gpt-6-sol", "gpt-6.1-sol"],
+      availableModels: ["gpt-6.1-terra", "gpt-6.2-sol"],
       paths,
     });
 
@@ -207,10 +207,10 @@ test("setupConfig configures Claude Desktop library, models and _meta.json", () 
     assert.equal(config.inferenceGatewayAuthScheme, "x-api-key");
     assert.equal(config.modelDiscoveryEnabled, true);
     assert.deepEqual(config.inferenceModels, [
-      { name: "claude-sonnet-5-5", labelOverride: "gpt-6-sol" },
-      { name: "claude-opus-5-5", labelOverride: "gpt-6.1-sol" },
+      { name: "claude-sonnet-5-5", labelOverride: "gpt-6.1-terra" },
+      { name: "claude-opus-5-5", labelOverride: "gpt-6.2-sol" },
       { name: "claude-haiku-5", labelOverride: "gpt-6-luna" },
-      { name: "claude-fable-5-1", labelOverride: "gpt-6-astra" },
+      { name: "claude-fable-5-1", labelOverride: "gpt-6.2-astra" },
     ]);
 
     const metaFile = join(paths.claudeDesktopDir, "_meta.json");

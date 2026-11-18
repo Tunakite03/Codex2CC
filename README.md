@@ -39,7 +39,7 @@ node dist/main.js --ui
 node dist/main.js --list-models
 
 # 3. Or launch Claude Code directly through the gateway
-node dist/main.js --model gpt-6-sol -- --resume
+node dist/main.js --model gpt-6.1-terra -- --resume
 
 # 4. Or run non-interactively and pipe the output
 node dist/main.js -p "Summarize this repository" | tee summary.txt
@@ -157,9 +157,9 @@ The Haiku route remains mapped to `gpt-6-luna`. Codex2CC applies `max` effort to
 |---|---|---|
 | `CODEX2CC_TOKEN` | `--serve`, `--ui`, setup | Gateway authentication token (min. 16 chars; saved local token reused when unset) |
 | `CODEX2CC_LOG_FILE` | all | Path to write formatted gateway logs (default: `logs/gateway.log`) |
-| `CODEX2CC_MODEL_FABLE` | all | ChatGPT model for Claude Fable tier (default: `gpt-6-astra`) |
-| `CODEX2CC_MODEL_OPUS` | all | ChatGPT model for Claude Opus tier (default: `gpt-6.1-sol`) |
-| `CODEX2CC_MODEL_SONNET` | all | ChatGPT model for Claude Sonnet tier (default: `gpt-6-sol`) |
+| `CODEX2CC_MODEL_FABLE` | all | ChatGPT model for Claude Fable tier (default: `gpt-6.2-astra`) |
+| `CODEX2CC_MODEL_OPUS` | all | ChatGPT model for Claude Opus tier (default: `gpt-6.2-sol`) |
+| `CODEX2CC_MODEL_SONNET` | all | ChatGPT model for Claude Sonnet tier (default: `gpt-6.1-terra`) |
 | `CODEX2CC_MODEL_HAIKU` | all | ChatGPT model for Claude Haiku tier (default: `gpt-6-luna`) |
 | `CODEX2CC_TIERS_FILE` | all | Optional path for the persisted Web UI tier mapping (default: `logs/tier-models.json` under the project directory) |
 

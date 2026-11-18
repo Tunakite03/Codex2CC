@@ -33,6 +33,7 @@ import {
 import { activeTierModels, type TierModelStore } from "../models/tier-store.js";
 import { handleUiRoute } from "../ui/ui.js";
 import type { AccountUsageLimits } from "../auth/auth.js";
+import { PayloadTraces, type CapturePayload } from "../telemetry/payload-traces.js";
 import { recordLog } from "../telemetry/logger.js";
 import { recordTokenUsage } from "../telemetry/usage.js";
 import { isApiProvider, requireApiKey, type ApiProvider } from "../providers/config.js";
@@ -102,16 +103,19 @@ function errorType(status: number): string {
   return "api_error";
 }
 
-function sendError(response: ServerResponse, error: BridgeError): void {
+function sendError(response: ServerResponse, error: BridgeError, capture?: CapturePayload): void {
   const body = { type: "error", error: { type: errorType(error.status), message: error.message } };
   if (response.headersSent) {
-    response.write(`event: error\ndata: ${JSON.stringify(body)}\n\n`);
+    const frame = `event: error\ndata: ${JSON.stringify(body)}\n\n`;
+    response.write(frame);
+    capture?.("claudeResponse", frame);
     response.end();
   } else {
     response.writeHead(error.status, {
       "Content-Type": "application/json",
       ...(error.retryAfterSeconds === undefined ? {} : { "Retry-After": String(error.retryAfterSeconds) }),
     }).end(JSON.stringify(body));
+    capture?.("claudeResponse", JSON.stringify(body));
   }
 }
 
@@ -231,12 +235,14 @@ function parseRequest(raw: string): MessageRequest {
   }
 }
 
-async function openInference(options: ResolvedGatewayOptions, body: object, clientGone: AbortSignal): Promise<Response> {
+async function openInference(options: ResolvedGatewayOptions, body: object, clientGone: AbortSignal, capture?: CapturePayload): Promise<Response> {
+  const serialized = JSON.stringify(body);
   let token = await options.session.accessToken();
   let refreshedAfterRejection = false;
   let attempt = 0;
   for (;;) {
     attempt++;
+    capture?.("chatgptRequest", serialized + "\n");
     const response = await fetch(options.upstreamUrl, {
       method: "POST",
       headers: {
@@ -244,14 +250,16 @@ async function openInference(options: ResolvedGatewayOptions, body: object, clie
         Authorization: `Bearer ${token}`,
         "ChatGPT-Account-Id": options.session.accountId(),
       },
-      body: JSON.stringify(body),
+      body: serialized,
       signal: AbortSignal.any([AbortSignal.timeout(UPSTREAM_TIMEOUT_MS), clientGone]),
     });
+    capture?.("chatgptResponse", `HTTP ${response.status}\n`);
     if (response.status === 401 && !refreshedAfterRejection) {
       // The token may have expired early or been rotated by another process: refresh once, outside the retry budget.
       refreshedAfterRejection = true;
       attempt--;
       await response.body?.cancel();
+      capture?.("chatgptResponse", "[Retry body discarded by gateway]\n");
       process.stderr.write(`${JSON.stringify({ level: "warn", operation: "inference", status: 401, action: "refresh_token" })}\n`);
       recordLog({
         level: "warn",
@@ -272,11 +280,14 @@ async function openInference(options: ResolvedGatewayOptions, body: object, clie
         details: { attempt, status: response.status },
       });
       await response.body?.cancel();
+      capture?.("chatgptResponse", "[Retry body discarded by gateway]\n");
       await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
       continue;
     }
     if (!response.ok) {
-      throw upstreamHttpError(response.status, response.headers, await response.text());
+      const text = await response.text();
+      capture?.("chatgptResponse", text);
+      throw upstreamHttpError(response.status, response.headers, text);
     }
     if (!response.body) throw new BridgeError(502, "missing_stream", "ChatGPT inference returned no stream.");
     return response;
@@ -288,9 +299,13 @@ async function handleMessage(
   request: IncomingMessage,
   response: ServerResponse,
   clientGone: AbortSignal,
+  provider: ProviderType,
+  capture?: CapturePayload,
 ): Promise<void> {
   const startTime = Date.now();
-  const inbound = parseRequest(await readBody(request, options.maxBodyBytes));
+  const raw = await readBody(request, options.maxBodyBytes);
+  capture?.("claudeRequest", raw);
+  const inbound = parseRequest(raw);
   const requestedEffort = inbound.output_config?.effort ?? inbound.reasoning_effort;
   const loggedRequestedEffort = requestedEffort ?? "upstream_default";
   recordLog({
@@ -319,7 +334,6 @@ async function handleMessage(
       details: { names: omittedTools.join(", ") },
     });
   }
-  const provider = options.activeProvider();
   if (isApiProvider(provider)) {
     await routeToApi(options, provider, inbound, request.headers, response, clientGone, startTime);
     return;
@@ -328,7 +342,7 @@ async function handleMessage(
     await routeToAntigravity(options, inbound, requestedEffort, response, clientGone);
     return;
   }
-  await routeToCodex(options, inbound, request.headers, response, clientGone, startTime);
+  await routeToCodex(options, inbound, request.headers, response, clientGone, startTime, capture);
 }
 
 function resolveRequestModel(options: ResolvedGatewayOptions, requestedModel: string): ReturnType<typeof resolveModel> {
@@ -369,9 +383,9 @@ async function routeToAntigravity(
  * Opens the upstream stream. Replayed reasoning the upstream cannot decrypt (expired, or issued to
  * another account) is dropped once instead of failing the turn.
  */
-async function openCodexInference(options: ResolvedGatewayOptions, outgoing: OpenAIRequest, clientGone: AbortSignal): Promise<Response> {
+async function openCodexInference(options: ResolvedGatewayOptions, outgoing: OpenAIRequest, clientGone: AbortSignal, capture?: CapturePayload): Promise<Response> {
   try {
-    return await openInference(options, outgoing, clientGone);
+    return await openInference(options, outgoing, clientGone, capture);
   } catch (error) {
     if (!(error instanceof BridgeError && error.code === "reasoning_rejected" && hasReasoningItems(outgoing))) throw error;
     process.stderr.write(`${JSON.stringify({ level: "warn", operation: "reasoning_rejected", action: "retry_without_reasoning" })}\n`);
@@ -381,7 +395,7 @@ async function openCodexInference(options: ResolvedGatewayOptions, outgoing: Ope
       message: "ChatGPT rejected replayed reasoning; retrying without it",
       details: { action: "retry_without_reasoning" },
     });
-    return openInference(options, withoutReasoningItems(outgoing), clientGone);
+    return openInference(options, withoutReasoningItems(outgoing), clientGone, capture);
   }
 }
 
@@ -392,6 +406,7 @@ async function routeToCodex(
   response: ServerResponse,
   clientGone: AbortSignal,
   startTime: number,
+  capture?: CapturePayload,
 ): Promise<void> {
   const resolution = resolveRequestModel(options, inbound.model);
   const activeModel = resolution.slug;
@@ -419,17 +434,18 @@ async function routeToCodex(
   const effort = outgoing.reasoning?.effort ?? "upstream_default";
   const estimatedTokens = estimateCodexInputTokens(outgoing);
   try {
-    const upstream = await openCodexInference(options, outgoing, clientGone);
+    const upstream = await openCodexInference(options, outgoing, clientGone, capture);
+    const onUpstreamText = capture && ((text: string) => capture("chatgptResponse", text));
     if (inbound.stream) {
       // Headers go out with the first SSE frame, so a failure reported before any content still gets its status.
       response.statusCode = 200;
       response.setHeader("Content-Type", "text/event-stream");
       response.setHeader("Cache-Control", "no-cache");
       response.setHeader("Connection", "keep-alive");
-      const encoder = new AnthropicStream(response, activeModel, estimatedTokens);
+      const encoder = new AnthropicStream(response, activeModel, estimatedTokens, capture && ((text) => capture("claudeResponse", text)));
       const keepAlive = setInterval(() => encoder.keepAlive(), options.keepAliveMs);
       try {
-        await readSse(upstream.body!, (event) => encoder.accept(event));
+        await readSse(upstream.body!, (event) => encoder.accept(event), onUpstreamText);
       } finally {
         clearInterval(keepAlive);
       }
@@ -461,10 +477,12 @@ async function routeToCodex(
       });
     } else {
       const accumulator = new MessageAccumulator(activeModel);
-      await readSse(upstream.body!, (event) => accumulator.accept(event));
+      await readSse(upstream.body!, (event) => accumulator.accept(event), onUpstreamText);
       accumulator.assertCompleted();
       const msg = accumulator.buildMessage();
-      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(msg));
+      const serialized = JSON.stringify(msg);
+      response.writeHead(200, { "Content-Type": "application/json" }).end(serialized);
+      capture?.("claudeResponse", serialized);
       const usage = accumulator.getUsage();
       const inputTokens = usage.input_tokens;
       const outputTokens = usage.output_tokens;
@@ -605,6 +623,7 @@ function toBridgeError(error: Error): BridgeError {
  * route except the `HEAD /api/hello` liveness probe must pass the client credential check.
  */
 export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
+  const traces = new PayloadTraces();
   const options: ResolvedGatewayOptions = {
     ...gatewayOptions,
     upstreamUrl: gatewayOptions.upstreamUrl ?? CHATGPT_RESPONSES_URL,
@@ -652,7 +671,7 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
         sendGuardFailure(response, originCheck);
         return;
       }
-      handleUiRoute(gatewayOptions, request, response, path, port).then((handled) => {
+      handleUiRoute(gatewayOptions, request, response, path, port, traces).then((handled) => {
         if (!handled) response.writeHead(404, { "Content-Type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "not_found_error", message: "Unknown control panel route." } }));
       }).catch((error: Error) => {
         const typed = toBridgeError(error);
@@ -725,7 +744,9 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
 
     const clientGone = new AbortController();
     response.on("close", () => clientGone.abort());
-    route(options, request, response, clientGone.signal).catch((error: Error) => {
+    const provider = options.activeProvider();
+    const capture = route === handleMessage && provider === "codex" ? traces.begin() : undefined;
+    route(options, request, response, clientGone.signal, provider, capture).catch((error: Error) => {
       const typed = toBridgeError(error);
       const clientDisconnected = clientGone.signal.aborted;
       process.stderr.write(`${JSON.stringify({ level: clientDisconnected ? "info" : "error", operation: "bridge_request", code: typed.code, status: typed.status, message: typed.message, clientDisconnected })}\n`);
@@ -735,7 +756,7 @@ export function createGatewayServer(gatewayOptions: GatewayOptions): Server {
         message: clientDisconnected ? "Client closed connection before completion" : `${typed.code} (${typed.status}): ${typed.message}`,
         details: { code: typed.code, status: typed.status, clientDisconnected },
       });
-      if (!clientDisconnected) sendError(response, typed);
+      if (!clientDisconnected) sendError(response, typed, capture);
     });
   });
 }

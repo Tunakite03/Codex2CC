@@ -418,10 +418,6 @@ function resolveOutputIndex(event: OpenAIEvent, open: ReadonlyMap<number, unknow
   return event.output_index ?? open.keys().next().value ?? 0;
 }
 
-function writeEvent(response: ServerResponse, event: string, data: object): void {
-  response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
-
 /**
  * Translates Responses stream events into Anthropic SSE. `message_start` is held back until the first
  * content, so an upstream failure that arrives first can still be answered with a real HTTP status.
@@ -443,12 +439,19 @@ export class AnthropicStream {
     private readonly response: ServerResponse,
     private readonly model: string,
     private readonly estimatedInputTokens: number = 0,
+    private readonly onFrame?: (frame: string) => void,
   ) {}
+
+  private writeEvent(event: string, data: object): void {
+    const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    this.response.write(frame);
+    this.onFrame?.(frame);
+  }
 
   private start(): void {
     if (this.started) return;
     this.started = true;
-    writeEvent(this.response, "message_start", {
+    this.writeEvent("message_start", {
       type: "message_start",
       message: {
         id: this.messageId ?? `resp_${randomUUID()}`,
@@ -465,7 +468,7 @@ export class AnthropicStream {
 
   private closeText(): void {
     if (this.textBlock === undefined) return;
-    writeEvent(this.response, "content_block_stop", { type: "content_block_stop", index: this.textBlock });
+    this.writeEvent("content_block_stop", { type: "content_block_stop", index: this.textBlock });
     this.textBlock = undefined;
     this.textOutput = "";
   }
@@ -474,9 +477,9 @@ export class AnthropicStream {
     if (this.thinkingBlock === undefined) return;
     const { index } = this.thinkingBlock;
     if (signature !== undefined) {
-      writeEvent(this.response, "content_block_delta", { type: "content_block_delta", index, delta: { type: "signature_delta", signature } });
+      this.writeEvent("content_block_delta", { type: "content_block_delta", index, delta: { type: "signature_delta", signature } });
     }
-    writeEvent(this.response, "content_block_stop", { type: "content_block_stop", index });
+    this.writeEvent("content_block_stop", { type: "content_block_stop", index });
     this.thinkingBlock = undefined;
   }
 
@@ -488,12 +491,12 @@ export class AnthropicStream {
     if (this.thinkingBlock === undefined) {
       const index = this.nextBlock++;
       this.thinkingBlock = { index, summaryIndex };
-      writeEvent(this.response, "content_block_start", { type: "content_block_start", index, content_block: { type: "thinking", thinking: "", signature: "" } });
+      this.writeEvent("content_block_start", { type: "content_block_start", index, content_block: { type: "thinking", thinking: "", signature: "" } });
     } else if (summaryIndex !== this.thinkingBlock.summaryIndex) {
       this.thinkingBlock.summaryIndex = summaryIndex;
-      writeEvent(this.response, "content_block_delta", { type: "content_block_delta", index: this.thinkingBlock.index, delta: { type: "thinking_delta", thinking: "\n\n" } });
+      this.writeEvent("content_block_delta", { type: "content_block_delta", index: this.thinkingBlock.index, delta: { type: "thinking_delta", thinking: "\n\n" } });
     }
-    writeEvent(this.response, "content_block_delta", { type: "content_block_delta", index: this.thinkingBlock.index, delta: { type: "thinking_delta", thinking: event.delta } });
+    this.writeEvent("content_block_delta", { type: "content_block_delta", index: this.thinkingBlock.index, delta: { type: "thinking_delta", thinking: event.delta } });
   }
 
   /** Ends the reasoning item; its encrypted content becomes the signature Claude Code sends back. */
@@ -507,8 +510,8 @@ export class AnthropicStream {
     this.start();
     this.closeText();
     const index = this.nextBlock++;
-    writeEvent(this.response, "content_block_start", { type: "content_block_start", index, content_block: { type: "redacted_thinking", data: signature } });
-    writeEvent(this.response, "content_block_stop", { type: "content_block_stop", index });
+    this.writeEvent("content_block_start", { type: "content_block_start", index, content_block: { type: "redacted_thinking", data: signature } });
+    this.writeEvent("content_block_stop", { type: "content_block_stop", index });
   }
 
   private finish(event: OpenAIEvent, stopReason: StopReason): void {
@@ -516,22 +519,22 @@ export class AnthropicStream {
     this.closeThinking(undefined);
     this.closeText();
     for (const [outputIndex, index] of this.functionBlocks.entries()) {
-      writeEvent(this.response, "content_block_stop", { type: "content_block_stop", index });
+      this.writeEvent("content_block_stop", { type: "content_block_stop", index });
       this.functionBlocks.delete(outputIndex);
     }
     if (this.nextBlock === 0) {
       const index = this.nextBlock++;
-      writeEvent(this.response, "content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
-      writeEvent(this.response, "content_block_stop", { type: "content_block_stop", index });
+      this.writeEvent("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
+      this.writeEvent("content_block_stop", { type: "content_block_stop", index });
     }
     const usage = toAnthropicUsage(event.response?.usage);
     this.finalUsage = usage;
-    writeEvent(this.response, "message_delta", {
+    this.writeEvent("message_delta", {
       type: "message_delta",
       delta: { stop_reason: stopReason, stop_sequence: null },
       usage,
     });
-    writeEvent(this.response, "message_stop", { type: "message_stop" });
+    this.writeEvent("message_stop", { type: "message_stop" });
     this.stopped = true;
   }
 
@@ -550,10 +553,10 @@ export class AnthropicStream {
         if (this.textBlock === undefined) {
           const index = this.nextBlock++;
           this.textBlock = index;
-          writeEvent(this.response, "content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
+          this.writeEvent("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
         }
         this.textOutput += event.delta;
-        writeEvent(this.response, "content_block_delta", { type: "content_block_delta", index: this.textBlock, delta: { type: "text_delta", text: event.delta } });
+        this.writeEvent("content_block_delta", { type: "content_block_delta", index: this.textBlock, delta: { type: "text_delta", text: event.delta } });
       }
     } else if (event.type === "response.output_text.done" || event.type === "response.refusal.done") {
       this.closeText();
@@ -568,7 +571,7 @@ export class AnthropicStream {
       this.usedTool = true;
       this.functionBlocks.set(outputIndex, index);
       this.functionArguments.set(outputIndex, "");
-      writeEvent(this.response, "content_block_start", {
+      this.writeEvent("content_block_start", {
         type: "content_block_start",
         index,
         content_block: { type: "tool_use", id: callId, name, input: {} },
@@ -578,7 +581,7 @@ export class AnthropicStream {
       const index = this.functionBlocks.get(outputIndex);
       if (index !== undefined && typeof event.delta === "string") {
         this.functionArguments.set(outputIndex, (this.functionArguments.get(outputIndex) ?? "") + event.delta);
-        writeEvent(this.response, "content_block_delta", {
+        this.writeEvent("content_block_delta", {
           type: "content_block_delta",
           index,
           delta: { type: "input_json_delta", partial_json: event.delta },
@@ -589,7 +592,7 @@ export class AnthropicStream {
       const index = this.functionBlocks.get(outputIndex);
       if (index !== undefined && typeof event.arguments === "string" && (this.functionArguments.get(outputIndex) ?? "") === "") {
         this.functionArguments.set(outputIndex, event.arguments);
-        writeEvent(this.response, "content_block_delta", {
+        this.writeEvent("content_block_delta", {
           type: "content_block_delta",
           index,
           delta: { type: "input_json_delta", partial_json: event.arguments },
@@ -599,7 +602,7 @@ export class AnthropicStream {
       const outputIndex = resolveOutputIndex(event, this.functionBlocks);
       const index = this.functionBlocks.get(outputIndex);
       if (index !== undefined) {
-        writeEvent(this.response, "content_block_stop", { type: "content_block_stop", index });
+        this.writeEvent("content_block_stop", { type: "content_block_stop", index });
         this.functionBlocks.delete(outputIndex);
         this.functionArguments.delete(outputIndex);
       }
@@ -616,7 +619,7 @@ export class AnthropicStream {
   keepAlive(): void {
     if (this.stopped) return;
     this.start();
-    writeEvent(this.response, "ping", { type: "ping" });
+    this.writeEvent("ping", { type: "ping" });
   }
 
   getUsage(): AnthropicUsage | undefined {
@@ -736,7 +739,7 @@ export class MessageAccumulator {
   }
 }
 
-export async function readSse(body: ReadableStream<Uint8Array>, accept: (event: OpenAIEvent) => void): Promise<void> {
+export async function readSse(body: ReadableStream<Uint8Array>, accept: (event: OpenAIEvent) => void, onText?: (text: string) => void): Promise<void> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -744,7 +747,9 @@ export async function readSse(body: ReadableStream<Uint8Array>, accept: (event: 
     for (;;) {
       const chunk = await reader.read();
       if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
+      const text = decoder.decode(chunk.value, { stream: true });
+      onText?.(text);
+      buffer += text;
       for (;;) {
         const match = /\r?\n\r?\n/.exec(buffer);
         if (!match) break;
