@@ -30,6 +30,7 @@ type FakeServer = {
   origin: string;
   refreshBodies: URLSearchParams[];
   onRefresh: (handler: (response: ServerResponse) => Promise<void> | void) => void;
+  modelRequests: string[];
   onModels: (handler: (response: ServerResponse) => void) => void;
   onUsage: (handler: (response: ServerResponse) => void) => void;
   close: () => Promise<void>;
@@ -37,6 +38,7 @@ type FakeServer = {
 
 async function startFakeServer(): Promise<FakeServer> {
   const refreshBodies: URLSearchParams[] = [];
+  const modelRequests: string[] = [];
   let refreshHandler: (response: ServerResponse) => Promise<void> | void = (response) => { response.writeHead(500).end(); };
   let modelsHandler: (response: ServerResponse) => void = (response) => { response.writeHead(500).end(); };
   let usageHandler: (response: ServerResponse) => void = (response) => { response.writeHead(500).end(); };
@@ -48,6 +50,7 @@ async function startFakeServer(): Promise<FakeServer> {
         refreshBodies.push(new URLSearchParams(Buffer.concat(chunks).toString("utf8")));
         void Promise.resolve(refreshHandler(response));
       } else if (request.method === "GET" && request.url?.startsWith("/backend/codex/models")) {
+        modelRequests.push(request.url);
         modelsHandler(response);
       } else if (request.method === "GET" && request.url?.startsWith("/backend/wham/usage")) {
         usageHandler(response);
@@ -61,6 +64,7 @@ async function startFakeServer(): Promise<FakeServer> {
   return {
     origin,
     refreshBodies,
+    modelRequests,
     onRefresh: (handler) => { refreshHandler = handler; },
     onModels: (handler) => { modelsHandler = handler; },
     onUsage: (handler) => { usageHandler = handler; },
@@ -205,8 +209,11 @@ test("listModels prefers the remote catalog, then the local cache, then built-in
   await withFixture({ access: jwt(Date.now() + HOUR_MS), refresh: "r1" }, async ({ options, dir, fake }) => {
     const session = await ChatGPTSession.open(options);
 
+    await writeFile(options.modelsCachePath, JSON.stringify({ client_version: "0.200.0", models: [] }));
     fake.onModels((response) => json(response, 200, { models: [{ slug: "remote-model", display_name: "Remote", context_window: 1000000 }] }));
     assert.deepEqual(await session.listModels(), [{ slug: "remote-model", displayName: "Remote", contextWindow: 1000000 }]);
+
+    assert.deepEqual(fake.modelRequests, ["/backend/codex/models?client_version=0.200.0"]);
 
     fake.onModels((response) => json(response, 404, {}));
     await writeFile(join(dir, "models_cache.json"), JSON.stringify({ models: [{ slug: "cached-model", context_window: 180000 }] }));
@@ -214,7 +221,7 @@ test("listModels prefers the remote catalog, then the local cache, then built-in
 
     await writeFile(join(dir, "models_cache.json"), JSON.stringify({ models: [] }));
     const defaults = await session.listModels();
-    assert.deepEqual(defaults.map((model) => model.slug), ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"]);
+    assert.deepEqual(defaults.map((model) => model.slug), ["gpt-6.2-astra", "gpt-6.1-terra", "gpt-6.2-sol", "gpt-6-luna"]);
   });
 });
 

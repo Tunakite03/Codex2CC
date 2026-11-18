@@ -3,10 +3,11 @@ import { chmod, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { OFFLINE_CODEX_MODELS } from "../models/models.js";
 import { BridgeError } from "../bridge/bridge.js";
 
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const CODEX_CLIENT_VERSION = "0.159.0";
+const CODEX_CLIENT_VERSION = "0.169.0";
 const REFRESH_MARGIN_MS = 60_000;
 const FRESH_TOKEN_WINDOW_MS = 30_000;
 const LOST_RACE_POLLS = 5;
@@ -359,9 +360,23 @@ export class ChatGPTSession {
   }
 
   async listModels(): Promise<Array<{ slug: string; displayName: string; contextWindow?: number }>> {
+    let cache: z.infer<typeof ModelsApiResponse> | undefined;
+    let clientVersion = CODEX_CLIENT_VERSION;
+    try {
+      const raw: unknown = JSON.parse(await readFile(this.options.modelsCachePath, "utf8"));
+      const version = z.object({ client_version: z.string().regex(/^\d+\.\d+\.\d+$/) }).safeParse(raw);
+      if (version.success) clientVersion = version.data.client_version;
+      cache = ModelsApiResponse.safeParse(raw).data;
+    } catch (error) {
+      if (!isErrnoException(error, "ENOENT")) {
+        warn("local_model_cache", { path: this.options.modelsCachePath, message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
+    let catalog = cache;
     try {
       const response = await fetchRetry(
-        `${this.options.backendOrigin}/codex/models?client_version=${CODEX_CLIENT_VERSION}`,
+        `${this.options.backendOrigin}/codex/models?client_version=${clientVersion}`,
         {
           method: "GET",
           headers: {
@@ -373,39 +388,20 @@ export class ChatGPTSession {
       );
       if (response.ok) {
         const parsed = ModelsApiResponse.safeParse(await response.json());
-        if (parsed.success && parsed.data.models.length > 0) {
-          return parsed.data.models.map((m) => ({
-            slug: m.slug,
-            displayName: m.display_name ?? m.slug,
-            ...(m.context_window === undefined ? {} : { contextWindow: m.context_window }),
-          }));
-        }
+        if (parsed.success && parsed.data.models.length > 0) catalog = parsed.data;
       }
     } catch (error) {
       warn("remote_model_discovery", { message: error instanceof Error ? error.message : String(error) });
     }
 
-    try {
-      const parsed = ModelsApiResponse.safeParse(JSON.parse(await readFile(this.options.modelsCachePath, "utf8")));
-      if (parsed.success && parsed.data.models.length > 0) {
-        return parsed.data.models.map((m) => ({
-          slug: m.slug,
-          displayName: m.display_name ?? m.slug,
-          ...(m.context_window === undefined ? {} : { contextWindow: m.context_window }),
-        }));
-      }
-    } catch (error) {
-      if (!isErrnoException(error, "ENOENT")) {
-        warn("local_model_cache", { path: this.options.modelsCachePath, message: error instanceof Error ? error.message : String(error) });
-      }
+    if (catalog?.models.length) {
+      return catalog.models.map((model) => ({
+        slug: model.slug,
+        displayName: model.display_name ?? model.slug,
+        ...(model.context_window === undefined ? {} : { contextWindow: model.context_window }),
+      }));
     }
-
-    return [
-      { slug: "gpt-6-astra", displayName: "GPT-6 Astra" },
-      { slug: "gpt-6-sol", displayName: "GPT-6 Sol" },
-      { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol" },
-      { slug: "gpt-6-luna", displayName: "GPT-6 Luna" },
-    ];
+    return [...OFFLINE_CODEX_MODELS];
   }
 
   async getUsageLimits(forceRefresh = false): Promise<AccountUsageLimits | null> {

@@ -57,8 +57,8 @@ type Gateway = { base: string; port: number; close: () => Promise<void> };
 async function startGateway(upstreamUrl: string, overrides: Partial<GatewayOptions> = {}): Promise<Gateway> {
   const server = createGatewayServer({
     session: { accessToken: async () => "upstream-token", refreshAfterRejection: async () => "refreshed-token", accountId: () => "acct_1" },
-    defaultModel: "gpt-6-sol",
-    availableModels: [{ slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 1000000 }, { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 1000000 }, { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 1000000 }],
+    defaultModel: "gpt-6.1-terra",
+    availableModels: [{ slug: "gpt-6.1-terra", displayName: "GPT-6.1 Terra", contextWindow: 1000000 }, { slug: "gpt-6.2-sol", displayName: "GPT-6.2 Sol", contextWindow: 1000000 }, { slug: "gpt-6.2-astra", displayName: "GPT-6.2 Astra", contextWindow: 1000000 }],
     policy: { mode: "token", token: TOKEN },
     upstreamUrl,
     ...overrides,
@@ -138,10 +138,10 @@ test("gateway discovery lists only Claude-compatible routes", async () => {
     const ids = body.data.map((model) => model.id);
     assert.deepEqual(ids, ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5", "claude-fable-5-1"]);
     assert.deepEqual(body.data.map((model) => model.display_name), [
-      "gpt-6-sol (ChatGPT via sonnet route)",
-      "gpt-6.1-sol (ChatGPT via opus route)",
-      "gpt-6-sol (ChatGPT via haiku route, fallback)",
-      "gpt-6-astra (ChatGPT via fable route)",
+      "gpt-6.1-terra (ChatGPT via sonnet route)",
+      "gpt-6.2-sol (ChatGPT via opus route)",
+      "gpt-6.1-terra (ChatGPT via haiku route, fallback)",
+      "gpt-6.2-astra (ChatGPT via fable route)",
     ]);
     assert.deepEqual(body.data.map((model) => model.max_input_tokens), [1000000, 1000000, 1000000, 1000000]);
     assert.equal(body.first_id, ids[0]);
@@ -166,7 +166,7 @@ test("gateway streams an Anthropic response and forwards the mapped model with u
     assert.equal(sent.headers["chatgpt-account-id"], "acct_1");
     const body = JSON.parse(sent.body) as { model: string; stream: boolean; store: boolean; instructions: string; reasoning: { effort: string } };
     assert.deepEqual({ model: body.model, stream: body.stream, store: body.store, instructions: body.instructions, reasoning: body.reasoning }, {
-      model: "gpt-6-sol",
+      model: "gpt-6.1-terra",
       stream: true,
       store: false,
       instructions: "Be brief.",
@@ -190,9 +190,9 @@ test("Haiku route forwards reasoning effort to GPT-6 Luna", async () => {
     assert.deepEqual(sent.reasoning, { effort: "xhigh", summary: "auto" });
   }, {
     availableModels: [
-      { slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 1000000 },
-      { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 1000000 },
-      { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 1000000 },
+      { slug: "gpt-6.1-terra", displayName: "GPT-6.1 Terra", contextWindow: 1000000 },
+      { slug: "gpt-6.2-sol", displayName: "GPT-6.2 Sol", contextWindow: 1000000 },
+      { slug: "gpt-6.2-astra", displayName: "GPT-6.2 Astra", contextWindow: 1000000 },
       { slug: "gpt-6-luna", displayName: "GPT-6 Luna", contextWindow: 1000000 },
     ],
   });
@@ -213,13 +213,13 @@ test("Haiku route defaults to max effort for GPT-6 Luna when the client omits ef
     await sonnetResponse.text();
 
     const sonnetSent = JSON.parse(upstream.requests[1]!.body) as { model: string; reasoning?: { effort?: string } };
-    assert.equal(sonnetSent.model, "gpt-6-sol");
+    assert.equal(sonnetSent.model, "gpt-6.1-terra");
     assert.equal(sonnetSent.reasoning?.effort, undefined);
   }, {
     availableModels: [
-      { slug: "gpt-6-sol", displayName: "GPT-6 Sol", contextWindow: 1000000 },
-      { slug: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", contextWindow: 1000000 },
-      { slug: "gpt-6-astra", displayName: "GPT-6 Astra", contextWindow: 1000000 },
+      { slug: "gpt-6.1-terra", displayName: "GPT-6.1 Terra", contextWindow: 1000000 },
+      { slug: "gpt-6.2-sol", displayName: "GPT-6.2 Sol", contextWindow: 1000000 },
+      { slug: "gpt-6.2-astra", displayName: "GPT-6.2 Astra", contextWindow: 1000000 },
       { slug: "gpt-6-luna", displayName: "GPT-6 Luna", contextWindow: 1000000 },
     ],
   });
@@ -247,11 +247,11 @@ test("gateway logs requested effort for streamed and non-streamed messages", asy
   });
 });
 
-test("Fable route sends requests to GPT-6 Astra", async () => {
+test("Fable route sends requests to GPT-6.2 Astra", async () => {
   await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
     const response = await post(gateway, { ...CHAT_REQUEST, model: "claude-fable-5-1", stream: false });
     assert.equal(response.status, 200);
-    assert.equal((JSON.parse(upstream.requests[0]!.body) as { model: string }).model, "gpt-6-astra");
+    assert.equal((JSON.parse(upstream.requests[0]!.body) as { model: string }).model, "gpt-6.2-astra");
   });
 });
 
@@ -407,7 +407,7 @@ test("gateway retries a transient 503 and substitutes the default model for an u
     const response = await post(gateway, { ...CHAT_REQUEST, model: "totally-unknown-model", stream: false });
     assert.equal(response.status, 200);
     assert.equal(upstream.requests.length, 2);
-    assert.equal((JSON.parse(upstream.requests[1]!.body) as { model: string }).model, "gpt-6-sol");
+    assert.equal((JSON.parse(upstream.requests[1]!.body) as { model: string }).model, "gpt-6.1-terra");
   });
 });
 
@@ -483,7 +483,7 @@ test("gateway counts the resolved Codex payload and uses the same estimate at me
         model,
         stream: true,
         messages: [
-          { role: "assistant", content: [{ type: "thinking", thinking: "Reason about the task", signature: encodeReasoningSignature("gpt-6.1-sol", "opaque") }] },
+          { role: "assistant", content: [{ type: "thinking", thinking: "Reason about the task", signature: encodeReasoningSignature("gpt-6.2-sol", "opaque") }] },
           { role: "user", content: [{ type: "document", source: { data: "x".repeat(50_000) } }, { type: "text", text: "Read tiếng Việt" }] },
         ],
       });
@@ -493,7 +493,7 @@ test("gateway counts the resolved Codex payload and uses the same estimate at me
       });
       assert.equal(counted.status, 200);
       const { input_tokens: count } = await counted.json() as { input_tokens: number };
-      const resolved = model === "unmapped-model" ? "gpt-6-sol" : "gpt-6.1-sol";
+      const resolved = model === "unmapped-model" ? "gpt-6.1-terra" : "gpt-6.2-sol";
       assert.equal(count, estimateCodexInputTokens(toOpenAIRequest(request, resolved)));
       assert.equal(upstream.requests.length, before);
       const response = await post(gateway, request);
@@ -505,7 +505,7 @@ test("gateway counts the resolved Codex payload and uses the same estimate at me
       assert.equal(start.message.usage.input_tokens, count);
       assert.match(events, /"usage":\{"input_tokens":3,"output_tokens":2\}/);
     }
-  }, { tiers: { fable: "gpt-6-astra", opus: "gpt-6.1-sol", sonnet: "gpt-6.1-sol", haiku: "gpt-6-sol" } });
+  }, { tiers: { fable: "gpt-6.2-astra", opus: "gpt-6.2-sol", sonnet: "gpt-6.2-sol", haiku: "gpt-6.1-terra" } });
 });
 
 test("gateway counts the pruned Antigravity prompt locally, including protocol and nested tool results", async () => {
@@ -586,7 +586,7 @@ test("gateway records token usage metrics for processed requests", async () => {
     assert.equal(usage.totalInputTokens, 3);
     assert.equal(usage.totalOutputTokens, 2);
     assert.equal(usage.grandTotalTokens, 5);
-    assert.equal(usage.models[0]?.model, "gpt-6-sol");
+    assert.equal(usage.models[0]?.model, "gpt-6.1-terra");
   });
 });
 
@@ -637,7 +637,7 @@ test("UI endpoint /api/ui/provider dynamically switches active provider", async 
       assert.equal(response.status, 200);
       return (await response.json() as { input_tokens: number }).input_tokens;
     };
-    assert.equal(await countTokens(), estimateCodexInputTokens(toOpenAIRequest(countRequest, "gpt-6-sol")));
+    assert.equal(await countTokens(), estimateCodexInputTokens(toOpenAIRequest(countRequest, "gpt-6.1-terra")));
     // Check initial status
     const statusRes1 = await fetch(`${gateway.base}/api/ui/status`);
     const status1 = await statusRes1.json() as { provider: { active: string } };
@@ -771,7 +771,7 @@ test("gateway retries once without replayed reasoning when upstream rejects its 
       stream: false,
       messages: [
         { role: "user", content: "hi" },
-        { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: encodeReasoningSignature("gpt-6-sol", "stale") }, { type: "text", text: "hello" }] },
+        { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: encodeReasoningSignature("gpt-6.1-terra", "stale") }, { type: "text", text: "hello" }] },
         { role: "user", content: "again" },
       ],
     });
@@ -780,4 +780,65 @@ test("gateway retries once without replayed reasoning when upstream rejects its 
     const types = upstream.requests.map((sent) => (JSON.parse(sent.body) as { input: Array<{ type?: string }> }).input.map((item) => item.type ?? "message"));
     assert.deepEqual(types, [["message", "reasoning", "message", "message"], ["message", "message", "message"]]);
   });
+});
+
+test("ChatGPT payload capture matches all four HTTP bodies for JSON and streaming clients", async () => {
+  await withGateway(replyWithStream(HELLO_STREAM), async (gateway, upstream) => {
+    const endpoint = gateway.base + "/api/ui/payload-traces";
+    const index = async () => (await (await fetch(endpoint)).json()) as {
+      enabled: boolean; requests: Array<{ id: string }>;
+    };
+    await (await post(gateway, CHAT_REQUEST)).text();
+    assert.deepEqual(await index(), { enabled: false, requests: [] });
+    assert.equal((await fetch(endpoint + "/start", { method: "POST" })).status, 200);
+    for (const stream of [true, false]) {
+      const raw = JSON.stringify({ ...CHAT_REQUEST, stream, trace_test_extra: "incoming only" }, null, 2);
+      const clientBody = await (await post(gateway, raw)).text();
+      const id = (await index()).requests[0]!.id;
+      const response = await fetch(endpoint + "/" + id);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      const { stages } = await response.json() as { stages: Record<string, string> };
+      assert.equal(stages.claudeRequest, raw);
+      assert.equal(stages.chatgptRequest?.trimEnd(), upstream.requests.at(-1)?.body);
+      assert.equal(stages.chatgptResponse, "HTTP 200\n" + HELLO_STREAM);
+      assert.equal(stages.claudeResponse, clientBody);
+      assert.ok(clientBody.includes("Hello"));
+      assert.ok(!JSON.stringify(stages).includes(TOKEN));
+    }
+    const ids = (await index()).requests.map(row => row.id);
+    assert.equal(new Set(ids).size, 2);
+    await fetch(endpoint + "/stop", { method: "POST" });
+    assert.deepEqual(await index(), { enabled: false, requests: [] });
+    assert.equal((await fetch(endpoint + "/" + ids[0])).status, 404);
+  });
+});
+
+test("payload capture exposes partial streams and stopping invalidates in-flight captures", async () => {
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    await withGateway((_request, response) => {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.write(sse({ type: "response.output_text.delta", delta: "partial" }));
+      void released.then(() => response.end(sse({ type: "response.completed" })));
+    }, async (gateway) => {
+      const endpoint = gateway.base + "/api/ui/payload-traces";
+      await fetch(endpoint + "/start", { method: "POST" });
+      const response = await post(gateway, { ...CHAT_REQUEST, stream: true });
+      const { requests } = await (await fetch(endpoint)).json() as { requests: Array<{ id: string }> };
+      const detail = endpoint + "/" + requests[0]!.id;
+      const { stages } = await (await fetch(detail)).json() as { stages: Record<string, string> };
+      assert.match(stages.chatgptResponse!, /partial/);
+      assert.match(stages.claudeResponse!, /partial/);
+      assert.doesNotMatch(stages.claudeResponse!, /message_stop/);
+      await fetch(endpoint + "/stop", { method: "POST" });
+      await fetch(endpoint + "/start", { method: "POST" });
+      release();
+      assert.match(await response.text(), /message_stop/);
+      assert.equal((await fetch(detail)).status, 404);
+      assert.deepEqual(await (await fetch(endpoint)).json(), { enabled: true, requests: [] });
+    });
+  } finally {
+    release();
+  }
 });
